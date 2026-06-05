@@ -196,6 +196,8 @@ const now = 1_700_000_000_000;
 	scheduleProxyCacheWrite(env, ctx, 'cache-key', record, now, false);
 	scheduleProxyCacheWrite(env, ctx, 'cache-key', record, now + 1_000, false);
 	assert.equal(puts.length, 1, 'same-record writes should be throttled');
+	assert.equal(puts[0].value.lastKvWriteAt, now);
+	assert.equal(normalizeProxyCacheRecord(puts[0].value, now).lastKvWriteAt, now);
 	assert.equal(waitUntilPromises.length, 1);
 	assert.equal(puts[0].options.expirationTtl, PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS);
 	await Promise.all(waitUntilPromises);

@@ -1,7 +1,7 @@
 const Version = '2026-06-01 15:49:39';
-let config_JSON, 反代IP = '', 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {};
-let 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 启用反代兜底 = true, 调试日志打印 = false;
-let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
+let config_JSON;
+const DEFAULT_SOCKS5_WHITELIST = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 调试日志打印 = false;
 const Pages静态页面 = 'https://edt-pages.github.io';
 
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -20,13 +20,16 @@ const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = 850;
 const PROXY_CONNECT_TIMEOUT_MIN_MS = 400;
 const PROXY_CONNECT_TIMEOUT_MAX_MS = 1500;
+const DOH_LOOKUP_TIMEOUT_MS = 850;
+const DIAL_STAGGER_MS = 90;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
+const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
-let TCP并发拨号数 = 2, 预加载竞速拨号 = false;
 
 export default {
 	async fetch(request, env, ctx) {
-		WORKER_REQUEST_CONTEXT.set(request, { env, ctx });
+		const workerRequestContext = { env, ctx, tunnel: null };
+		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -46,27 +49,17 @@ export default {
 		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
-		调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
-		预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
-		if (TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发拨号数 = 1;
-		if (env.PROXYIP) {
-			const proxyIPs = await 整理成数组(env.PROXYIP);
-			反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-			启用反代兜底 = false;
-		} else 反代IP = (request.cf.colo + '.PrOxYIp.CmLiUsSsS.nEt').toLowerCase();
+		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
+		workerRequestContext.tunnel = await createTunnelContext(request, env);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || 'unknown-ip';
-		if (缓存SOCKS5白名单 === null) {
-			if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
-			缓存SOCKS5白名单 = SOCKS5白名单;
-		} else SOCKS5白名单 = 缓存SOCKS5白名单;
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
 			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (管理员密码 && upgradeHeader === 'websocket') {
-			await 反代参数获取(url, userID);
+			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {
-			await 反代参数获取(url, userID);
+			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
@@ -141,8 +134,8 @@ export default {
 						const startTime = Date.now();
 						let 检测代理响应;
 						try {
-							parsedSocks5Address = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
-							const { username, password, hostname, port } = parsedSocks5Address;
+							const parsedProxyAddress = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
+							const { username, password, hostname, port } = parsedProxyAddress;
 							const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
 							try {
 								const 检测主机 = 'cloudflare.com', 检测端口 = 443, encoder = new TextEncoder(), decoder = new TextDecoder();
@@ -150,14 +143,14 @@ export default {
 								let tcpSocket = null, tlsSocket = null;
 								try {
 									tcpSocket = 代理协议 === 'socks5'
-										? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接)
+										? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接, parsedProxyAddress)
 										: 代理协议 === 'turn'
-											? await turnConnect(parsedSocks5Address, 检测主机, 检测端口, TCP连接)
+											? await turnConnect(parsedProxyAddress, 检测主机, 检测端口, TCP连接)
 											: 代理协议 === 'sstp'
-												? await sstpConnect(parsedSocks5Address, 检测主机, 检测端口, TCP连接)
+												? await sstpConnect(parsedProxyAddress, 检测主机, 检测端口, TCP连接)
 												: (代理协议 === 'https' && isIPHostname(hostname)
-													? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接)
-													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接));
+													? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接, parsedProxyAddress)
+													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, parsedProxyAddress));
 									if (!tcpSocket) throw new Error('Unable to connect to the proxy server');
 									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
 									await tlsSocket.handshake();
@@ -397,6 +390,7 @@ export default {
 								完整优选IP = 完整优选IP.concat(优选生成器IP数组);
 								其他节点LINK += 优选生成器其他节点;
 							}
+							完整优选IP = expandPreferredEndpointList(完整优选IP);
 							const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
 							const isLoonOrSurge = ua.includes('loon') || ua.includes('surge');
 							const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
@@ -1863,9 +1857,97 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	return new Uint8Array(pt);
 }
 
+function closeRemoteSocketQuietly(socket) {
+	try { socket?.close?.() } catch (e) { }
+}
+
+function uniqueDialCandidates(candidates) {
+	const unique = [];
+	const seen = new Set();
+	for (const candidate of candidates || []) {
+		if (!candidate || !candidate.hostname || !candidate.port) continue;
+		const key = `${String(candidate.hostname).toLowerCase()}:${Number(candidate.port)}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		unique.push(candidate);
+	}
+	return unique;
+}
+
+async function openStaggeredCandidates(candidates, openCandidate, options = {}) {
+	const unique = uniqueDialCandidates(candidates);
+	if (!unique.length) throw new Error('No dial candidates available');
+	if (unique.length === 1) {
+		const candidate = unique[0];
+		return { socket: await openCandidate(candidate), candidate };
+	}
+	const staggerMs = Math.max(0, Number(options.staggerMs ?? DIAL_STAGGER_MS) || 0);
+	return await new Promise((resolve, reject) => {
+		let settled = false, launched = 0, active = 0;
+		const failures = [];
+		const timers = new Set();
+		const clearTimers = () => {
+			for (const timer of timers) clearTimeout(timer);
+			timers.clear();
+		};
+		const maybeReject = () => {
+			if (!settled && launched >= unique.length && active === 0) {
+				settled = true;
+				clearTimers();
+				reject(new AggregateError(failures, 'All dial candidates failed'));
+			}
+		};
+		const launchNext = () => {
+			if (settled || launched >= unique.length) return;
+			const candidate = unique[launched++];
+			active++;
+			Promise.resolve()
+				.then(() => openCandidate(candidate))
+				.then(socket => {
+					active--;
+					if (settled) {
+						closeRemoteSocketQuietly(socket);
+						return;
+					}
+					settled = true;
+					clearTimers();
+					resolve({ socket, candidate });
+				})
+				.catch(error => {
+					active--;
+					failures.push(error);
+					if (!settled && launched < unique.length) {
+						clearTimers();
+						launchNext();
+					}
+					maybeReject();
+				});
+			if (!settled && launched < unique.length) {
+				if (staggerMs === 0) queueMicrotask(launchNext);
+				else {
+					const timer = setTimeout(() => {
+						timers.delete(timer);
+						launchNext();
+					}, staggerMs);
+					timers.add(timer);
+				}
+			}
+		};
+		launchNext();
+	});
+}
+
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
-	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${反代IP} | ProxyIP fallback: ${启用反代兜底 ? 'yes' : 'no'} | Proxy type: ${启用SOCKS5反代 || 'proxyip'} | Global: ${启用SOCKS5全局反代 ? 'yes' : 'no'}`);
 	const { env, ctx } = getWorkerRequestContext(request);
+	const tunnelContext = getRequestTunnelContext(request);
+	const parsedProxyAddress = tunnelContext.parsedProxyAddress || {};
+	const proxyType = tunnelContext.proxyType;
+	const proxyIP = tunnelContext.proxyIP;
+	const proxyFallbackEnabled = tunnelContext.proxyFallbackEnabled;
+	const proxyGlobalEnabled = tunnelContext.globalProxyEnabled;
+	const socksWhitelist = Array.isArray(tunnelContext.socksWhitelist) ? tunnelContext.socksWhitelist : DEFAULT_SOCKS5_WHITELIST;
+	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
+	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
@@ -1896,30 +1978,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function 并发打开候选连接(候选列表) {
-		if (候选列表.length === 1) {
-			const 候选 = 候选列表[0];
-			return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
-		}
-		const attempts = 候选列表.map(候选 => 打开TCP连接(候选.hostname, 候选.port).then(socket => ({ socket, candidate: 候选 })));
-		let winner = null;
-		try {
-			winner = await Promise.any(attempts);
-			return winner;
-		} finally {
-			if (winner) {
-				for (const attempt of attempts) {
-					attempt.then(({ socket }) => {
-						if (socket !== winner.socket) {
-							try { socket?.close?.() } catch (e) { }
-						}
-					}).catch(() => { });
-				}
-			}
-		}
+		return openStaggeredCandidates(候选列表, 候选 => 打开TCP连接(候选.hostname, 候选.port), { staggerMs: DIAL_STAGGER_MS });
 	}
 
 	async function 构建预加载竞速候选列表(address, port) {
-		if (!预加载竞速拨号 || isIPHostname(address)) return null;
+		if (!tunnelContext.preloadRaceDial || isIPHostname(address)) return null;
 		log(`[TCP direct] Preload race dialing enabled; querying A/AAAA records for ${address} concurrently`);
 		const [aRecords, aaaaRecords] = await Promise.all([
 			DoH查询(address, 'A'),
@@ -1933,7 +1996,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			const data = r.data;
 			return r.type === 28 && typeof data === 'string' && isIPHostname(data) ? [data] : [];
 		}))];
-		const 拨号上限 = Math.max(1, TCP并发拨号数 | 0);
+		const 拨号上限 = dialConcurrency;
 		const ipList = ipv4List.length >= 拨号上限
 			? ipv4List.slice(0, 拨号上限)
 			: ipv4List.concat(ipv6List.slice(0, 拨号上限 - ipv4List.length));
@@ -1951,7 +2014,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectDirect(address, port, data = null, 启用预加载 = false) {
 		const 预加载候选列表 = 启用预加载 ? await 构建预加载竞速候选列表(address, port) : null;
-		const 候选列表 = 预加载候选列表 || Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
+		const 候选列表 = 预加载候选列表 || [{ hostname: address, port, attempt: 0 }];
 		log(预加载候选列表
 			? `[TCP direct] Trying ${候选列表.length} concurrent paths: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`
 			: `[TCP direct] Trying ${候选列表.length} concurrent paths: ${address}:${port}`);
@@ -1974,9 +2037,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = true) {
 		if (所有反代数组 && 所有反代数组.length > 0) {
-			for (let i = 0; i < 所有反代数组.length; i += TCP并发拨号数) {
+			for (let i = 0; i < 所有反代数组.length; i += dialConcurrency) {
 				const 候选列表 = [];
-				for (let j = 0; j < TCP并发拨号数 && i + j < 所有反代数组.length; j++) {
+				for (let j = 0; j < dialConcurrency && i + j < 所有反代数组.length; j++) {
 					const 反代数组索引 = (缓存反代数组索引 + i + j) % 所有反代数组.length;
 					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
@@ -1989,14 +2052,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
-					rememberProxyEndpointResult(env, ctx, 反代IP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间);
+					rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					缓存反代数组索引 = candidate.index;
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
-					if (candidate) rememberProxyEndpointResult(env, ctx, 反代IP, [candidate.hostname, candidate.port], false, null);
-					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, 反代IP, [候选.hostname, 候选.port], false, null);
+					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null);
+					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null);
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -2020,28 +2083,28 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 		const 当前连接任务 = (async () => {
 			let newSocket;
-			if (启用SOCKS5反代 === 'socks5') {
+			if (proxyType === 'socks5') {
 				log(`[SOCKS5 proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接);
-			} else if (启用SOCKS5反代 === 'http') {
+				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接, parsedProxyAddress);
+			} else if (proxyType === 'http') {
 				log(`[HTTP proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接);
-			} else if (启用SOCKS5反代 === 'https') {
+				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, parsedProxyAddress);
+			} else if (proxyType === 'https') {
 				log(`[HTTPS proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = isIPHostname(parsedSocks5Address.hostname)
-					? await httpsConnect(host, portNum, 本次首包数据, TCP连接)
-					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接);
-			} else if (启用SOCKS5反代 === 'turn') {
+				newSocket = isIPHostname(parsedProxyAddress.hostname)
+					? await httpsConnect(host, portNum, 本次首包数据, TCP连接, parsedProxyAddress)
+					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, parsedProxyAddress);
+			} else if (proxyType === 'turn') {
 				log(`[TURN proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await turnConnect(parsedSocks5Address, host, portNum, TCP连接);
+				newSocket = await turnConnect(parsedProxyAddress, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
 					try { await writer.write(数据转Uint8Array(本次首包数据)) }
 					finally { try { writer.releaseLock() } catch (e) { } }
 				}
-			} else if (启用SOCKS5反代 === 'sstp') {
+			} else if (proxyType === 'sstp') {
 				log(`[SSTP proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await sstpConnect(parsedSocks5Address, host, portNum, TCP连接);
+				newSocket = await sstpConnect(parsedProxyAddress, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
 					try { await writer.write(数据转Uint8Array(本次首包数据)) }
@@ -2049,13 +2112,13 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				}
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
-				const 所有反代数组 = await 解析地址端口(反代IP, host, yourUUID, env, ctx);
-				newSocket = await connectProxyIP(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 启用反代兜底);
+				const 所有反代数组 = await 解析地址端口(proxyIP, host, yourUUID, env, ctx);
+				newSocket = await connectProxyIP(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-			connectStreams(newSocket, ws, respHeader, null);
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null);
 		})();
 
 		remoteConnWrapper.connectingPromise = 当前连接任务;
@@ -2069,7 +2132,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	if (启用SOCKS5反代 && (启用SOCKS5全局反代 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
+	if (proxyType && (proxyGlobalEnabled || socksWhitelist.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
 		log(`[TCP forwarding] SOCKS5/HTTP/HTTPS/TURN/SSTP global proxy enabled`);
 		try {
 			await connecttoPry();
@@ -2082,7 +2145,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP forwarding] Trying direct connection to: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
-			connectStreams(initialSocket, ws, respHeader, async () => {
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();
 			});
@@ -2444,8 +2507,16 @@ function 创建下行Grain发送器(webSocket, headerData = null) {
 	};
 }
 
+function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc) {
+	return connectStreams(remoteSocket, webSocket, headerData, retryFunc).catch(error => {
+		log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
+		closeSocketQuietly(webSocket);
+	});
+}
+
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
+	let readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header);
 	header = null;
@@ -2480,9 +2551,24 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 			}
 		}
 		await 下行发送器.flush();
-	} catch (err) { closeSocketQuietly(webSocket) }
-	finally { try { reader.cancel() } catch (e) { } try { reader.releaseLock() } catch (e) { } }
-	if (!hasData && retryFunc) await retryFunc();
+	} catch (err) { readError = err }
+	finally {
+		try { await reader.cancel() } catch (e) { }
+		try { reader.releaseLock() } catch (e) { }
+	}
+	if (!hasData && retryFunc) {
+		try {
+			await retryFunc();
+			return;
+		} catch (retryError) {
+			closeSocketQuietly(webSocket);
+			throw retryError;
+		}
+	}
+	if (readError) {
+		closeSocketQuietly(webSocket);
+		throw readError;
+	}
 }
 
 function isSpeedTestSite(hostname) {
@@ -2500,8 +2586,8 @@ function isSpeedTestSite(hostname) {
 }
 
 
-async function socks5Connect(targetHost, targetPort, initialData, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function socks5Connect(targetHost, targetPort, initialData, TCP连接, proxyAddress = {}) {
+	const { username, password, hostname, port } = proxyAddress;
 	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
 	try {
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
@@ -2536,8 +2622,8 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接) {
 	}
 }
 
-async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接, proxyAddress = {}) {
+	const { username, password, hostname, port } = proxyAddress;
 	const socket = HTTPS代理
 		? TCP连接({ hostname, port }, { secureTransport: 'on', allowHalfOpen: false })
 		: TCP连接({ hostname, port });
@@ -2594,8 +2680,8 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	}
 }
 
-async function httpsConnect(targetHost, targetPort, initialData, TCP连接) {
-	const { username, password, hostname, port } = parsedSocks5Address;
+async function httpsConnect(targetHost, targetPort, initialData, TCP连接, proxyAddress = {}) {
+	const { username, password, hostname, port } = proxyAddress;
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	let tlsSocket = null;
@@ -4809,14 +4895,14 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudf
 
 
 		log(`[DoH lookup] Sending query packet for ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length} bytes)`);
-		const response = await fetch(DoH解析服务, {
+		const response = await fetchWithTimeout(DoH解析服务, {
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/dns-message',
 				'Accept': 'application/dns-message',
 			},
 			body: query,
-		});
+		}, DOH_LOOKUP_TIMEOUT_MS);
 		if (!response.ok) {
 			console.warn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
 			return [];
@@ -5734,10 +5820,10 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		反代: {
 			[_p]: "auto",
 			SOCKS5: {
-				启用: 启用SOCKS5反代,
-				全局: 启用SOCKS5全局反代,
-				账号: 我的SOCKS5账号,
-				白名单: SOCKS5白名单,
+				启用: null,
+				全局: false,
+				账号: null,
+				白名单: DEFAULT_SOCKS5_WHITELIST,
 			},
 			路径模板: {
 				[_p]: "proxyip=" + 占位符,
@@ -6237,108 +6323,8 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 	return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
 }
 
-async function 反代参数获取(url, uuid) {
-	const { searchParams } = url;
-	const pathname = decodeURIComponent(url.pathname);
-	const pathLower = pathname.toLowerCase();
-
-	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
-	if (链式代理路径匹配) {
-		try {
-			const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1], uuid);
-			const { type, ...链式代理地址 } = JSON.parse(链式代理明文);
-			if (!type || !反代协议默认端口[String(type).toLowerCase()]) throw new Error('Invalid chain proxy type');
-			if (!链式代理地址.hostname || !链式代理地址.port) throw new Error('Chain proxy address is missing hostname or port');
-			我的SOCKS5账号 = '';
-			反代IP = 'chain-proxy';
-			启用反代兜底 = false;
-			启用SOCKS5全局反代 = true;
-			启用SOCKS5反代 = String(type).toLowerCase();
-			parsedSocks5Address = {
-				username: 链式代理地址.username,
-				password: 链式代理地址.password,
-				hostname: 链式代理地址.hostname,
-				port: Number(链式代理地址.port)
-			};
-			if (isNaN(parsedSocks5Address.port)) throw new Error('Invalid chain proxy port');
-			return;
-		} catch (err) {
-			console.error('Failed to parse chain proxy parameters:', err.message);
-		}
-	}
-
-	我的SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
-	启用SOCKS5全局反代 = searchParams.has('globalproxy');
-	if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-	else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-	else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-	else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-	else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
-
-	const 解析代理URL = (值, 强制全局 = true) => {
-		const 匹配 = /^(socks5|http|https|turn|sstp):\/\/(.+)$/i.exec(值 || '');
-		if (!匹配) return false;
-		启用SOCKS5反代 = 匹配[1].toLowerCase();
-		我的SOCKS5账号 = 匹配[2].split('/')[0];
-		if (强制全局) 启用SOCKS5全局反代 = true;
-		return true;
-	};
-
-	const 设置反代IP = (值) => {
-		反代IP = 值;
-		启用SOCKS5反代 = null;
-		启用反代兜底 = false;
-	};
-
-	const 提取路径值 = (值) => {
-		if (!值.includes('://')) {
-			const 斜杠索引 = 值.indexOf('/');
-			return 斜杠索引 > 0 ? 值.slice(0, 斜杠索引) : 值;
-		}
-		const 协议拆分 = 值.split('://');
-		if (协议拆分.length !== 2) return 值;
-		const 斜杠索引 = 协议拆分[1].indexOf('/');
-		return 斜杠索引 > 0 ? `${协议拆分[0]}://${协议拆分[1].slice(0, 斜杠索引)}` : 值;
-	};
-
-	const 查询反代IP = searchParams.get('proxyip');
-	if (查询反代IP !== null) {
-		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
-	} else {
-		let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
-		if (匹配) {
-			const 类型 = 匹配[1].toLowerCase();
-			启用SOCKS5反代 = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
-			我的SOCKS5账号 = 匹配[2].split('/')[0];
-			启用SOCKS5全局反代 = true;
-		} else if ((匹配 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i.exec(pathname))) {
-			const 类型 = 匹配[1].toLowerCase();
-			我的SOCKS5账号 = 匹配[2].split('/')[0];
-			启用SOCKS5反代 = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
-			if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
-		} else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
-			const 路径反代值 = 提取路径值(匹配[2]);
-			if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
-		}
-	}
-
-	if (!我的SOCKS5账号) {
-		启用SOCKS5反代 = null;
-		return;
-	}
-
-	try {
-		parsedSocks5Address = await 获取SOCKS5账号(我的SOCKS5账号, 获取代理默认端口(启用SOCKS5反代));
-		if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-		else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-		else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-		else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-		else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
-		else 启用SOCKS5反代 = 启用SOCKS5反代 || 'socks5';
-	} catch (err) {
-		console.error('Failed to parse SOCKS5 address:', err.message);
-		启用SOCKS5反代 = null;
-	}
+async function 反代参数获取(url, uuid, tunnelContext = emptyTunnelContext()) {
+	return applyProxyParamsToTunnelContext(url, uuid, tunnelContext);
 }
 
 const 反代协议默认端口 = { socks5: 1080, http: 80, https: 443, turn: 3478, sstp: 443 };
@@ -6476,10 +6462,179 @@ function getWorkerRequestContext(request) {
 	return WORKER_REQUEST_CONTEXT.get(request) || {};
 }
 
+function emptyTunnelContext() {
+	return {
+		proxyIP: '',
+		proxyFallbackEnabled: true,
+		proxyType: null,
+		globalProxyEnabled: false,
+		proxyAccount: null,
+		parsedProxyAddress: {},
+		socksWhitelist: DEFAULT_SOCKS5_WHITELIST,
+		tcpDialConcurrency: 2,
+		preloadRaceDial: false,
+	};
+}
+
+async function getSocksWhitelist(env) {
+	const key = String(env?.GO2SOCKS5 || '');
+	if (缓存SOCKS5白名单 && 缓存SOCKS5白名单键 === key) return 缓存SOCKS5白名单;
+	const extra = key.trim() ? await 整理成数组(key) : [];
+	缓存SOCKS5白名单 = [...new Set(DEFAULT_SOCKS5_WHITELIST.concat(extra).filter(Boolean))];
+	缓存SOCKS5白名单键 = key;
+	return 缓存SOCKS5白名单;
+}
+
+async function createTunnelContext(request, env = {}) {
+	const tunnelContext = emptyTunnelContext();
+	const proxyIPList = env?.PROXYIP ? (await 整理成数组(env.PROXYIP)).map(value => String(value || '').trim()).filter(Boolean) : [];
+	if (proxyIPList.length) {
+		tunnelContext.proxyIP = proxyIPList[Math.floor(Math.random() * proxyIPList.length)];
+		tunnelContext.proxyFallbackEnabled = false;
+	} else {
+		const colo = String(request?.cf?.colo || 'www').toLowerCase();
+		tunnelContext.proxyIP = `${colo}.PrOxYIp.CmLiUsSsS.nEt`.toLowerCase();
+		tunnelContext.proxyFallbackEnabled = true;
+	}
+	tunnelContext.socksWhitelist = await getSocksWhitelist(env);
+	tunnelContext.tcpDialConcurrency = 识别运营商(request) === 'cmcc' ? 1 : 2;
+	tunnelContext.preloadRaceDial = ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL || '').toLowerCase());
+	return tunnelContext;
+}
+
+function getRequestTunnelContext(request) {
+	return getWorkerRequestContext(request).tunnel || emptyTunnelContext();
+}
+
+async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyTunnelContext()) {
+	const { searchParams } = url;
+	const pathname = decodeURIComponent(url.pathname);
+	const pathLower = pathname.toLowerCase();
+
+	tunnelContext.proxyAccount = null;
+	tunnelContext.proxyType = null;
+	tunnelContext.globalProxyEnabled = false;
+	tunnelContext.parsedProxyAddress = {};
+
+	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
+	if (链式代理路径匹配) {
+		try {
+			const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1], uuid);
+			const { type, ...链式代理地址 } = JSON.parse(链式代理明文);
+			if (!type || !反代协议默认端口[String(type).toLowerCase()]) throw new Error('Invalid chain proxy type');
+			if (!链式代理地址.hostname || !链式代理地址.port) throw new Error('Chain proxy address is missing hostname or port');
+			tunnelContext.proxyAccount = '';
+			tunnelContext.proxyIP = 'chain-proxy';
+			tunnelContext.proxyFallbackEnabled = false;
+			tunnelContext.globalProxyEnabled = true;
+			tunnelContext.proxyType = String(type).toLowerCase();
+			tunnelContext.parsedProxyAddress = {
+				username: 链式代理地址.username,
+				password: 链式代理地址.password,
+				hostname: 链式代理地址.hostname,
+				port: Number(链式代理地址.port)
+			};
+			if (isNaN(tunnelContext.parsedProxyAddress.port)) throw new Error('Invalid chain proxy port');
+			return tunnelContext;
+		} catch (err) {
+			console.error('Failed to parse chain proxy parameters:', err.message);
+		}
+	}
+
+	tunnelContext.proxyAccount = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
+	tunnelContext.globalProxyEnabled = searchParams.has('globalproxy');
+	if (searchParams.get('socks5')) tunnelContext.proxyType = 'socks5';
+	else if (searchParams.get('http')) tunnelContext.proxyType = 'http';
+	else if (searchParams.get('https')) tunnelContext.proxyType = 'https';
+	else if (searchParams.get('turn')) tunnelContext.proxyType = 'turn';
+	else if (searchParams.get('sstp')) tunnelContext.proxyType = 'sstp';
+
+	const 解析代理URL = (值, 强制全局 = true) => {
+		const 匹配 = /^(socks5|http|https|turn|sstp):\/\/(.+)$/i.exec(值 || '');
+		if (!匹配) return false;
+		tunnelContext.proxyType = 匹配[1].toLowerCase();
+		tunnelContext.proxyAccount = 匹配[2].split('/')[0];
+		if (强制全局) tunnelContext.globalProxyEnabled = true;
+		return true;
+	};
+
+	const 设置反代IP = (值) => {
+		tunnelContext.proxyIP = 值;
+		tunnelContext.proxyType = null;
+		tunnelContext.proxyAccount = null;
+		tunnelContext.parsedProxyAddress = {};
+		tunnelContext.proxyFallbackEnabled = false;
+		return tunnelContext;
+	};
+
+	const 提取路径值 = (值) => {
+		if (!值.includes('://')) {
+			const 斜杠索引 = 值.indexOf('/');
+			return 斜杠索引 > 0 ? 值.slice(0, 斜杠索引) : 值;
+		}
+		const 协议拆分 = 值.split('://');
+		if (协议拆分.length !== 2) return 值;
+		const 斜杠索引 = 协议拆分[1].indexOf('/');
+		return 斜杠索引 > 0 ? `${协议拆分[0]}://${协议拆分[1].slice(0, 斜杠索引)}` : 值;
+	};
+
+	const 查询反代IP = searchParams.get('proxyip');
+	if (查询反代IP !== null) {
+		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
+	} else {
+		let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
+		if (匹配) {
+			const 类型 = 匹配[1].toLowerCase();
+			tunnelContext.proxyType = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
+			tunnelContext.proxyAccount = 匹配[2].split('/')[0];
+			tunnelContext.globalProxyEnabled = true;
+		} else if ((匹配 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i.exec(pathname))) {
+			const 类型 = 匹配[1].toLowerCase();
+			tunnelContext.proxyAccount = 匹配[2].split('/')[0];
+			tunnelContext.proxyType = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
+			if (类型.startsWith('g')) tunnelContext.globalProxyEnabled = true;
+		} else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
+			const 路径反代值 = 提取路径值(匹配[2]);
+			if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
+		}
+	}
+
+	if (!tunnelContext.proxyAccount) {
+		tunnelContext.proxyType = null;
+		tunnelContext.parsedProxyAddress = {};
+		return tunnelContext;
+	}
+
+	try {
+		tunnelContext.parsedProxyAddress = await 获取SOCKS5账号(tunnelContext.proxyAccount, 获取代理默认端口(tunnelContext.proxyType));
+		if (searchParams.get('socks5')) tunnelContext.proxyType = 'socks5';
+		else if (searchParams.get('http')) tunnelContext.proxyType = 'http';
+		else if (searchParams.get('https')) tunnelContext.proxyType = 'https';
+		else if (searchParams.get('turn')) tunnelContext.proxyType = 'turn';
+		else if (searchParams.get('sstp')) tunnelContext.proxyType = 'sstp';
+		else tunnelContext.proxyType = tunnelContext.proxyType || 'socks5';
+	} catch (err) {
+		console.error('Failed to parse SOCKS5 address:', err.message);
+		tunnelContext.proxyType = null;
+		tunnelContext.parsedProxyAddress = {};
+	}
+	return tunnelContext;
+}
+
 function getProxyConnectTimeoutMs(env) {
 	const configured = Number(env?.CONNECT_TIMEOUT_MS);
 	if (!Number.isFinite(configured) || configured <= 0) return PROXY_CONNECT_TIMEOUT_DEFAULT_MS;
 	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+async function fetchWithTimeout(resource, init = {}, timeoutMs = DOH_LOOKUP_TIMEOUT_MS, fetchImpl = fetch) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || DOH_LOOKUP_TIMEOUT_MS));
+	try {
+		return await fetchImpl(resource, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function stableHashText(value) {
@@ -6612,6 +6767,7 @@ function serializeProxyCacheRecord(record, now = Date.now()) {
 		updatedAt: record.updatedAt || now,
 		endpoints: (record.endpoints || []).slice(0, PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS),
 		health,
+		lastKvWriteAt: Number(record.lastKvWriteAt) || 0,
 	});
 }
 
@@ -6701,10 +6857,11 @@ function recordProxyEndpointResult(record, endpoint, success, latencyMs, now = D
 	return current;
 }
 
-function parsePreferredEndpoint(value) {
+function parsePreferredEndpointText(value) {
 	if (typeof value !== 'string') return null;
+	const text = value.trim();
 	const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
-	const match = value.match(regex);
+	const match = text.match(regex);
 	if (!match) return null;
 	const port = match[2] || '443';
 	const portNumber = Number(port);
@@ -6712,8 +6869,44 @@ function parsePreferredEndpoint(value) {
 	return {
 		address: match[1],
 		port,
-		remark: match[3] || match[1],
+		remark: match[3] || '',
+		hasExplicitPort: Boolean(match[2]),
 	};
+}
+
+function parsePreferredEndpoint(value) {
+	const parsed = parsePreferredEndpointText(value);
+	if (!parsed) return null;
+	return {
+		address: parsed.address,
+		port: parsed.port,
+		remark: parsed.remark || parsed.address,
+	};
+}
+
+function formatPreferredEndpointVariant(parsed, address) {
+	return `${address}${parsed.hasExplicitPort ? ':' + parsed.port : ''}${parsed.remark ? '#' + parsed.remark : ''}`;
+}
+
+function expandPreferredEndpointVariants(value) {
+	const parsed = parsePreferredEndpointText(value);
+	if (!parsed) return [value];
+	const address = parsed.address;
+	if (address.includes('*') || address.startsWith('[') || isIPHostname(address) || !address.includes('.')) return [value];
+	const pairedAddress = address.toLowerCase().startsWith('www.') ? address.slice(4) : `www.${address}`;
+	if (!pairedAddress || pairedAddress === address || !isValidProxyEndpointHost(pairedAddress) || isIPHostname(pairedAddress)) return [value];
+	return [...new Set([
+		formatPreferredEndpointVariant(parsed, address),
+		formatPreferredEndpointVariant(parsed, pairedAddress),
+	])];
+}
+
+function expandPreferredEndpointList(values) {
+	const expanded = [];
+	for (const value of values || []) {
+		for (const variant of expandPreferredEndpointVariants(value)) expanded.push(variant);
+	}
+	return [...new Set(expanded)];
 }
 
 function rememberProxyEndpointResult(env, ctx, proxyIP, endpoint, success, latencyMs, now = Date.now()) {
@@ -6727,9 +6920,9 @@ function rememberProxyEndpointResult(env, ctx, proxyIP, endpoint, success, laten
 	scheduleProxyCacheWrite(env, ctx, cacheKey, record, now, false);
 }
 
-async function refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord = null) {
+async function refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord = null, liveResolver = resolveProxyEndpointsLive) {
 	const now = Date.now();
-	const endpoints = await resolveProxyEndpointsLive(proxyIP, 目标域名, UUID);
+	const endpoints = await liveResolver(proxyIP, 目标域名, UUID);
 	const record = normalizeProxyCacheRecord({
 		version: PROXY_RESOLUTION_CACHE_VERSION,
 		createdAt: priorRecord?.createdAt || now,
@@ -6743,6 +6936,37 @@ async function refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标�
 	return record;
 }
 
+function proxyResolutionInFlightKey(cacheKey, 目标域名, UUID) {
+	return `${cacheKey}:${stableHashText(目标域名)}:${stableHashText(UUID)}`;
+}
+
+function startProxyResolutionRefresh(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord = null, liveResolver = resolveProxyEndpointsLive) {
+	const inFlightKey = proxyResolutionInFlightKey(cacheKey, 目标域名, UUID);
+	const existing = PROXY_RESOLUTION_IN_FLIGHT.get(inFlightKey);
+	if (existing) return existing;
+	const refreshPromise = refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord, liveResolver)
+		.finally(() => PROXY_RESOLUTION_IN_FLIGHT.delete(inFlightKey));
+	PROXY_RESOLUTION_IN_FLIGHT.set(inFlightKey, refreshPromise);
+	return refreshPromise;
+}
+
+async function getProxyResolutionRecord(env, ctx, proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', liveResolver = resolveProxyEndpointsLive) {
+	proxyIP = String(proxyIP || '').toLowerCase();
+	const now = Date.now();
+	const cache = await readProxyResolutionCache(env, proxyIP, now);
+	if (cache.record) {
+		if (!cache.record.isFresh) {
+			const refreshPromise = startProxyResolutionRefresh(env, ctx, cache.key, proxyIP, 目标域名, UUID, cache.record, liveResolver)
+				.catch(error => log(`[ProxyIP cache] Background refresh failed: ${error?.message || error}`));
+			if (ctx?.waitUntil) ctx.waitUntil(refreshPromise);
+			else refreshPromise.catch(() => { });
+		}
+		return { key: cache.key, record: cache.record, source: cache.source };
+	}
+	const record = await startProxyResolutionRefresh(env, ctx, cache.key, proxyIP, 目标域名, UUID, null, liveResolver);
+	return { key: cache.key, record, source: record ? 'live' : 'none' };
+}
+
 async function resolveProxyEndpointsLive(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
 	return 解析地址端口Legacy(proxyIP, 目标域名, UUID);
 }
@@ -6752,36 +6976,36 @@ export const __testPerformanceHelpers = {
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
 	getProxyConnectTimeoutMs,
+	createTunnelContext,
+	applyProxyParamsToTunnelContext,
+	getProxyResolutionRecord,
+	fetchWithTimeout,
 	normalizeProxyCacheRecord,
+	openStaggeredCandidates,
 	orderProxyEndpoints,
 	proxyCacheKey,
 	readProxyResolutionCache,
 	recordProxyEndpointResult,
 	parsePreferredEndpoint,
+	expandPreferredEndpointVariants,
 	scheduleProxyCacheWrite,
+	connectStreams,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
 	proxyIP = String(proxyIP || '').toLowerCase();
 	const now = Date.now();
-	const cache = await readProxyResolutionCache(env, proxyIP, now);
-	if (cache.record) {
-		const ordered = orderProxyEndpoints(cache.record.endpoints, cache.record.health, now, `${目标域名}|${UUID}`);
+	const resolution = await getProxyResolutionRecord(env, ctx, proxyIP, 目标域名, UUID);
+	if (resolution.record) {
+		const ordered = orderProxyEndpoints(resolution.record.endpoints, resolution.record.health, now, `${目标域名}|${UUID}`);
 		缓存反代IP = proxyIP;
 		缓存反代解析数组 = ordered;
-		log(`[ProxyIP resolver] Loaded ${cache.source} cache (${cache.record.isFresh ? 'fresh' : 'stale'}). Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-		if (!cache.record.isFresh) {
-			const refreshPromise = refreshProxyResolutionCache(env, ctx, cache.key, proxyIP, 目标域名, UUID, cache.record)
-				.catch(error => log(`[ProxyIP cache] Background refresh failed: ${error?.message || error}`));
-			if (ctx?.waitUntil) ctx.waitUntil(refreshPromise);
-			else refreshPromise.catch(() => { });
-		}
+		log(`[ProxyIP resolver] Loaded ${resolution.source} resolver (${resolution.record.isFresh ? 'fresh' : 'stale'}). Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 		return 缓存反代解析数组;
 	}
 
-	const record = await refreshProxyResolutionCache(env, ctx, cache.key, proxyIP, 目标域名, UUID, null);
 	缓存反代IP = proxyIP;
-	缓存反代解析数组 = record ? orderProxyEndpoints(record.endpoints, record.health, now, `${目标域名}|${UUID}`) : [];
+	缓存反代解析数组 = [];
 	log(`[ProxyIP resolver] Loaded live resolver. Total: ${缓存反代解析数组.length}\n${缓存反代解析数组.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 	return 缓存反代解析数组;
 }
