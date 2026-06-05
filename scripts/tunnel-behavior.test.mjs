@@ -11,6 +11,10 @@ const {
 	fetchWithTimeout,
 	openStaggeredCandidates,
 	connectStreams,
+	forwardataudp,
+	socks5Connect,
+	httpConnect,
+	httpsConnect,
 	expandPreferredEndpointVariants,
 } = helpers;
 
@@ -24,6 +28,36 @@ function fakeRequest({ colo = 'SJC', asn = 13335, asOrganization = 'Cloudflare' 
 			},
 		},
 	};
+}
+
+function withTestTimeout(promise, timeoutMs, label) {
+	return Promise.race([
+		promise,
+		new Promise((_, reject) => setTimeout(() => reject(new Error(`test harness timeout: ${label}`)), timeoutMs)),
+	]);
+}
+
+function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = () => {} } = {}) {
+	let closed = false;
+	const socket = {
+		opened,
+		readable: new ReadableStream({
+			cancel(reason) {
+				readableCancel(reason);
+			},
+		}),
+		writable: new WritableStream({
+			write() {},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			closed = true;
+		},
+		get closedFlag() {
+			return closed;
+		},
+	};
+	return socket;
 }
 
 {
@@ -138,6 +172,104 @@ function fakeRequest({ colo = 'SJC', asn = 13335, asOrganization = 'Cloudflare' 
 	});
 
 	assert.deepEqual(events, ['retry'], 'early no-data read errors should retry before closing the client socket');
+}
+
+{
+	const events = [];
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send() { events.push('send'); },
+		close() {
+			events.push('close');
+			this.readyState = WebSocket.CLOSED;
+		},
+	};
+	const remoteSocket = {
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([1, 2, 3]));
+				controller.close();
+			},
+		}),
+	};
+
+	await connectStreams(remoteSocket, webSocket, null, null);
+
+	assert.deepEqual(events, ['send', 'close'], 'normal upstream EOF after data should close the client bridge');
+}
+
+{
+	let upstreamClosed = false;
+	const writes = [];
+	const sent = [];
+	const responseFrame = new Uint8Array([0, 3, 0xaa, 0xbb, 0xcc]);
+	const tcpSocket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(responseFrame);
+			},
+		}),
+		writable: new WritableStream({
+			write(chunk) {
+				writes.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			upstreamClosed = true;
+		},
+	};
+	const request = {
+		fetcher: {
+			connect() {
+				return tcpSocket;
+			},
+		},
+	};
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send(payload) {
+			sent.push(new Uint8Array(payload));
+		},
+	};
+
+	await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DNS TCP response should not wait for upstream close');
+
+	assert.deepEqual(writes, [new Uint8Array([0, 2, 0x12, 0x34])]);
+	assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])]);
+	assert.equal(upstreamClosed, true, 'DNS TCP socket should be closed after one complete response frame');
+}
+
+{
+	let canceled = false;
+	const socket = makeHangingProxySocket({ readableCancel: () => { canceled = true; } });
+	await assert.rejects(
+		withTestTimeout(socks5Connect('target.example', 443, null, () => socket, { hostname: 'proxy.example', port: 1080, timeoutMs: 400 }), 1_000, 'SOCKS5 handshake timeout'),
+		/SOCKS5 proxy handshake timed out/
+	);
+	assert.equal(socket.closedFlag, true, 'SOCKS5 timeout should close the proxy socket');
+	assert.equal(canceled, true, 'SOCKS5 timeout should cancel the pending read');
+}
+
+{
+	let canceled = false;
+	const socket = makeHangingProxySocket({ readableCancel: () => { canceled = true; } });
+	await assert.rejects(
+		withTestTimeout(httpConnect('target.example', 443, null, false, () => socket, { hostname: 'proxy.example', port: 8080, timeoutMs: 400 }), 1_000, 'HTTP CONNECT timeout'),
+		/HTTP proxy CONNECT response timed out/
+	);
+	assert.equal(socket.closedFlag, true, 'HTTP timeout should close the proxy socket');
+	assert.equal(canceled, true, 'HTTP timeout should cancel the pending read');
+}
+
+{
+	const socket = makeHangingProxySocket({ opened: new Promise(() => {}) });
+	await assert.rejects(
+		withTestTimeout(httpsConnect('target.example', 443, null, () => socket, { hostname: 'proxy.example', port: 8443, timeoutMs: 400 }), 1_000, 'HTTPS proxy TCP timeout'),
+		/HTTPS proxy TCP connect timed out/
+	);
+	assert.equal(socket.closedFlag, true, 'HTTPS timeout should close the proxy socket');
 }
 
 console.log('tunnel behavior tests passed');

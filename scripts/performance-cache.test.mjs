@@ -115,10 +115,38 @@ const now = 1_700_000_000_000;
 }
 
 {
+	const resolutionUpdatedAt = now - 30 * 60 * 1000;
+	const record = normalizeProxyCacheRecord({
+		version: 1,
+		updatedAt: resolutionUpdatedAt,
+		endpoints: [['freshness.example', 443]],
+		health: {},
+	}, now);
+
+	assert.equal(record.isFresh, false);
+	recordProxyEndpointResult(record, ['freshness.example', 443], true, 100, now);
+	assert.equal(record.updatedAt, resolutionUpdatedAt, 'health updates must not make old resolution data look freshly resolved');
+	assert.equal(normalizeProxyCacheRecord(record, now).isFresh, false);
+}
+
+{
 	assert.equal(getProxyConnectTimeoutMs({}), 850);
 	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '200' }), 400);
 	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '5000' }), 1500);
 	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '950' }), 950);
+}
+
+{
+	assert.notEqual(
+		proxyCacheKey('proxy.example.com', 'telegram.org', '00000000-0000-4000-8000-000000000000'),
+		proxyCacheKey('proxy.example.com', 'youtube.com', '00000000-0000-4000-8000-000000000000'),
+		'target-dependent proxy resolution needs a target-aware cache key'
+	);
+	assert.notEqual(
+		proxyCacheKey('proxy.example.com', 'telegram.org', '00000000-0000-4000-8000-000000000000'),
+		proxyCacheKey('proxy.example.com', 'telegram.org', '11111111-1111-4111-8111-111111111111'),
+		'UUID-dependent proxy resolution needs a UUID-aware cache key'
+	);
 }
 
 {

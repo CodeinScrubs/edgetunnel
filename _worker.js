@@ -21,6 +21,7 @@ const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = 850;
 const PROXY_CONNECT_TIMEOUT_MIN_MS = 400;
 const PROXY_CONNECT_TIMEOUT_MAX_MS = 1500;
 const DOH_LOOKUP_TIMEOUT_MS = 850;
+const DNS_TCP_RESPONSE_TIMEOUT_MS = 1200;
 const DIAL_STAGGER_MS = 90;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
@@ -1949,14 +1950,12 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
+	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒 };
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
 
 	async function 等待连接建立(remoteSock, timeoutMs = 连接超时毫秒) {
-		await Promise.race([
-			remoteSock.opened,
-			new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timed out')), timeoutMs))
-		]);
+		await socketOpenedWithTimeout(remoteSock, timeoutMs, 'Connection timed out');
 	}
 
 	async function 打开TCP连接(address, port) {
@@ -2052,14 +2051,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
-					rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间);
+					rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					缓存反代数组索引 = candidate.index;
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
-					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null);
-					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null);
+					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null, Date.now(), host, yourUUID);
+					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -2085,15 +2084,15 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			let newSocket;
 			if (proxyType === 'socks5') {
 				log(`[SOCKS5 proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接, parsedProxyAddress);
+				newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接, proxyAddressForConnect);
 			} else if (proxyType === 'http') {
 				log(`[HTTP proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, parsedProxyAddress);
+				newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, proxyAddressForConnect);
 			} else if (proxyType === 'https') {
 				log(`[HTTPS proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = isIPHostname(parsedProxyAddress.hostname)
-					? await httpsConnect(host, portNum, 本次首包数据, TCP连接, parsedProxyAddress)
-					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, parsedProxyAddress);
+					? await httpsConnect(host, portNum, 本次首包数据, TCP连接, proxyAddressForConnect)
+					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, proxyAddressForConnect);
 			} else if (proxyType === 'turn') {
 				log(`[TURN proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = await turnConnect(parsedProxyAddress, host, portNum, TCP连接);
@@ -2160,43 +2159,75 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
-	const 请求数据 = 数据转Uint8Array(udpChunk);
-	const 请求字节数 = 请求数据.byteLength;
-	log(`[UDP forwarding] Received DNS request: ${请求字节数}B -> 8.8.4.4:53`);
+async function readOneDnsTcpFrame(tcpSocket, timeoutMs) {
+	const reader = tcpSocket.readable.getReader();
+	let buffer = new Uint8Array(0);
+	const deadline = Date.now() + Math.max(1, Number(timeoutMs) || DNS_TCP_RESPONSE_TIMEOUT_MS);
 	try {
+		while (true) {
+			if (buffer.byteLength >= 2) {
+				const responseLength = (buffer[0] << 8) | buffer[1];
+				if (responseLength <= 0) throw new Error('DNS TCP response has invalid length');
+				if (responseLength > 65535) throw new Error('DNS TCP response is too large');
+				const frameLength = responseLength + 2;
+				if (buffer.byteLength >= frameLength) return buffer.slice(0, frameLength);
+			}
+			if (buffer.byteLength > 65537) throw new Error('DNS TCP response buffer is too large');
+			const remainingMs = Math.max(1, deadline - Date.now());
+			const { done, value } = await readWithOperationTimeout(reader, remainingMs, 'DNS TCP response timed out');
+			if (done) throw new Error('DNS TCP server closed before returning a complete response');
+			const chunk = 数据转Uint8Array(value);
+			if (!chunk.byteLength) continue;
+			buffer = buffer.byteLength ? 拼接字节数据(buffer, chunk) : chunk;
+		}
+	} finally {
+		cancelReaderQuietly(reader);
+		try { reader.releaseLock() } catch (e) { }
+	}
+}
+
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
+	const requestData = 数据转Uint8Array(udpChunk);
+	const requestBytes = requestData.byteLength;
+	log(`[UDP forwarding] Received DNS request: ${requestBytes}B -> 8.8.4.4:53`);
+	let tcpSocket = null;
+	let writer = null;
+	try {
+		const { env } = getWorkerRequestContext(request);
+		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		const TCP连接 = 创建请求TCP连接器(request);
-		const tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
-		let 魏烈思Header = respHeader;
-		const writer = tcpSocket.writable.getWriter();
-		await writer.write(请求数据);
-		log(`[UDP forwarding] DNS request written upstream: ${请求字节数}B`);
-		writer.releaseLock();
-		await tcpSocket.readable.pipeTo(new WritableStream({
-			async write(chunk) {
-				const 原始响应 = 数据转Uint8Array(chunk);
-				log(`[UDP forwarding] Received DNS response: ${原始响应.byteLength}B`);
-				const 封装结果 = 响应封装器 ? await 响应封装器(原始响应) : 原始响应;
-				const 发送片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
-				if (!发送片段列表.length) return;
-				if (webSocket.readyState !== WebSocket.OPEN) return;
-				for (const fragment of 发送片段列表) {
-					const 转发响应 = 数据转Uint8Array(fragment);
-					if (!转发响应.byteLength) continue;
-					if (魏烈思Header) {
-						const response = new Uint8Array(魏烈思Header.length + 转发响应.byteLength);
-						response.set(魏烈思Header, 0);
-						response.set(转发响应, 魏烈思Header.length);
-						await WebSocket发送并等待(webSocket, response.buffer);
-						魏烈思Header = null;
-					} else {
-						await WebSocket发送并等待(webSocket, 转发响应);
-					}
-				}
-			},
-		}));
+		tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
+		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
+		writer = tcpSocket.writable.getWriter();
+		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
+		log(`[UDP forwarding] DNS request written upstream: ${requestBytes}B`);
+		try { writer.releaseLock() } catch (e) { }
+		writer = null;
+
+		const rawResponse = await readOneDnsTcpFrame(tcpSocket, timeoutMs);
+		log(`[UDP forwarding] Received DNS response: ${rawResponse.byteLength}B`);
+		const wrappedResult = 响应封装器 ? await 响应封装器(rawResponse) : rawResponse;
+		const fragments = Array.isArray(wrappedResult) ? wrappedResult : [wrappedResult];
+		if (!fragments.length || webSocket.readyState !== WebSocket.OPEN) return;
+		let vlessHeader = respHeader;
+		for (const fragment of fragments) {
+			const forwardedResponse = 数据转Uint8Array(fragment);
+			if (!forwardedResponse.byteLength || webSocket.readyState !== WebSocket.OPEN) continue;
+			if (vlessHeader) {
+				const response = new Uint8Array(vlessHeader.length + forwardedResponse.byteLength);
+				response.set(vlessHeader, 0);
+				response.set(forwardedResponse, vlessHeader.length);
+				await WebSocket发送并等待(webSocket, response.buffer);
+				vlessHeader = null;
+			} else {
+				await WebSocket发送并等待(webSocket, forwardedResponse);
+			}
+		}
 	} catch (error) {
 		log(`[UDP forwarding] DNS forwarding failed: ${error?.message || error}`);
+	} finally {
+		try { writer?.releaseLock?.() } catch (e) { }
+		try { tcpSocket?.close?.() } catch (e) { }
 	}
 }
 
@@ -2569,6 +2600,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 		closeSocketQuietly(webSocket);
 		throw readError;
 	}
+	closeSocketQuietly(webSocket);
 }
 
 function isSpeedTestSite(hostname) {
@@ -2588,11 +2620,13 @@ function isSpeedTestSite(hostname) {
 
 async function socks5Connect(targetHost, targetPort, initialData, TCP连接, proxyAddress = {}) {
 	const { username, password, hostname, port } = proxyAddress;
+	const timeoutMs = getProxyHandshakeTimeoutMs(proxyAddress);
 	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
 	try {
+		await socketOpenedWithTimeout(socket, timeoutMs, 'SOCKS5 proxy TCP connect timed out');
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
-		await writer.write(authMethods);
-		let response = await reader.read();
+		await writeWithOperationTimeout(writer, authMethods, timeoutMs, 'SOCKS5 proxy method write timed out');
+		let response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
 		if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
 
 		const selectedMethod = new Uint8Array(response.value)[1];
@@ -2600,18 +2634,18 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 			if (!username || !password) throw new Error('S5 requires authentication');
 			const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
 			const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
-			await writer.write(authPacket);
-			response = await reader.read();
+			await writeWithOperationTimeout(writer, authPacket, timeoutMs, 'SOCKS5 proxy authentication write timed out');
+			response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
 			if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
 		const hostBytes = new TextEncoder().encode(targetHost);
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
-		await writer.write(connectPacket);
-		response = await reader.read();
+		await writeWithOperationTimeout(writer, connectPacket, timeoutMs, 'SOCKS5 proxy CONNECT write timed out');
+		response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
 		if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
 
-		if (有效数据长度(initialData) > 0) await writer.write(initialData);
+		if (有效数据长度(initialData) > 0) await writeWithOperationTimeout(writer, initialData, timeoutMs, 'SOCKS5 initial data write timed out');
 		writer.releaseLock(); reader.releaseLock();
 		return socket;
 	} catch (error) {
@@ -2624,6 +2658,7 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 
 async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接, proxyAddress = {}) {
 	const { username, password, hostname, port } = proxyAddress;
+	const timeoutMs = getProxyHandshakeTimeoutMs(proxyAddress);
 	const socket = HTTPS代理
 		? TCP连接({ hostname, port }, { secureTransport: 'on', allowHalfOpen: false })
 		: TCP连接({ hostname, port });
@@ -2631,18 +2666,18 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	try {
-		if (HTTPS代理) await socket.opened;
+		await socketOpenedWithTimeout(socket, timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy TCP connect timed out`);
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
 		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
-		await writer.write(encoder.encode(request));
+		await writeWithOperationTimeout(writer, encoder.encode(request), timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy CONNECT write timed out`);
 		writer.releaseLock();
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {
-			const { done, value } = await reader.read();
+			const { done, value } = await readWithOperationTimeout(reader, timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy CONNECT response timed out`);
 			if (done || !value) throw new Error(`${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy closed the connection before returning a CONNECT response`);
-			responseBuffer = new Uint8Array([...responseBuffer, ...value]);
+			responseBuffer = 拼接字节数据(responseBuffer, value);
 			bytesRead = responseBuffer.length;
 			const crlfcrlf = responseBuffer.findIndex((_, i) => i < responseBuffer.length - 3 && responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a && responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a);
 			if (crlfcrlf !== -1) headerEndIndex = crlfcrlf + 4;
@@ -2657,8 +2692,11 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 
 		if (有效数据长度(initialData) > 0) {
 			const 远端写入器 = socket.writable.getWriter();
-			await 远端写入器.write(initialData);
-			远端写入器.releaseLock();
+			try {
+				await writeWithOperationTimeout(远端写入器, initialData, timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy initial data write timed out`);
+			} finally {
+				try { 远端写入器.releaseLock() } catch (e) { }
+			}
 		}
 
 
@@ -2682,6 +2720,7 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 
 async function httpsConnect(targetHost, targetPort, initialData, TCP连接, proxyAddress = {}) {
 	const { username, password, hostname, port } = proxyAddress;
+	const timeoutMs = getProxyHandshakeTimeoutMs(proxyAddress);
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
 	let tlsSocket = null;
@@ -2689,9 +2728,11 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 	const 打开HTTPS代理TLS = async (allowChacha = false) => {
 		const proxySocket = TCP连接({ hostname, port });
 		try {
-			await proxySocket.opened;
+			await socketOpenedWithTimeout(proxySocket, timeoutMs, 'HTTPS proxy TCP connect timed out');
 			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha });
-			await socket.handshake();
+			await withOperationTimeout(socket.handshake(), timeoutMs, 'HTTPS proxy TLS handshake timed out', () => {
+				try { socket.close() } catch (e) { }
+			});
 			log(`[HTTPS proxy] TLS version: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
 			return socket;
 		} catch (error) {
@@ -2710,11 +2751,15 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
 		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
-		await tlsSocket.write(encoder.encode(request));
+		await withOperationTimeout(tlsSocket.write(encoder.encode(request)), timeoutMs, 'HTTPS proxy CONNECT write timed out', () => {
+			try { tlsSocket.close() } catch (e) { }
+		});
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {
-			const value = await tlsSocket.read();
+			const value = await withOperationTimeout(tlsSocket.read(), timeoutMs, 'HTTPS proxy CONNECT response timed out', () => {
+				try { tlsSocket.close() } catch (e) { }
+			});
 			if (!value) throw new Error('HTTPS proxy closed the connection before returning a CONNECT response');
 			responseBuffer = 拼接字节数据(responseBuffer, value);
 			bytesRead = responseBuffer.length;
@@ -2727,7 +2772,9 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : NaN;
 		if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) throw new Error(`Connection failed: HTTP ${statusCode}`);
 
-		if (有效数据长度(initialData) > 0) await tlsSocket.write(数据转Uint8Array(initialData));
+		if (有效数据长度(initialData) > 0) await withOperationTimeout(tlsSocket.write(数据转Uint8Array(initialData)), timeoutMs, 'HTTPS proxy initial data write timed out', () => {
+			try { tlsSocket.close() } catch (e) { }
+		});
 		const bufferedData = bytesRead > headerEndIndex ? responseBuffer.subarray(headerEndIndex, bytesRead) : null;
 		let closedSettled = false, resolveClosed, rejectClosed;
 		const settleClosed = (settle, value) => {
@@ -6627,6 +6674,62 @@ function getProxyConnectTimeoutMs(env) {
 	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
 }
 
+function getProxyHandshakeTimeoutMs(proxyAddress = {}) {
+	const configured = Number(proxyAddress?.timeoutMs);
+	if (!Number.isFinite(configured) || configured <= 0) return PROXY_CONNECT_TIMEOUT_DEFAULT_MS;
+	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+function getDnsTcpResponseTimeoutMs(env) {
+	const configured = Number(env?.DNS_TIMEOUT_MS || env?.CONNECT_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return DNS_TCP_RESPONSE_TIMEOUT_MS;
+	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+async function withOperationTimeout(operation, timeoutMs, message, onTimeout = null) {
+	let timedOut = false;
+	let timer = null;
+	try {
+		return await Promise.race([
+			Promise.resolve(operation),
+			new Promise((_, reject) => {
+				timer = setTimeout(() => {
+					timedOut = true;
+					reject(new Error(message));
+					queueMicrotask(() => {
+						try { onTimeout?.() } catch (e) { }
+					});
+				}, Math.max(1, Number(timeoutMs) || PROXY_CONNECT_TIMEOUT_DEFAULT_MS));
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+		if (timedOut && operation && typeof operation.catch === 'function') operation.catch(() => { });
+	}
+}
+
+function cancelReaderQuietly(reader, reason = 'operation timed out') {
+	try {
+		const result = reader?.cancel?.(reason);
+		if (result && typeof result.catch === 'function') result.catch(() => { });
+	} catch (e) { }
+}
+
+async function readWithOperationTimeout(reader, timeoutMs, message) {
+	return withOperationTimeout(reader.read(), timeoutMs, message, () => cancelReaderQuietly(reader, message));
+}
+
+async function writeWithOperationTimeout(writer, chunk, timeoutMs, message) {
+	return withOperationTimeout(writer.write(chunk), timeoutMs, message);
+}
+
+async function socketOpenedWithTimeout(socket, timeoutMs, message) {
+	if (!socket?.opened) return;
+	return withOperationTimeout(socket.opened, timeoutMs, message, () => {
+		try { socket?.close?.() } catch (e) { }
+	});
+}
+
 async function fetchWithTimeout(resource, init = {}, timeoutMs = DOH_LOOKUP_TIMEOUT_MS, fetchImpl = fetch) {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || DOH_LOOKUP_TIMEOUT_MS));
@@ -6646,8 +6749,12 @@ function stableHashText(value) {
 	return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-function proxyCacheKey(proxyIP) {
-	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${stableHashText(String(proxyIP || '').toLowerCase())}`;
+function proxyCacheKey(proxyIP, targetHost = '', UUID = '') {
+	const baseKey = `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${stableHashText(String(proxyIP || '').toLowerCase())}`;
+	const targetKey = String(targetHost || '').toLowerCase();
+	const uuidKey = String(UUID || '').toLowerCase();
+	if (!targetKey && !uuidKey) return baseKey;
+	return `${baseKey}:${stableHashText(targetKey)}:${stableHashText(uuidKey)}`;
 }
 
 function proxyEndpointKey(endpoint) {
@@ -6734,8 +6841,8 @@ function touchProxyL1Cache(key, record) {
 	}
 }
 
-async function readProxyResolutionCache(env, proxyIP, now = Date.now()) {
-	const key = proxyCacheKey(proxyIP);
+async function readProxyResolutionCache(env, proxyIP, now = Date.now(), targetHost = '', UUID = '') {
+	const key = proxyCacheKey(proxyIP, targetHost, UUID);
 	const memoryRecord = normalizeProxyCacheRecord(PROXY_RESOLUTION_L1_CACHE.get(key), now);
 	if (memoryRecord) {
 		touchProxyL1Cache(key, memoryRecord);
@@ -6853,7 +6960,6 @@ function recordProxyEndpointResult(record, endpoint, success, latencyMs, now = D
 		if (current.failures >= PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD) current.cooldownUntil = now + PROXY_ENDPOINT_FAILURE_COOLDOWN_MS;
 	}
 	record.health[key] = current;
-	record.updatedAt = now;
 	return current;
 }
 
@@ -6909,10 +7015,10 @@ function expandPreferredEndpointList(values) {
 	return [...new Set(expanded)];
 }
 
-function rememberProxyEndpointResult(env, ctx, proxyIP, endpoint, success, latencyMs, now = Date.now()) {
+function rememberProxyEndpointResult(env, ctx, proxyIP, endpoint, success, latencyMs, now = Date.now(), targetHost = '', UUID = '') {
 	const normalizedEndpoint = normalizeProxyEndpoint(endpoint);
 	if (!normalizedEndpoint) return;
-	const cacheKey = proxyCacheKey(proxyIP);
+	const cacheKey = proxyCacheKey(proxyIP, targetHost, UUID);
 	const record = normalizeProxyCacheRecord(PROXY_RESOLUTION_L1_CACHE.get(cacheKey), now);
 	if (!record) return;
 	recordProxyEndpointResult(record, normalizedEndpoint, success, latencyMs, now);
@@ -6953,7 +7059,7 @@ function startProxyResolutionRefresh(env, ctx, cacheKey, proxyIP, 目标域名, 
 async function getProxyResolutionRecord(env, ctx, proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', liveResolver = resolveProxyEndpointsLive) {
 	proxyIP = String(proxyIP || '').toLowerCase();
 	const now = Date.now();
-	const cache = await readProxyResolutionCache(env, proxyIP, now);
+	const cache = await readProxyResolutionCache(env, proxyIP, now, 目标域名, UUID);
 	if (cache.record) {
 		if (!cache.record.isFresh) {
 			const refreshPromise = startProxyResolutionRefresh(env, ctx, cache.key, proxyIP, 目标域名, UUID, cache.record, liveResolver)
@@ -6990,6 +7096,10 @@ export const __testPerformanceHelpers = {
 	expandPreferredEndpointVariants,
 	scheduleProxyCacheWrite,
 	connectStreams,
+	forwardataudp,
+	socks5Connect,
+	httpConnect,
+	httpsConnect,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
