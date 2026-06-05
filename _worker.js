@@ -7,10 +7,26 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
+const PROXY_RESOLUTION_CACHE_VERSION = 1;
+const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = 24;
+const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = 8;
+const PROXY_RESOLUTION_CACHE_FRESH_TTL_MS = 10 * 60 * 1000;
+const PROXY_RESOLUTION_CACHE_STALE_TTL_MS = 6 * 60 * 60 * 1000;
+const PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS = Math.ceil(PROXY_RESOLUTION_CACHE_STALE_TTL_MS / 1000);
+const PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS = 60 * 1000;
+const PROXY_ENDPOINT_FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
+const PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD = 2;
+const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = 850;
+const PROXY_CONNECT_TIMEOUT_MIN_MS = 400;
+const PROXY_CONNECT_TIMEOUT_MAX_MS = 1500;
+const PROXY_RESOLUTION_L1_CACHE = new Map();
+const WORKER_REQUEST_CONTEXT = new WeakMap();
 let TCP并发拨号数 = 2, 预加载竞速拨号 = false;
 
 export default {
 	async fetch(request, env, ctx) {
+		WORKER_REQUEST_CONTEXT.set(request, { env, ctx });
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -385,23 +401,16 @@ export default {
 							const isLoonOrSurge = ua.includes('loon') || ua.includes('surge');
 							const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
 							订阅内容 = 其他节点LINK + 完整优选IP.map(原始地址 => {
-
-
-
-
-
-								const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
-								const match = 原始地址.match(regex);
-
 								let 节点地址, 节点端口 = "443", 节点备注;
+								const preferredEndpoint = parsePreferredEndpoint(原始地址);
 
-								if (match) {
-									节点地址 = match[1];
-									节点端口 = match[2] ? match[2] : '443';
-									节点备注 = match[3] || 节点地址;
+								if (preferredEndpoint) {
+									节点地址 = preferredEndpoint.address;
+									节点端口 = preferredEndpoint.port;
+									节点备注 = preferredEndpoint.remark;
 								} else {
 
-									console.warn(`[Subscription] Ignored invalid IP format: ${原始地址}`);
+									console.warn(`[Subscription] Ignored invalid preferred endpoint: ${原始地址}`);
 									return null;
 								}
 
@@ -1856,7 +1865,8 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${反代IP} | ProxyIP fallback: ${启用反代兜底 ? 'yes' : 'no'} | Proxy type: ${启用SOCKS5反代 || 'proxyip'} | Global: ${启用SOCKS5全局反代 ? 'yes' : 'no'}`);
-	const 连接超时毫秒 = 1000;
+	const { env, ctx } = getWorkerRequestContext(request);
+	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
 
@@ -1974,15 +1984,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				let socket = null, candidate = null;
 				try {
 					log(`[ProxyIP connection] Trying ${候选列表.length} concurrent paths: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
+					const 开始时间 = performance.now();
 					const 连接结果 = await 并发打开候选连接(候选列表);
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
+					rememberProxyEndpointResult(env, ctx, 反代IP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					缓存反代数组索引 = candidate.index;
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
+					if (candidate) rememberProxyEndpointResult(env, ctx, 反代IP, [candidate.hostname, candidate.port], false, null);
+					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, 反代IP, [候选.hostname, 候选.port], false, null);
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -2035,7 +2049,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				}
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
-				const 所有反代数组 = await 解析地址端口(反代IP, host, yourUUID);
+				const 所有反代数组 = await 解析地址端口(反代IP, host, yourUUID, env, ctx);
 				newSocket = await connectProxyIP(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, 启用反代兜底);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
@@ -6457,9 +6471,323 @@ function sha224(s) {
 	return hex;
 }
 
-async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
-	if (!缓存反代IP || !缓存反代解析数组 || 缓存反代IP !== proxyIP) {
-		proxyIP = proxyIP.toLowerCase();
+function getWorkerRequestContext(request) {
+	if (!request || typeof request !== 'object') return {};
+	return WORKER_REQUEST_CONTEXT.get(request) || {};
+}
+
+function getProxyConnectTimeoutMs(env) {
+	const configured = Number(env?.CONNECT_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return PROXY_CONNECT_TIMEOUT_DEFAULT_MS;
+	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+function stableHashText(value) {
+	let hash = 2166136261;
+	for (const char of String(value || '')) {
+		hash ^= char.charCodeAt(0);
+		hash = Math.imul(hash, 16777619);
+	}
+	return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function proxyCacheKey(proxyIP) {
+	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${stableHashText(String(proxyIP || '').toLowerCase())}`;
+}
+
+function proxyEndpointKey(endpoint) {
+	return `${endpoint[0]}:${endpoint[1]}`;
+}
+
+function isValidProxyEndpointHost(host) {
+	if (typeof host !== 'string' || !host || host.length > 255 || /[\s/\\?#]/.test(host)) return false;
+	if (/^\[[\da-f:]+\]$/i.test(host)) return true;
+	if (/^(?:[a-f0-9]{0,4}:){1,7}[a-f0-9]{0,4}$/i.test(host)) return true;
+	if (/^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/.test(host)) return true;
+	return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i.test(host);
+}
+
+function normalizeProxyEndpoint(endpoint) {
+	if (!Array.isArray(endpoint) || endpoint.length < 2) return null;
+	const host = String(endpoint[0] || '').trim().toLowerCase();
+	const port = Number(endpoint[1]);
+	if (!isValidProxyEndpointHost(host) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+	return [host, port];
+}
+
+function normalizeProxyHealthEntry(entry, now) {
+	if (!entry || typeof entry !== 'object') return null;
+	const lastSeenAt = Number(entry.lastSeenAt || entry.lastSuccessAt || entry.lastFailureAt || entry.updatedAt || 0);
+	if (lastSeenAt && now - lastSeenAt > PROXY_ENDPOINT_HEALTH_MAX_AGE_MS) return null;
+	const rawLatency = entry.latencyMs;
+	return {
+		successes: Math.max(0, Math.min(1000, Number(entry.successes) || 0)),
+		failures: Math.max(0, Math.min(1000, Number(entry.failures) || 0)),
+		latencyMs: rawLatency === null || rawLatency === undefined || rawLatency === '' ? null : (Number.isFinite(Number(rawLatency)) ? Math.max(1, Math.min(60000, Math.round(Number(rawLatency)))) : null),
+		cooldownUntil: Number.isFinite(Number(entry.cooldownUntil)) ? Math.max(0, Math.round(Number(entry.cooldownUntil))) : 0,
+		lastSeenAt: lastSeenAt || 0,
+		lastSuccessAt: Number.isFinite(Number(entry.lastSuccessAt)) ? Math.max(0, Math.round(Number(entry.lastSuccessAt))) : 0,
+		lastFailureAt: Number.isFinite(Number(entry.lastFailureAt)) ? Math.max(0, Math.round(Number(entry.lastFailureAt))) : 0,
+	};
+}
+
+function normalizeProxyCacheRecord(raw, now = Date.now()) {
+	let data = raw;
+	if (typeof raw === 'string') {
+		try { data = JSON.parse(raw) }
+		catch (_) { return null }
+	}
+	if (!data || typeof data !== 'object' || data.version !== PROXY_RESOLUTION_CACHE_VERSION) return null;
+	const updatedAt = Number(data.updatedAt || data.createdAt || 0);
+	if (!Number.isFinite(updatedAt) || updatedAt <= 0 || now - updatedAt > PROXY_RESOLUTION_CACHE_STALE_TTL_MS) return null;
+	const endpoints = [];
+	const seen = new Set();
+	for (const rawEndpoint of Array.isArray(data.endpoints) ? data.endpoints : []) {
+		const endpoint = normalizeProxyEndpoint(rawEndpoint);
+		if (!endpoint) continue;
+		const key = proxyEndpointKey(endpoint);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		endpoints.push(endpoint);
+		if (endpoints.length >= PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS) break;
+	}
+	if (!endpoints.length) return null;
+	const health = {};
+	const inputHealth = data.health && typeof data.health === 'object' ? data.health : {};
+	for (const endpoint of endpoints) {
+		const key = proxyEndpointKey(endpoint);
+		const entry = normalizeProxyHealthEntry(inputHealth[key], now);
+		if (entry) health[key] = entry;
+	}
+	return {
+		version: PROXY_RESOLUTION_CACHE_VERSION,
+		createdAt: Number(data.createdAt) || updatedAt,
+		updatedAt,
+		isFresh: now - updatedAt <= PROXY_RESOLUTION_CACHE_FRESH_TTL_MS,
+		endpoints,
+		health,
+		lastKvWriteAt: Number(data.lastKvWriteAt) || 0,
+	};
+}
+
+function touchProxyL1Cache(key, record) {
+	if (!key || !record) return;
+	if (PROXY_RESOLUTION_L1_CACHE.has(key)) PROXY_RESOLUTION_L1_CACHE.delete(key);
+	PROXY_RESOLUTION_L1_CACHE.set(key, record);
+	while (PROXY_RESOLUTION_L1_CACHE.size > PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES) {
+		PROXY_RESOLUTION_L1_CACHE.delete(PROXY_RESOLUTION_L1_CACHE.keys().next().value);
+	}
+}
+
+async function readProxyResolutionCache(env, proxyIP, now = Date.now()) {
+	const key = proxyCacheKey(proxyIP);
+	const memoryRecord = normalizeProxyCacheRecord(PROXY_RESOLUTION_L1_CACHE.get(key), now);
+	if (memoryRecord) {
+		touchProxyL1Cache(key, memoryRecord);
+		return { key, record: memoryRecord, source: 'memory' };
+	}
+	if (!env?.KV || typeof env.KV.get !== 'function') return { key, record: null, source: 'none' };
+	try {
+		const raw = await env.KV.get(key);
+		const record = normalizeProxyCacheRecord(raw, now);
+		if (record) {
+			touchProxyL1Cache(key, record);
+			return { key, record, source: 'kv' };
+		}
+	} catch (error) {
+		log(`[ProxyIP cache] KV read failed: ${error?.message || error}`);
+	}
+	return { key, record: null, source: 'none' };
+}
+
+function serializeProxyCacheRecord(record, now = Date.now()) {
+	const health = {};
+	for (const endpoint of record.endpoints || []) {
+		const key = proxyEndpointKey(endpoint);
+		if (record.health?.[key]) health[key] = record.health[key];
+	}
+	return JSON.stringify({
+		version: PROXY_RESOLUTION_CACHE_VERSION,
+		createdAt: record.createdAt || now,
+		updatedAt: record.updatedAt || now,
+		endpoints: (record.endpoints || []).slice(0, PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS),
+		health,
+	});
+}
+
+function scheduleProxyCacheWrite(env, ctx, cacheKey, record, now = Date.now(), force = false) {
+	if (!env?.KV || typeof env.KV.put !== 'function' || !cacheKey || !record) return;
+	if (!force && record.lastKvWriteAt && now - record.lastKvWriteAt < PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS) return;
+	record.lastKvWriteAt = now;
+	let writePromise;
+	try {
+		writePromise = Promise.resolve(env.KV.put(cacheKey, serializeProxyCacheRecord(record, now), { expirationTtl: PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS }))
+			.catch(error => log(`[ProxyIP cache] KV write failed: ${error?.message || error}`));
+		if (ctx?.waitUntil) {
+			try { ctx.waitUntil(writePromise) }
+			catch (error) {
+				log(`[ProxyIP cache] waitUntil failed: ${error?.message || error}`);
+				writePromise.catch(() => { });
+			}
+		} else writePromise.catch(() => { });
+	} catch (error) {
+		log(`[ProxyIP cache] KV write failed: ${error?.message || error}`);
+	}
+}
+
+function endpointJitter(endpoint, seed) {
+	return parseInt(stableHashText(`${seed}|${proxyEndpointKey(endpoint)}`).slice(0, 8), 16) / 0xffffffff;
+}
+
+function orderProxyEndpoints(endpoints, health = {}, now = Date.now(), seed = '') {
+	const normalized = [];
+	const seen = new Set();
+	for (const rawEndpoint of endpoints || []) {
+		const endpoint = normalizeProxyEndpoint(rawEndpoint);
+		if (!endpoint) continue;
+		const key = proxyEndpointKey(endpoint);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		normalized.push(endpoint);
+	}
+	const score = endpoint => {
+		const h = health[proxyEndpointKey(endpoint)] || {};
+		const latency = Number.isFinite(Number(h.latencyMs)) ? Number(h.latencyMs) : 700;
+		const failures = Number(h.failures) || 0;
+		const successes = Number(h.successes) || 0;
+		const successBonus = successes > 0 ? Math.min(250, successes * 12) : 0;
+		return latency + failures * 450 - successBonus + endpointJitter(endpoint, seed) * 20;
+	};
+	const active = normalized.filter(endpoint => {
+		const h = health[proxyEndpointKey(endpoint)] || {};
+		return !(Number(h.cooldownUntil) > now);
+	});
+	const candidates = active.length ? active : normalized;
+	return candidates.sort((a, b) => score(a) - score(b)).slice(0, PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS);
+}
+
+function recordProxyEndpointResult(record, endpoint, success, latencyMs, now = Date.now()) {
+	if (!record || !endpoint) return null;
+	const normalizedEndpoint = normalizeProxyEndpoint(endpoint);
+	if (!normalizedEndpoint) return null;
+	const key = proxyEndpointKey(normalizedEndpoint);
+	const current = normalizeProxyHealthEntry(record.health?.[key], now) || {
+		successes: 0,
+		failures: 0,
+		latencyMs: null,
+		cooldownUntil: 0,
+		lastSeenAt: 0,
+		lastSuccessAt: 0,
+		lastFailureAt: 0,
+	};
+	if (!record.health) record.health = {};
+	current.lastSeenAt = now;
+	if (success) {
+		current.successes = Math.min(1000, current.successes + 1);
+		current.failures = 0;
+		current.cooldownUntil = 0;
+		current.lastSuccessAt = now;
+		if (Number.isFinite(Number(latencyMs)) && Number(latencyMs) > 0) {
+			const measured = Math.round(Number(latencyMs));
+			current.latencyMs = current.latencyMs ? Math.round(current.latencyMs * 0.7 + measured * 0.3) : measured;
+		}
+	} else {
+		current.failures = Math.min(1000, current.failures + 1);
+		current.lastFailureAt = now;
+		if (current.failures >= PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD) current.cooldownUntil = now + PROXY_ENDPOINT_FAILURE_COOLDOWN_MS;
+	}
+	record.health[key] = current;
+	record.updatedAt = now;
+	return current;
+}
+
+function parsePreferredEndpoint(value) {
+	if (typeof value !== 'string') return null;
+	const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+	const match = value.match(regex);
+	if (!match) return null;
+	const port = match[2] || '443';
+	const portNumber = Number(port);
+	if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;
+	return {
+		address: match[1],
+		port,
+		remark: match[3] || match[1],
+	};
+}
+
+function rememberProxyEndpointResult(env, ctx, proxyIP, endpoint, success, latencyMs, now = Date.now()) {
+	const normalizedEndpoint = normalizeProxyEndpoint(endpoint);
+	if (!normalizedEndpoint) return;
+	const cacheKey = proxyCacheKey(proxyIP);
+	const record = normalizeProxyCacheRecord(PROXY_RESOLUTION_L1_CACHE.get(cacheKey), now);
+	if (!record) return;
+	recordProxyEndpointResult(record, normalizedEndpoint, success, latencyMs, now);
+	touchProxyL1Cache(cacheKey, record);
+	scheduleProxyCacheWrite(env, ctx, cacheKey, record, now, false);
+}
+
+async function refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord = null) {
+	const now = Date.now();
+	const endpoints = await resolveProxyEndpointsLive(proxyIP, 目标域名, UUID);
+	const record = normalizeProxyCacheRecord({
+		version: PROXY_RESOLUTION_CACHE_VERSION,
+		createdAt: priorRecord?.createdAt || now,
+		updatedAt: now,
+		endpoints,
+		health: priorRecord?.health || {},
+	}, now);
+	if (!record) return null;
+	touchProxyL1Cache(cacheKey, record);
+	scheduleProxyCacheWrite(env, ctx, cacheKey, record, now, true);
+	return record;
+}
+
+async function resolveProxyEndpointsLive(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
+	return 解析地址端口Legacy(proxyIP, 目标域名, UUID);
+}
+
+export const __testPerformanceHelpers = {
+	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
+	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
+	PROXY_RESOLUTION_L1_CACHE,
+	getProxyConnectTimeoutMs,
+	normalizeProxyCacheRecord,
+	orderProxyEndpoints,
+	proxyCacheKey,
+	readProxyResolutionCache,
+	recordProxyEndpointResult,
+	parsePreferredEndpoint,
+	scheduleProxyCacheWrite,
+};
+
+async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
+	proxyIP = String(proxyIP || '').toLowerCase();
+	const now = Date.now();
+	const cache = await readProxyResolutionCache(env, proxyIP, now);
+	if (cache.record) {
+		const ordered = orderProxyEndpoints(cache.record.endpoints, cache.record.health, now, `${目标域名}|${UUID}`);
+		缓存反代IP = proxyIP;
+		缓存反代解析数组 = ordered;
+		log(`[ProxyIP resolver] Loaded ${cache.source} cache (${cache.record.isFresh ? 'fresh' : 'stale'}). Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+		if (!cache.record.isFresh) {
+			const refreshPromise = refreshProxyResolutionCache(env, ctx, cache.key, proxyIP, 目标域名, UUID, cache.record)
+				.catch(error => log(`[ProxyIP cache] Background refresh failed: ${error?.message || error}`));
+			if (ctx?.waitUntil) ctx.waitUntil(refreshPromise);
+			else refreshPromise.catch(() => { });
+		}
+		return 缓存反代解析数组;
+	}
+
+	const record = await refreshProxyResolutionCache(env, ctx, cache.key, proxyIP, 目标域名, UUID, null);
+	缓存反代IP = proxyIP;
+	缓存反代解析数组 = record ? orderProxyEndpoints(record.endpoints, record.health, now, `${目标域名}|${UUID}`) : [];
+	log(`[ProxyIP resolver] Loaded live resolver. Total: ${缓存反代解析数组.length}\n${缓存反代解析数组.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+	return 缓存反代解析数组;
+}
+
+async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
+	proxyIP = String(proxyIP || '').toLowerCase();
 
 		function 解析地址端口字符串(str) {
 			let 地址 = str, 端口 = 443;
@@ -6538,11 +6866,9 @@ async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com',
 		let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
 		log(`[ProxyIP resolver] Random seed: ${随机种子}\nTarget site: ${目标根域名}`)
 		const 洗牌后 = [...排序后数组].sort(() => (随机种子 = (随机种子 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
-		缓存反代解析数组 = 洗牌后.slice(0, 8);
-		log(`[ProxyIP resolver] Resolution complete. Total: ${缓存反代解析数组.length}\n${缓存反代解析数组.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-		缓存反代IP = proxyIP;
-	} else log(`[ProxyIP resolver] Loaded cache. Total: ${缓存反代解析数组.length}\n${缓存反代解析数组.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-	return 缓存反代解析数组;
+		const liveEndpoints = 洗牌后.slice(0, PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS);
+		log(`[ProxyIP resolver] Resolution complete. Total: ${liveEndpoints.length}\n${liveEndpoints.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+	return liveEndpoints;
 }
 
 

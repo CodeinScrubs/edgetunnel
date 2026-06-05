@@ -41,6 +41,7 @@ This repository contains a Cloudflare Worker / Pages deployment with an admin pa
 | `OFF_LOG` | No | `1` | Disables request logging when set to `1` or `true`. |
 | `BEST_SUB` | No | `1` | Enables preferred subscription generator mode when set to `1` or `true`. |
 | `PRELOAD_RACE_DIAL` | No | `1` | Enables preload race dialing when set to `1` or `true`. |
+| `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `1500` ms. |
 
 ## Admin Panel
 
@@ -58,6 +59,7 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - Use a UUID v4 value when setting `UUID`.
 - Redeploy after changing production environment variables.
 - The generated subscription host defaults to the current deployed hostname unless `HOST` is explicitly configured.
+- Proxy endpoint resolution uses a bounded memory cache and, when KV is bound, a small last-known-good KV cache. This keeps cold starts faster without allowing cache growth to become unbounded.
 
 ## Disclaimer
 

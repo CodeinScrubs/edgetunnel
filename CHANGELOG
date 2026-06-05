@@ -4,6 +4,10 @@ This local working copy is being kept English-only for the admin UI and generate
 
 ## Current Local Changes
 
+- Added a bounded ProxyIP resolution cache with memory-first lookup and optional KV persistence.
+- Added endpoint health ordering, failure cooldowns, and throttled background KV writes.
+- Added a clamped `CONNECT_TIMEOUT_MS` setting for faster failover tuning.
+- Added preferred endpoint parsing tests covering clean IPs, domains, and subdomains.
 - Translated Worker responses, admin API messages, generated labels, and Wrangler comments to English.
 - Added English translation for upstream static admin/login pages.
 - Added a runtime DOM translator for admin UI text inserted by client-side JavaScript after page load.
