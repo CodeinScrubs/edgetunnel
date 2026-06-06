@@ -1,6 +1,6 @@
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
-let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 调试日志打印 = false;
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
 const Pages静态页面 = 'https://edt-pages.github.io';
 
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -576,6 +576,11 @@ async function 处理XHTTP请求(request, yourUUID) {
 					if (已关闭) return;
 					已关闭 = true;
 					this.readyState = WebSocket.CLOSED;
+					XHTTP上行写入队列?.清空();
+					try {
+						const cancelPromise = reader.cancel();
+						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
+					} catch (e) { }
 					try { controller.close() } catch (e) { }
 				}
 			};
@@ -638,10 +643,11 @@ async function 处理XHTTP请求(request, yourUUID) {
 				try { reader.releaseLock() } catch (e) { }
 			}
 		},
-		cancel() {
+		async cancel() {
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			释放远端写入器();
+			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
 	}), { status: 200, headers: responseHeaders });
@@ -5978,7 +5984,7 @@ function translateUIText(value) {
 }
 
 function translateSafeTagAttributes(tag) {
-	return tag.replace(/\s(placeholder|title|aria-label|aria-description|alt|data-title|data-label|data-tooltip|data-bs-title|data-original-title)=(["'])([\s\S]*?)\2/gi, (match, name, quote, value) => {
+	return tag.replace(/\s(placeholder|title|aria-label|aria-description|alt|data-title|data-label|data-tip|data-tooltip|data-bs-title|data-original-title)=(["'])([\s\S]*?)\2/gi, (match, name, quote, value) => {
 		return ` ${name}=${quote}${translateUIText(value)}${quote}`;
 	});
 }
@@ -5995,8 +6001,8 @@ function translateHTMLChunk(chunk) {
 function translateHTMLVisibleText(html) {
 	return html
 		.replace(/<html\b([^>]*)lang=(["'])zh-CN\2/gi, '<html$1lang="en"')
-		.split(/(<script\b[\s\S]*?<\/script>|<style\b[\s\S]*?<\/style>|<template\b[\s\S]*?<\/template>)/gi)
-		.map(part => /^<(script|style|template)\b/i.test(part) ? part : translateHTMLChunk(part))
+		.split(/(<script\b[\s\S]*?<\/script>|<style\b[\s\S]*?<\/style>)/gi)
+		.map(part => /^<(script|style)\b/i.test(part) ? part : translateHTMLChunk(part))
 		.join('');
 }
 
@@ -6023,7 +6029,7 @@ function buildEnglishRuntimeTranslatorScript() {
 		'var translationMap=new Map(entries);',
 		'function escapeRegExp(value){return value.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\\\$&");}',
 		'var pattern=entries.length?new RegExp(entries.map(function(pair){return escapeRegExp(pair[0]);}).sort(function(a,b){return b.length-a.length;}).join("|"),"g"):null;',
-		'var textAttrs=["placeholder","title","aria-label","aria-description","alt","data-title","data-label","data-tooltip","data-bs-title","data-original-title"];',
+		'var textAttrs=["placeholder","title","aria-label","aria-description","alt","data-title","data-label","data-tip","data-tooltip","data-bs-title","data-original-title"];',
 		'var skipped={SCRIPT:1,STYLE:1,TEMPLATE:1,TEXTAREA:1,CODE:1,PRE:1};',
 		'function hasHan(value){return /[\\u3400-\\u9fff\\uf900-\\ufaff]/.test(value);}',
 		'function translate(value){if(!value||!hasHan(value))return value;var output=pattern?value.replace(pattern,function(match){return translationMap.get(match)||match;}):value;return output.replace(/[\\u3400-\\u9fff\\uf900-\\ufaff]+/g,"").replace(/[ \\t]{2,}/g," ").trim();}',
@@ -6241,6 +6247,26 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		console.error(`Failed to read config_JSON: ${error.message}`);
 		config_JSON = 默认配置JSON;
 	}
+
+	const 合并对象默认值 = (默认值, 当前值) => ({
+		...默认值,
+		...((当前值 && typeof 当前值 === 'object' && !Array.isArray(当前值)) ? 当前值 : {})
+	});
+	config_JSON = 合并对象默认值(默认配置JSON, config_JSON);
+	config_JSON.优选订阅生成 = 合并对象默认值(默认配置JSON.优选订阅生成, config_JSON.优选订阅生成);
+	config_JSON.优选订阅生成.本地IP库 = 合并对象默认值(默认配置JSON.优选订阅生成.本地IP库, config_JSON.优选订阅生成.本地IP库);
+	config_JSON.订阅转换配置 = 合并对象默认值(默认配置JSON.订阅转换配置, config_JSON.订阅转换配置);
+	config_JSON.ECHConfig = 合并对象默认值(默认配置JSON.ECHConfig, config_JSON.ECHConfig);
+	config_JSON.SS = 合并对象默认值(默认配置JSON.SS, config_JSON.SS);
+	config_JSON.反代 = 合并对象默认值(默认配置JSON.反代, config_JSON.反代);
+	config_JSON.反代.SOCKS5 = 合并对象默认值(默认配置JSON.反代.SOCKS5, config_JSON.反代.SOCKS5);
+	config_JSON.反代.路径模板 = 合并对象默认值(默认配置JSON.反代.路径模板, config_JSON.反代.路径模板);
+	for (const 模板名称 of ['SOCKS5', 'HTTP', 'HTTPS', 'TURN', 'SSTP']) {
+		config_JSON.反代.路径模板[模板名称] = 合并对象默认值(默认配置JSON.反代.路径模板[模板名称], config_JSON.反代.路径模板[模板名称]);
+	}
+	config_JSON.TG = 合并对象默认值(默认配置JSON.TG, config_JSON.TG);
+	config_JSON.CF = 合并对象默认值(默认配置JSON.CF, config_JSON.CF);
+	config_JSON.CF.Usage = 合并对象默认值(默认配置JSON.CF.Usage, config_JSON.CF.Usage);
 
 	if (!config_JSON.gRPCUserAgent) config_JSON.gRPCUserAgent = UA;
 	const normalizeConfigHost = h => String(h || '').toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0].trim();
@@ -7444,16 +7470,13 @@ async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com',
 	const resolution = await getProxyResolutionRecord(env, ctx, proxyIP, 目标域名, UUID);
 	if (resolution.record) {
 		const ordered = orderProxyEndpoints(resolution.record.endpoints, resolution.record.health, now, `${目标域名}|${UUID}`);
-		缓存反代IP = proxyIP;
-		缓存反代解析数组 = ordered;
 		log(`[ProxyIP resolver] Loaded ${resolution.source} resolver (${resolution.record.isFresh ? 'fresh' : 'stale'}). Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-		return 缓存反代解析数组;
+		return ordered;
 	}
 
-	缓存反代IP = proxyIP;
-	缓存反代解析数组 = [];
-	log(`[ProxyIP resolver] Loaded live resolver. Total: ${缓存反代解析数组.length}\n${缓存反代解析数组.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-	return 缓存反代解析数组;
+	const ordered = [];
+	log(`[ProxyIP resolver] Loaded live resolver. Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
+	return ordered;
 }
 
 async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {

@@ -265,6 +265,25 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 
 {
 	const uuid = '11111111-1111-4111-8111-111111111111';
+	const config = await readConfigJson({
+		KV: makeFakeKV({
+			'config.json': JSON.stringify({
+				UUID: uuid,
+				HOST: 'worker.example',
+				HOSTS: ['worker.example'],
+			}),
+		}),
+	}, 'worker.example', uuid, 'UnitTest/1.0');
+
+	assert.equal(config.HOST, 'worker.example');
+	assert.equal(config.传输协议, 'ws');
+	assert.equal(config.反代.PROXYIP, 'auto');
+	assert.equal(config.优选订阅生成.SUBNAME, 'edgetunnel');
+	assert.equal(config.LINK.includes(`vless://${uuid}@worker.example:443`), true);
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
 	const [alpha, beta] = await Promise.all([
 		readConfigJson({ KV: makeFakeKV({}, { getDelays: { 'tg.json': 25 } }), HOST: 'alpha.example' }, 'alpha.example', uuid, 'UA-A'),
 		readConfigJson({ KV: makeFakeKV({}), HOST: 'beta.example' }, 'beta.example', uuid, 'UA-B'),
@@ -283,6 +302,11 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 	assert.equal(translated.includes('lang="en"'), true);
 	assert.equal(/[\u3400-\u9fff\uf900-\ufaff]/.test(visibleHtml), false, 'visible translated HTML should not leak non-English Han text');
 	assert.equal(translated.includes('<script>const label="保存配置";</script>'), true, 'script contents should not be rewritten server-side');
+}
+
+{
+	const translated = translateHTMLVisibleText('<html><body><template><section aria-label="网络环境"><button title="清空列表" data-tip="端口为 0 时，随机设置 443、2053、2083、2087、2096、8443 端口。">清空列表</button><p>在线优选</p></section></template></body></html>');
+	assert.equal(/[\u3400-\u9fff\uf900-\ufaff]/.test(translated), false, 'template UI text should be translated before client-side rendering');
 }
 
 {
@@ -860,6 +884,43 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0xbb]]);
 	await waitForCondition(() => requestBodyCanceled, 300, 'gRPC upstream EOF should cancel open request body');
 	assert.equal(upstreamClosed, true, 'gRPC upstream EOF should close upstream socket');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	let requestBodyCanceled = false;
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0xcc]));
+				controller.close();
+			},
+		}),
+		writable: new WritableStream(),
+		closed: Promise.resolve(),
+		close() {},
+	};
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa])));
+		},
+		cancel() {
+			requestBodyCanceled = true;
+		},
+	});
+	const response = await workerModule.default.fetch({
+		url: 'https://worker.example/tunnel',
+		method: 'POST',
+		headers: { get: () => null },
+		body,
+		cf: {},
+		fetcher: { connect: () => socket },
+	}, { ADMIN: 'admin-password', UUID: uuid }, { waitUntil() {} });
+
+	const bytes = await collectReadableStream(response.body);
+	assert.deepEqual([...bytes], [0, 0, 0xcc]);
+	await waitForCondition(() => requestBodyCanceled, 300, 'XHTTP upstream EOF should cancel open request body');
 }
 
 console.log('tunnel behavior tests passed');
