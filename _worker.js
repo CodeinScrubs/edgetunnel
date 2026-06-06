@@ -1,5 +1,4 @@
 const Version = '2026-06-01 15:49:39';
-let config_JSON;
 const DEFAULT_SOCKS5_WHITELIST = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代IP, 缓存反代解析数组, 缓存反代数组索引 = 0, 调试日志打印 = false;
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -42,6 +41,7 @@ export default {
 	async fetch(request, env, ctx) {
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
+		let config_JSON;
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
 		const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
@@ -846,24 +846,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				send(data) {
 					if (已关闭) return;
 					const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
-					const lenBytes数组 = [];
-					let remaining = chunk.byteLength >>> 0;
-					while (remaining > 127) {
-						lenBytes数组.push((remaining & 0x7f) | 0x80);
-						remaining >>>= 7;
-					}
-					lenBytes数组.push(remaining);
-					const lenBytes = new Uint8Array(lenBytes数组);
-					const protobufLen = 1 + lenBytes.length + chunk.byteLength;
-					const frame = new Uint8Array(5 + protobufLen);
-					frame[0] = 0;
-					frame[1] = (protobufLen >>> 24) & 0xff;
-					frame[2] = (protobufLen >>> 16) & 0xff;
-					frame[3] = (protobufLen >>> 8) & 0xff;
-					frame[4] = protobufLen & 0xff;
-					frame[5] = 0x0a;
-					frame.set(lenBytes, 6);
-					frame.set(chunk, 6 + lenBytes.length);
+					const frame = encodeGrpcDataFrame(chunk);
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
 					安排刷新发送队列();
@@ -970,34 +953,9 @@ async function 处理gRPC请求(request, yourUUID) {
 					if (done) break;
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
-					const merged = new Uint8Array(pending.length + 当前块.length);
-					merged.set(pending, 0);
-					merged.set(当前块, pending.length);
-					pending = merged;
-					while (pending.byteLength >= 5) {
-						const grpcLen = readGrpcFrameLength(pending);
-						const frameSize = 5 + grpcLen;
-						if (pending.byteLength < frameSize) break;
-						const grpcPayload = pending.subarray(5, frameSize);
-						pending = pending.slice(frameSize);
-						if (!grpcPayload.byteLength) continue;
-						let payload = grpcPayload;
-						if (payload.byteLength >= 2 && payload[0] === 0x0a) {
-							let shift = 0;
-							let offset = 1;
-							let varint有效 = false;
-							while (offset < payload.length) {
-								const current = payload[offset++];
-								if ((current & 0x80) === 0) {
-									varint有效 = true;
-									break;
-								}
-								shift += 7;
-								if (shift > 35) break;
-							}
-							if (varint有效) payload = payload.subarray(offset);
-						}
-						if (!payload.byteLength) continue;
+					const parsedFrames = parseGrpcFrameChunk(pending, 当前块);
+					pending = parsedFrames.pending;
+					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
 							else await forwardataudp(payload, grpcBridge, null, request);
@@ -1053,9 +1011,15 @@ async function 处理gRPC请求(request, yourUUID) {
 				关闭连接();
 			}
 		},
-		cancel() {
+		async cancel() {
 			GRPC上行写入队列?.清空();
+			if (远端写入器) {
+				try { 远端写入器.releaseLock() } catch (e) { }
+				远端写入器 = null;
+			}
+			当前写入Socket = null;
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
+			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
 	}), { status: 200, headers: grpcHeaders });
@@ -1717,12 +1681,92 @@ function 拼接字节数据(...chunkList) {
 	return result;
 }
 
+function encodeGrpcVarint(value) {
+	let remaining = Number(value) >>> 0;
+	const bytes = [];
+	while (remaining > 127) {
+		bytes.push((remaining & 0x7f) | 0x80);
+		remaining >>>= 7;
+	}
+	bytes.push(remaining);
+	return new Uint8Array(bytes);
+}
+
+function readGrpcVarint(data, offset = 0) {
+	let value = 0, shift = 0;
+	for (let i = offset; i < data.byteLength; i++) {
+		const current = data[i];
+		value |= (current & 0x7f) << shift;
+		if ((current & 0x80) === 0) return { value: value >>> 0, nextOffset: i + 1 };
+		shift += 7;
+		if (shift > 35) break;
+	}
+	throw new Error('Invalid gRPC protobuf wrapper: bad varint length');
+}
+
+function encodeGrpcMessagePayload(payload) {
+	const chunk = 数据转Uint8Array(payload);
+	const lenBytes = encodeGrpcVarint(chunk.byteLength);
+	const message = new Uint8Array(1 + lenBytes.byteLength + chunk.byteLength);
+	message[0] = 0x0a;
+	message.set(lenBytes, 1);
+	message.set(chunk, 1 + lenBytes.byteLength);
+	return message;
+}
+
+function encodeGrpcDataFrame(payload) {
+	const message = encodeGrpcMessagePayload(payload);
+	const frame = new Uint8Array(5 + message.byteLength);
+	frame[0] = 0;
+	frame[1] = (message.byteLength >>> 24) & 0xff;
+	frame[2] = (message.byteLength >>> 16) & 0xff;
+	frame[3] = (message.byteLength >>> 8) & 0xff;
+	frame[4] = message.byteLength & 0xff;
+	frame.set(message, 5);
+	return frame;
+}
+
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
 	const grpcLen = ((data[1] << 24) >>> 0) | (data[2] << 16) | (data[3] << 8) | data[4];
 	if (grpcLen > GRPC_MAX_FRAME_PAYLOAD_BYTES) throw new Error(`gRPC frame too large: ${grpcLen}B`);
 	return grpcLen;
+}
+
+function unwrapGrpcMessagePayloads(grpcPayload) {
+	const data = 数据转Uint8Array(grpcPayload);
+	if (!data.byteLength) return [];
+	if (data[0] !== 0x0a) return [data];
+	const payloads = [];
+	let offset = 0;
+	while (offset < data.byteLength) {
+		if (data[offset] !== 0x0a) throw new Error('Invalid gRPC protobuf wrapper: expected data field');
+		const { value: length, nextOffset } = readGrpcVarint(data, offset + 1);
+		const end = nextOffset + length;
+		if (end > data.byteLength) throw new Error('Invalid gRPC protobuf wrapper: declared length exceeds payload');
+		if (length > 0) payloads.push(data.subarray(nextOffset, end));
+		offset = end;
+	}
+	return payloads;
+}
+
+function parseGrpcFrameChunk(pending, chunk) {
+	const prior = 数据转Uint8Array(pending);
+	const current = 数据转Uint8Array(chunk);
+	const merged = prior.byteLength ? 拼接字节数据(prior, current) : current;
+	const payloads = [];
+	let offset = 0;
+	while (merged.byteLength - offset >= 5) {
+		const frameHeader = merged.subarray(offset, offset + 5);
+		const grpcLen = readGrpcFrameLength(frameHeader);
+		const frameSize = 5 + grpcLen;
+		if (merged.byteLength - offset < frameSize) break;
+		const grpcPayload = merged.subarray(offset + 5, offset + frameSize);
+		if (grpcPayload.byteLength) payloads.push(...unwrapGrpcMessagePayloads(grpcPayload));
+		offset += frameSize;
+	}
+	return { payloads, pending: merged.subarray(offset) };
 }
 
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
@@ -4287,7 +4331,7 @@ function base64SecretDecode(encoded, secret) {
 function 获取传输协议配置(配置 = {}) {
 	const 是gRPC = 配置.传输协议 === 'grpc';
 	return {
-		type: 是gRPC ? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun') : (配置.传输协议 === 'xhttp' ? 'xhttp&mode=stream-one' : 'ws'),
+		type: 是gRPC ? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi&alpn=h2' : 'grpc&mode=gun&alpn=h2') : (配置.传输协议 === 'xhttp' ? 'xhttp&mode=stream-one' : 'ws'),
 		路径字段名: 是gRPC ? 'serviceName' : 'path',
 		域名字段名: 是gRPC ? 'authority' : 'host'
 	};
@@ -4986,18 +5030,62 @@ function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
 	return `${前缀}${'*'.repeat(星号数量)}${后缀}`;
 }
 
-async function MD5MD5(文本) {
+function md5HexFallback(文本) {
+	const bytes = Array.from(new TextEncoder().encode(String(文本 || '')));
+	const bitLenLow = (bytes.length * 8) >>> 0;
+	const bitLenHigh = Math.floor((bytes.length * 8) / 0x100000000) >>> 0;
+	bytes.push(0x80);
+	while (bytes.length % 64 !== 56) bytes.push(0);
+	for (let i = 0; i < 4; i++) bytes.push((bitLenLow >>> (8 * i)) & 0xff);
+	for (let i = 0; i < 4; i++) bytes.push((bitLenHigh >>> (8 * i)) & 0xff);
+
+	let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+	const s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+	const k = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0);
+	const rotl = (x, n) => ((x << n) | (x >>> (32 - n))) >>> 0;
+
+	for (let offset = 0; offset < bytes.length; offset += 64) {
+		const m = [];
+		for (let i = 0; i < 16; i++) {
+			const base = offset + i * 4;
+			m[i] = (bytes[base] | (bytes[base + 1] << 8) | (bytes[base + 2] << 16) | (bytes[base + 3] << 24)) >>> 0;
+		}
+		let a = a0, b = b0, c = c0, d = d0;
+		for (let i = 0; i < 64; i++) {
+			let f, g;
+			if (i < 16) { f = (b & c) | (~b & d); g = i; }
+			else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+			else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+			else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+			const nextD = d;
+			d = c;
+			c = b;
+			b = (b + rotl((a + f + k[i] + m[g]) >>> 0, s[i])) >>> 0;
+			a = nextD;
+		}
+		a0 = (a0 + a) >>> 0;
+		b0 = (b0 + b) >>> 0;
+		c0 = (c0 + c) >>> 0;
+		d0 = (d0 + d) >>> 0;
+	}
+
+	const wordHex = word => [0, 8, 16, 24].map(shift => ((word >>> shift) & 0xff).toString(16).padStart(2, '0')).join('');
+	return `${wordHex(a0)}${wordHex(b0)}${wordHex(c0)}${wordHex(d0)}`;
+}
+
+async function md5Hex(文本) {
 	const 编码器 = new TextEncoder();
+	try {
+		const 哈希 = await crypto.subtle.digest('MD5', 编码器.encode(文本));
+		return Array.from(new Uint8Array(哈希)).map(字节 => 字节.toString(16).padStart(2, '0')).join('').toLowerCase();
+	} catch (error) {
+		return md5HexFallback(文本).toLowerCase();
+	}
+}
 
-	const 第一次哈希 = await crypto.subtle.digest('MD5', 编码器.encode(文本));
-	const 第一次哈希数组 = Array.from(new Uint8Array(第一次哈希));
-	const 第一次十六进制 = 第一次哈希数组.map(字节 => 字节.toString(16).padStart(2, '0')).join('');
-
-	const 第二次哈希 = await crypto.subtle.digest('MD5', 编码器.encode(第一次十六进制.slice(7, 27)));
-	const 第二次哈希数组 = Array.from(new Uint8Array(第二次哈希));
-	const 第二次十六进制 = 第二次哈希数组.map(字节 => 字节.toString(16).padStart(2, '0')).join('');
-
-	return 第二次十六进制.toLowerCase();
+async function MD5MD5(文本) {
+	const 第一次十六进制 = await md5Hex(文本);
+	return (await md5Hex(第一次十六进制.slice(7, 27))).toLowerCase();
 }
 
 function 随机路径(完整节点路径 = "/") {
@@ -6132,6 +6220,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		}
 	};
 
+	let config_JSON;
 	try {
 		let configJSON = await env.KV.get('config.json');
 		if (!configJSON || 重置配置 == true) {
@@ -7320,8 +7409,14 @@ export const __testPerformanceHelpers = {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	handleGrpcRequest: 处理gRPC请求,
+	encodeGrpcDataFrame,
+	parseGrpcFrameChunk,
+	unwrapGrpcMessagePayloads,
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	getTransportConfig: 获取传输协议配置,
+	readConfigJson: 读取config_JSON,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog: 请求日志记录,

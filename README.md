@@ -65,6 +65,7 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - Proxy endpoint resolution uses a bounded memory cache and, when KV is bound, a small last-known-good KV cache. This keeps cold starts faster without allowing cache growth to become unbounded.
 - Request logs are stored as append-only KV entries under `log:entry:` instead of one shared `log.json` blob. This avoids lost log writes under concurrent traffic. Existing legacy `log.json` data is still readable as a fallback when no append-only entries exist.
 - TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.
+- gRPC flush timing should be tuned only from measurements. Use `node scripts/grpc-live-smoke-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid` to smoke-test a deployed gRPC endpoint before changing batching constants.
 
 ## Disclaimer
 

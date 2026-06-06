@@ -15,8 +15,14 @@ const {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	handleGrpcRequest,
+	encodeGrpcDataFrame,
+	parseGrpcFrameChunk,
+	unwrapGrpcMessagePayloads,
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	getTransportConfig,
+	readConfigJson,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog,
@@ -48,6 +54,60 @@ function withTestTimeout(promise, timeoutMs, label) {
 	]);
 }
 
+async function waitForCondition(predicate, timeoutMs, label) {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		if (predicate()) return;
+		await new Promise(resolve => setTimeout(resolve, 5));
+	}
+	throw new Error(`test harness timeout: ${label}`);
+}
+
+async function collectReadableStream(stream, timeoutMs = 1_000) {
+	const reader = stream.getReader();
+	const chunks = [];
+	try {
+		while (true) {
+			const { done, value } = await withTestTimeout(reader.read(), timeoutMs, 'collect readable stream');
+			if (done) break;
+			if (value) chunks.push(new Uint8Array(value));
+		}
+	} finally {
+		try { reader.releaseLock(); } catch {}
+	}
+	const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return out;
+}
+
+function uuidBytes(uuid) {
+	return new Uint8Array(uuid.replace(/-/g, '').match(/../g).map(hex => parseInt(hex, 16)));
+}
+
+function makeVlessTcpRequest(uuid, hostname = 'target.example', port = 443, rawData = new Uint8Array(0)) {
+	const hostBytes = new TextEncoder().encode(hostname);
+	const out = new Uint8Array(1 + 16 + 1 + 1 + 2 + 1 + 1 + hostBytes.byteLength + rawData.byteLength);
+	let offset = 0;
+	out[offset++] = 0;
+	out.set(uuidBytes(uuid), offset);
+	offset += 16;
+	out[offset++] = 0;
+	out[offset++] = 1;
+	out[offset++] = (port >> 8) & 0xff;
+	out[offset++] = port & 0xff;
+	out[offset++] = 2;
+	out[offset++] = hostBytes.byteLength;
+	out.set(hostBytes, offset);
+	offset += hostBytes.byteLength;
+	out.set(rawData, offset);
+	return out;
+}
+
 function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = () => {} } = {}) {
 	let closed = false;
 	const socket = {
@@ -71,13 +131,15 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 	return socket;
 }
 
-function makeFakeKV(initialEntries = {}) {
+function makeFakeKV(initialEntries = {}, options = {}) {
 	const store = new Map(Object.entries(initialEntries));
 	const puts = [];
 	return {
 		puts,
 		store,
 		async get(key) {
+			const delayMs = options.getDelays?.[key] || 0;
+			if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
 			return store.has(key) ? store.get(key) : null;
 		},
 		async put(key, value, options) {
@@ -96,6 +158,111 @@ function makeFakeKV(initialEntries = {}) {
 			};
 		},
 	};
+}
+
+{
+	const first = encodeGrpcDataFrame(new Uint8Array([1, 2, 3]));
+	const second = encodeGrpcDataFrame(new Uint8Array([4, 5]));
+	const combined = new Uint8Array(first.byteLength + second.byteLength);
+	combined.set(first, 0);
+	combined.set(second, first.byteLength);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), combined);
+	assert.deepEqual(parsed.payloads, [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])]);
+	assert.equal(parsed.pending.byteLength, 0);
+}
+
+{
+	const message = new Uint8Array([0x0a, 0x01, 0xaa, 0x0a, 0x02, 0xbb, 0xcc]);
+	const frame = new Uint8Array(5 + message.byteLength);
+	frame[0] = 0;
+	frame[4] = message.byteLength;
+	frame.set(message, 5);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), frame);
+	assert.deepEqual(parsed.payloads, [new Uint8Array([0xaa]), new Uint8Array([0xbb, 0xcc])], 'multi-mode protobuf messages should yield each bytes field as a separate payload');
+}
+
+{
+	const frame = encodeGrpcDataFrame(new Uint8Array([9, 8, 7, 6]));
+	const firstHalf = parseGrpcFrameChunk(new Uint8Array(0), frame.subarray(0, 4));
+	assert.equal(firstHalf.payloads.length, 0);
+	assert.equal(firstHalf.pending.byteLength, 4);
+	const secondHalf = parseGrpcFrameChunk(firstHalf.pending, frame.subarray(4));
+	assert.deepEqual(secondHalf.payloads, [new Uint8Array([9, 8, 7, 6])]);
+	assert.equal(secondHalf.pending.byteLength, 0);
+}
+
+{
+	const emptyFrame = new Uint8Array([0, 0, 0, 0, 0]);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), emptyFrame);
+	assert.deepEqual(parsed.payloads, []);
+	assert.equal(parsed.pending.byteLength, 0);
+}
+
+{
+	assert.throws(
+		() => parseGrpcFrameChunk(new Uint8Array(0), new Uint8Array([0, 1, 0, 0, 1])),
+		/gRPC frame too large/
+	);
+	assert.throws(
+		() => unwrapGrpcMessagePayloads(new Uint8Array([0x0a, 0x05, 0x01])),
+		/Invalid gRPC protobuf wrapper/
+	);
+}
+
+{
+	const gun = getTransportConfig({ 传输协议: 'grpc', gRPC模式: 'gun' });
+	const multi = getTransportConfig({ 传输协议: 'grpc', gRPC模式: 'multi' });
+	assert.equal(gun.type, 'grpc&mode=gun&alpn=h2');
+	assert.equal(multi.type, 'grpc&mode=multi&alpn=h2');
+	assert.equal(gun.路径字段名, 'serviceName');
+	assert.equal(gun.域名字段名, 'authority');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const baseConfig = {
+		UUID: uuid,
+		HOST: 'worker.example',
+		HOSTS: ['worker.example'],
+		PATH: '/',
+		协议类型: 'vless',
+		传输协议: 'grpc',
+		gRPC模式: 'gun',
+		gRPCUserAgent: 'UnitTest/1.0',
+		跳过证书验证: false,
+		启用0RTT: false,
+		TLS分片: null,
+		随机路径: false,
+		ECH: false,
+		ECHConfig: { DNS: 'https://dns.example/dns-query', SNI: 'cloudflare-ech.com' },
+		SS: { 加密方式: 'aes-128-gcm', TLS: true },
+		Fingerprint: 'chrome',
+		优选订阅生成: { local: true, 本地IP库: { 随机IP: false, 随机数量: 1, 指定端口: -1 }, SUB: null, SUBNAME: 'edge', SUBUpdateTime: 3 },
+		订阅转换配置: { SUBAPI: 'https://sub.example', SUBCONFIG: '', SUBEMOJI: false },
+		反代: { PROXYIP: 'auto', SOCKS5: { 启用: null, 全局: false, 账号: null, 白名单: [] }, 路径模板: { PROXYIP: 'proxyip={{IP:PORT}}' } },
+		TG: { 启用: false },
+		CF: { Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 } },
+	};
+	for (const mode of ['gun', 'multi']) {
+		const config = await readConfigJson({ KV: makeFakeKV({ 'config.json': JSON.stringify({ ...baseConfig, gRPC模式: mode }) }) }, 'worker.example', uuid, 'UnitTest/1.0');
+		assert.equal(config.LINK.includes(`type=grpc&mode=${mode}&alpn=h2`), true);
+		assert.equal(config.LINK.includes('authority=worker.example'), true);
+		assert.equal(config.LINK.includes('serviceName=%2F'), true);
+	}
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const [alpha, beta] = await Promise.all([
+		readConfigJson({ KV: makeFakeKV({}, { getDelays: { 'tg.json': 25 } }), HOST: 'alpha.example' }, 'alpha.example', uuid, 'UA-A'),
+		readConfigJson({ KV: makeFakeKV({}), HOST: 'beta.example' }, 'beta.example', uuid, 'UA-B'),
+	]);
+	assert.equal(alpha.HOST, 'alpha.example');
+	assert.deepEqual(alpha.HOSTS, ['alpha.example']);
+	assert.equal(alpha.gRPCUserAgent, 'UA-A');
+	assert.equal(beta.HOST, 'beta.example');
+	assert.deepEqual(beta.HOSTS, ['beta.example']);
+	assert.equal(beta.gRPCUserAgent, 'UA-B');
 }
 
 function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
@@ -552,6 +719,80 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		/HTTPS proxy TCP connect timed out/
 	);
 	assert.equal(socket.closedFlag, true, 'HTTPS timeout should close the proxy socket');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	let upstreamClosed = false;
+	let requestBodyCanceled = false;
+	const upstreamWrites = [];
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({}),
+		writable: new WritableStream({
+			write(chunk) {
+				upstreamWrites.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			upstreamClosed = true;
+		},
+	};
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]))));
+		},
+		cancel() {
+			requestBodyCanceled = true;
+		},
+	});
+	const response = await handleGrpcRequest({
+		body,
+		cf: {},
+		headers: { get: () => null },
+		fetcher: { connect: () => socket },
+	}, uuid);
+	const reader = response.body.getReader();
+	await waitForCondition(() => upstreamWrites.length > 0, 300, 'gRPC upstream connection should receive first payload');
+	await reader.cancel();
+	assert.equal(upstreamClosed, true, 'gRPC response cancellation should close upstream socket');
+	assert.equal(requestBodyCanceled, true, 'gRPC response cancellation should cancel request body reads');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	let upstreamClosed = false;
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0xbb]));
+				controller.close();
+			},
+		}),
+		writable: new WritableStream(),
+		closed: Promise.resolve(),
+		close() {
+			upstreamClosed = true;
+		},
+	};
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]))));
+			controller.close();
+		},
+	});
+	const response = await handleGrpcRequest({
+		body,
+		cf: {},
+		headers: { get: () => null },
+		fetcher: { connect: () => socket },
+	}, uuid);
+	const bytes = await collectReadableStream(response.body);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0xbb]]);
+	assert.equal(upstreamClosed, true, 'gRPC upstream EOF should close upstream socket');
 }
 
 console.log('tunnel behavior tests passed');
