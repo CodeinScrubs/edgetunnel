@@ -165,7 +165,7 @@ export default {
 													? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接, parsedProxyAddress)
 													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, parsedProxyAddress));
 									if (!tcpSocket) throw new Error('Unable to connect to the proxy server');
-									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
+									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true, timeout: 检测超时毫秒 });
 									await withOperationTimeout(tlsSocket.handshake(), 检测超时毫秒, 'Proxy check TLS handshake timed out', () => {
 										try { tlsSocket?.close() } catch (e) { }
 									});
@@ -2826,7 +2826,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		const proxySocket = TCP连接({ hostname, port });
 		try {
 			await socketOpenedWithTimeout(proxySocket, timeoutMs, 'HTTPS proxy TCP connect timed out');
-			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha });
+			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha, timeout: timeoutMs });
 			await withOperationTimeout(socket.handshake(), timeoutMs, 'HTTPS proxy TLS handshake timed out', () => {
 				try { socket.close() } catch (e) { }
 			});
@@ -3290,7 +3290,18 @@ class TlsClient {
 	recordHandshake(chunk) { this.handshakeChunks.push(chunk) }
 	transcript() { return 1 === this.handshakeChunks.length ? this.handshakeChunks[0] : concatBytes(...this.handshakeChunks) }
 	getCipherConfig(cipherSuite) { return CIPHER_SUITES_BY_ID.get(cipherSuite) || null }
-	async readChunk(reader) { return this.timeout ? Promise.race([reader.read(), new Promise(((resolve, reject) => setTimeout((() => reject(new Error("TLS read timeout"))), this.timeout)))]) : reader.read() }
+	async readChunk(reader) {
+		if (!this.timeout) return reader.read();
+		let timer;
+		try {
+			return await Promise.race([
+				reader.read(),
+				new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("TLS read timeout")), this.timeout) })
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
 	async readRecordsUntil(reader, predicate, closedError) {
 		for (; ;) {
 			let record;

@@ -396,6 +396,37 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	const ua = 'UnitTest/1.0';
+	const admin = 'test-admin-password';
+	const key = 'default-key-change-with-KEY-env-if-needed';
+	const env = { ADMIN: admin, UUID: '11111111-1111-4111-8111-111111111111', CONNECT_TIMEOUT_MS: '400', KV: makeFakeKV() };
+	const headers = { 'User-Agent': ua, Cookie: `auth=${md5md5(ua + key + admin)}` };
+	let closed = false;
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0x05, 0x00]));
+				controller.enqueue(new Uint8Array([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38]));
+			},
+		}),
+		writable: new WritableStream(),
+		closed: new Promise(() => {}),
+		close() {
+			closed = true;
+		},
+	};
+	const request = new Request('https://worker.example/admin/check?socks5=proxy.example:1080', { headers });
+	request.fetcher = { connect: () => socket };
+	const response = await withTestTimeout(workerModule.default.fetch(request, env, { waitUntil() {} }), 1_500, 'admin proxy check TLS timeout');
+	assert.equal(response.status, 200);
+	const result = JSON.parse(await response.text());
+	assert.equal(result.success, false);
+	assert.match(result.error, /Proxy check TLS handshake timed out/);
+	assert.equal(closed, true, 'admin proxy check timeout should close the probe socket');
+}
+
+{
 	const kv = makeFakeKV();
 	const config = { TG: { 启用: false } };
 	const request = fakeLogRequest('https://worker.example/admin/saveConfig');
