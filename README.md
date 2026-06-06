@@ -39,6 +39,8 @@ This repository contains a Cloudflare Worker / Pages deployment with an admin pa
 | `GO2SOCKS5` | No | `*.example.com` | Optional list of host patterns routed through SOCKS5. |
 | `DEBUG` | No | `1` | Enables debug logging when set to `1` or `true`. |
 | `OFF_LOG` | No | `1` | Disables request logging when set to `1` or `true`. |
+| `LOG_TTL_DAYS` | No | `7` | Number of days to retain append-only KV request log entries. Clamped from 1 to 30 days. |
+| `LOG_READ_LIMIT` | No | `500` | Maximum number of recent request logs returned by `/admin/log.json`. Clamped from 1 to 1000. |
 | `BEST_SUB` | No | `1` | Enables preferred subscription generator mode when set to `1` or `true`. |
 | `PRELOAD_RACE_DIAL` | No | `1` | Enables preload race dialing when set to `1` or `true`. |
 | `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `1500` ms. |
@@ -61,6 +63,7 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - Redeploy after changing production environment variables.
 - The generated subscription host defaults to the current deployed hostname unless `HOST` is explicitly configured.
 - Proxy endpoint resolution uses a bounded memory cache and, when KV is bound, a small last-known-good KV cache. This keeps cold starts faster without allowing cache growth to become unbounded.
+- Request logs are stored as append-only KV entries under `log:entry:` instead of one shared `log.json` blob. This avoids lost log writes under concurrent traffic. Existing legacy `log.json` data is still readable as a fallback when no append-only entries exist.
 - TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.
 
 ## Disclaimer

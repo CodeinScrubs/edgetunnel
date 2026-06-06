@@ -21,6 +21,16 @@ const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = 850;
 const PROXY_CONNECT_TIMEOUT_MIN_MS = 400;
 const PROXY_CONNECT_TIMEOUT_MAX_MS = 1500;
+const REQUEST_LOG_ENTRY_PREFIX = 'log:entry:';
+const REQUEST_LOG_DEDUPE_PREFIX = 'log:dedupe:';
+const REQUEST_LOG_LEGACY_KEY = 'log.json';
+const REQUEST_LOG_MAX_REVERSE_TIME = 9999999999999;
+const REQUEST_LOG_DEFAULT_READ_LIMIT = 500;
+const REQUEST_LOG_MAX_READ_LIMIT = 1000;
+const REQUEST_LOG_DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60;
+const REQUEST_LOG_MIN_TTL_SECONDS = 60 * 60;
+const REQUEST_LOG_MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
+const REQUEST_LOG_DEDUPE_TTL_SECONDS = 30 * 60;
 const DOH_LOOKUP_TIMEOUT_MS = 850;
 const DNS_TCP_RESPONSE_TIMEOUT_MS = 1200;
 const DIAL_STAGGER_MS = 90;
@@ -104,8 +114,8 @@ export default {
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('Redirecting...', { status: 302, headers: { 'Location': '/login' } });
 					if (访问路径 === 'admin/log.json') {
-						const 读取日志内容 = await env.KV.get('log.json') || '[]';
-						return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						const 日志内容 = await readRequestLogs(env, { limit: url.searchParams.get('limit') });
+						return new Response(JSON.stringify(日志内容, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					} else if (区分大小写访问路径 === 'admin/getCloudflareUsage') {
 						try {
 							const Usage_JSON = await getCloudflareUsage(url.searchParams.get('Email'), url.searchParams.get('GlobalAPIKey'), url.searchParams.get('AccountID'), url.searchParams.get('APIToken'));
@@ -4816,11 +4826,122 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 	return 输出内容;
 }
 
+function clampRequestLogNumber(value, fallback, min, max) {
+	const number = Number(value);
+	if (!Number.isFinite(number)) return fallback;
+	return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function getRequestLogReadLimit(env = {}, explicitLimit = null) {
+	return clampRequestLogNumber(explicitLimit ?? env.LOG_READ_LIMIT, REQUEST_LOG_DEFAULT_READ_LIMIT, 1, REQUEST_LOG_MAX_READ_LIMIT);
+}
+
+function getRequestLogTtlSeconds(env = {}) {
+	if (env.LOG_TTL_SECONDS !== undefined) {
+		return clampRequestLogNumber(env.LOG_TTL_SECONDS, REQUEST_LOG_DEFAULT_TTL_SECONDS, REQUEST_LOG_MIN_TTL_SECONDS, REQUEST_LOG_MAX_TTL_SECONDS);
+	}
+	const days = clampRequestLogNumber(env.LOG_TTL_DAYS, REQUEST_LOG_DEFAULT_TTL_SECONDS / 86400, 1, REQUEST_LOG_MAX_TTL_SECONDS / 86400);
+	return days * 86400;
+}
+
+function buildRequestLogEntryKey(timestamp = Date.now(), nonce = '') {
+	const safeTimestamp = Math.max(0, Math.min(REQUEST_LOG_MAX_REVERSE_TIME, Math.floor(Number(timestamp) || Date.now())));
+	const reverseTime = String(REQUEST_LOG_MAX_REVERSE_TIME - safeTimestamp).padStart(13, '0');
+	const suffix = String(nonce || crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`)
+		.replace(/[^a-z0-9-]/gi, '')
+		.slice(0, 64) || stableHashText(`${timestamp}|${Math.random()}`);
+	return `${REQUEST_LOG_ENTRY_PREFIX}${reverseTime}:${suffix}`;
+}
+
+function buildRequestLogDedupeKey(logEntry) {
+	return `${REQUEST_LOG_DEDUPE_PREFIX}${stableHashText([
+		logEntry?.TYPE || '',
+		logEntry?.IP || '',
+		logEntry?.URL || '',
+		logEntry?.UA || '',
+	].join('|'))}`;
+}
+
+async function readLegacyRequestLogs(env = {}) {
+	if (!env?.KV || typeof env.KV.get !== 'function') return [];
+	try {
+		const legacy = await env.KV.get(REQUEST_LOG_LEGACY_KEY);
+		if (!legacy) return [];
+		const parsed = JSON.parse(legacy);
+		return Array.isArray(parsed) ? parsed : [];
+	} catch (error) {
+		console.error(`Failed to read legacy request logs: ${error.message}`);
+		return [];
+	}
+}
+
+async function readRequestLogs(env = {}, options = {}) {
+	const limit = getRequestLogReadLimit(env, options.limit);
+	if (!env?.KV) return [];
+	if (typeof env.KV.list !== 'function' || typeof env.KV.get !== 'function') {
+		return readLegacyRequestLogs(env);
+	}
+
+	const logs = [];
+	let cursor;
+	try {
+		do {
+			const pageLimit = Math.min(REQUEST_LOG_MAX_READ_LIMIT, Math.max(1, limit - logs.length));
+			const page = await env.KV.list({ prefix: REQUEST_LOG_ENTRY_PREFIX, limit: pageLimit, cursor });
+			const keys = Array.isArray(page?.keys) ? page.keys : [];
+			const values = await Promise.all(keys.map(async key => {
+				try {
+					const raw = await env.KV.get(key.name);
+					if (!raw) return null;
+					const parsed = JSON.parse(raw);
+					return parsed && typeof parsed === 'object' ? parsed : null;
+				} catch (error) {
+					return null;
+				}
+			}));
+			for (const value of values) {
+				if (value) logs.push(value);
+				if (logs.length >= limit) break;
+			}
+			cursor = page?.cursor;
+			if (page?.list_complete !== false || logs.length >= limit) break;
+		} while (cursor);
+	} catch (error) {
+		console.error(`Failed to read request logs: ${error.message}`);
+	}
+
+	return logs.length ? logs : readLegacyRequestLogs(env);
+}
+
+async function writeRequestLogEntry(env = {}, logEntry, requestType = "Get_SUB", now = Date.now()) {
+	if (!env?.KV || typeof env.KV.put !== 'function') return false;
+	const entry = { ...logEntry, TIME: Number(logEntry?.TIME) || now };
+
+	if (requestType !== "Get_SUB") {
+		const dedupeKey = buildRequestLogDedupeKey(entry);
+		if (typeof env.KV.get === 'function') {
+			try {
+				if (await env.KV.get(dedupeKey)) return false;
+			} catch (error) {
+				console.error(`Failed to read request log dedupe key: ${error.message}`);
+			}
+		}
+		try {
+			await env.KV.put(dedupeKey, String(entry.TIME), { expirationTtl: REQUEST_LOG_DEDUPE_TTL_SECONDS });
+		} catch (error) {
+			console.error(`Failed to write request log dedupe key: ${error.message}`);
+		}
+	}
+
+	await env.KV.put(buildRequestLogEntryKey(entry.TIME), JSON.stringify(entry), { expirationTtl: getRequestLogTtlSeconds(env) });
+	return true;
+}
+
 async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
 	try {
 		const 当前时间 = new Date();
 		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
-		if (config_JSON.TG.启用) {
+		if (config_JSON?.TG?.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
 				const TG_JSON = JSON.parse(TG_TXT);
@@ -4850,24 +4971,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 		}
 		是否写入KV日志 = ['1', 'true'].includes(env.OFF_LOG) ? false : 是否写入KV日志;
 		if (!是否写入KV日志) return;
-		let 日志数组 = [];
-		const 现有日志 = await env.KV.get('log.json'), KV容量限制 = 4;//MB
-		if (现有日志) {
-			try {
-				日志数组 = JSON.parse(现有日志);
-				if (!Array.isArray(日志数组)) { 日志数组 = [日志内容] }
-				else if (请求类型 !== "Get_SUB") {
-					const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
-					if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
-					日志数组.push(日志内容);
-					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-				} else {
-					日志数组.push(日志内容);
-					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-				}
-			} catch (e) { 日志数组 = [日志内容] }
-		} else { 日志数组 = [日志内容] }
-		await env.KV.put('log.json', JSON.stringify(日志数组, null, 2));
+		await writeRequestLogEntry(env, 日志内容, 请求类型, 当前时间.getTime());
 	} catch (error) { console.error(`Failed to record log: ${error.message}`) }
 }
 
@@ -7218,6 +7322,10 @@ export const __testPerformanceHelpers = {
 	httpsConnect,
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	buildRequestLogEntryKey,
+	readRequestLogs,
+	recordRequestLog: 请求日志记录,
+	writeRequestLogEntry,
 	isSpeedTestSite,
 	matchesHostPattern,
 	patchSingboxSubscription: Singbox订阅配置文件热补丁,

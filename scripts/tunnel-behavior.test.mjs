@@ -17,6 +17,10 @@ const {
 	httpsConnect,
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	buildRequestLogEntryKey,
+	readRequestLogs,
+	recordRequestLog,
+	writeRequestLogEntry,
 	isSpeedTestSite,
 	matchesHostPattern,
 	patchSingboxSubscription,
@@ -65,6 +69,95 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 		},
 	};
 	return socket;
+}
+
+function makeFakeKV(initialEntries = {}) {
+	const store = new Map(Object.entries(initialEntries));
+	const puts = [];
+	return {
+		puts,
+		store,
+		async get(key) {
+			return store.has(key) ? store.get(key) : null;
+		},
+		async put(key, value, options) {
+			puts.push({ key, value, options });
+			store.set(key, value);
+		},
+		async list({ prefix = '', limit = 1000, cursor } = {}) {
+			const offset = cursor ? Number(cursor) : 0;
+			const names = [...store.keys()].filter(key => key.startsWith(prefix)).sort();
+			const page = names.slice(offset, offset + limit);
+			const nextOffset = offset + page.length;
+			return {
+				keys: page.map(name => ({ name })),
+				list_complete: nextOffset >= names.length,
+				cursor: nextOffset >= names.length ? undefined : String(nextOffset),
+			};
+		},
+	};
+}
+
+function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
+	return {
+		cf: { asn: 13335, asOrganization: 'Cloudflare', country: 'US', city: 'Austin' },
+		url,
+		headers: {
+			get(name) {
+				if (String(name).toLowerCase() === 'user-agent') return 'UnitTest/1.0';
+				return null;
+			},
+		},
+	};
+}
+
+{
+	const firstKey = buildRequestLogEntryKey(1000, 'a');
+	const secondKey = buildRequestLogEntryKey(2000, 'b');
+	assert.equal(firstKey < secondKey, false, 'newer log keys should sort before older keys');
+	assert.equal(firstKey.startsWith('log:entry:'), true);
+}
+
+{
+	const kv = makeFakeKV();
+	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/a' }, 'Get_SUB', 1000);
+	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1001, URL: 'https://worker.example/b' }, 'Get_SUB', 1001);
+
+	assert.equal(kv.puts.filter(call => call.key.startsWith('log:entry:')).length, 2);
+	assert.equal(kv.puts.some(call => call.key === 'log.json'), false, 'append-only logging must not write the legacy shared log.json key');
+}
+
+{
+	const kv = makeFakeKV();
+	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/old' }, 'Get_SUB', 1000);
+	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 2000, URL: 'https://worker.example/new' }, 'Get_SUB', 2000);
+
+	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
+	assert.deepEqual(logs.map(log => log.URL), ['https://worker.example/new', 'https://worker.example/old']);
+}
+
+{
+	const legacy = JSON.stringify([{ TYPE: 'Legacy', TIME: 1, URL: 'https://worker.example/legacy' }]);
+	const kv = makeFakeKV({ 'log.json': legacy });
+	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
+	assert.deepEqual(logs, JSON.parse(legacy));
+}
+
+{
+	const kv = makeFakeKV();
+	await recordRequestLog({ KV: kv, OFF_LOG: '1' }, fakeLogRequest(), '203.0.113.10', 'Get_SUB', { TG: { 启用: false } }, true);
+	assert.equal(kv.puts.length, 0, 'OFF_LOG should disable KV log writes');
+}
+
+{
+	const kv = makeFakeKV();
+	const config = { TG: { 启用: false } };
+	const request = fakeLogRequest('https://worker.example/admin/saveConfig');
+	await recordRequestLog({ KV: kv }, request, '203.0.113.10', 'Save_Config', config, true);
+	await recordRequestLog({ KV: kv }, request, '203.0.113.10', 'Save_Config', config, true);
+
+	assert.equal(kv.puts.filter(call => call.key.startsWith('log:entry:')).length, 1, 'duplicate non-subscription admin logs should be throttled');
+	assert.equal(kv.puts.some(call => call.key.startsWith('log:dedupe:')), true);
 }
 
 {
