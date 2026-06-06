@@ -146,7 +146,8 @@ export default {
 						const startTime = Date.now();
 						let 检测代理响应;
 						try {
-							const parsedProxyAddress = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
+							const 检测超时毫秒 = getProxyConnectTimeoutMs(env);
+							const parsedProxyAddress = { ...(await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议))), timeoutMs: 检测超时毫秒 };
 							const { username, password, hostname, port } = parsedProxyAddress;
 							const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
 							try {
@@ -165,12 +166,18 @@ export default {
 													: await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, parsedProxyAddress));
 									if (!tcpSocket) throw new Error('Unable to connect to the proxy server');
 									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
-									await tlsSocket.handshake();
-									await tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`));
+									await withOperationTimeout(tlsSocket.handshake(), 检测超时毫秒, 'Proxy check TLS handshake timed out', () => {
+										try { tlsSocket?.close() } catch (e) { }
+									});
+									await withOperationTimeout(tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`)), 检测超时毫秒, 'Proxy check request write timed out', () => {
+										try { tlsSocket?.close() } catch (e) { }
+									});
 									let responseBuffer = new Uint8Array(0), headerEndIndex = -1, contentLength = null, chunked = false;
 									const 最大响应字节 = 64 * 1024;
 									while (responseBuffer.length < 最大响应字节) {
-										const value = await tlsSocket.read();
+										const value = await withOperationTimeout(tlsSocket.read(), 检测超时毫秒, 'Proxy check response timed out', () => {
+											try { tlsSocket?.close() } catch (e) { }
+										});
 										if (!value) break;
 										if (value.byteLength === 0) continue;
 										responseBuffer = 拼接字节数据(responseBuffer, value);
@@ -2691,28 +2698,49 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 	const { username, password, hostname, port } = proxyAddress;
 	const timeoutMs = getProxyHandshakeTimeoutMs(proxyAddress);
 	const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
+	let pending = new Uint8Array(0);
+	const readExact = async (byteCount, message) => {
+		while (pending.byteLength < byteCount) {
+			const response = await readWithOperationTimeout(reader, timeoutMs, message);
+			if (response.done || !response.value) throw new Error(message.replace(' timed out', ' closed before completing'));
+			const chunk = 数据转Uint8Array(response.value);
+			if (chunk.byteLength) pending = pending.byteLength ? 拼接字节数据(pending, chunk) : chunk;
+		}
+		const out = pending.slice(0, byteCount);
+		pending = pending.slice(byteCount);
+		return out;
+	};
 	try {
 		await socketOpenedWithTimeout(socket, timeoutMs, 'SOCKS5 proxy TCP connect timed out');
 		const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
 		await writeWithOperationTimeout(writer, authMethods, timeoutMs, 'SOCKS5 proxy method write timed out');
-		let response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
-		if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
+		let response = await readExact(2, 'SOCKS5 proxy handshake timed out');
+		if (response[0] !== 0x05) throw new Error('S5 method selection failed');
 
-		const selectedMethod = new Uint8Array(response.value)[1];
+		const selectedMethod = response[1];
 		if (selectedMethod === 0x02) {
 			if (!username || !password) throw new Error('S5 requires authentication');
 			const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
+			if (userBytes.byteLength > 255 || passBytes.byteLength > 255) throw new Error('S5 username/password is too long');
 			const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
 			await writeWithOperationTimeout(writer, authPacket, timeoutMs, 'SOCKS5 proxy authentication write timed out');
-			response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
-			if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
+			response = await readExact(2, 'SOCKS5 proxy handshake timed out');
+			if (response[0] !== 0x01 || response[1] !== 0x00) throw new Error('S5 authentication failed');
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
 		const hostBytes = new TextEncoder().encode(targetHost);
+		if (hostBytes.byteLength > 255) throw new Error('S5 target hostname is too long');
 		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
 		await writeWithOperationTimeout(writer, connectPacket, timeoutMs, 'SOCKS5 proxy CONNECT write timed out');
-		response = await readWithOperationTimeout(reader, timeoutMs, 'SOCKS5 proxy handshake timed out');
-		if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
+		response = await readExact(4, 'SOCKS5 proxy handshake timed out');
+		if (response[0] !== 0x05 || response[1] !== 0x00) throw new Error('S5 connection failed');
+		const atyp = response[3];
+		if (atyp === 0x01) await readExact(6, 'SOCKS5 proxy handshake timed out');
+		else if (atyp === 0x04) await readExact(18, 'SOCKS5 proxy handshake timed out');
+		else if (atyp === 0x03) {
+			const length = (await readExact(1, 'SOCKS5 proxy handshake timed out'))[0];
+			await readExact(length + 2, 'SOCKS5 proxy handshake timed out');
+		} else throw new Error(`S5 unsupported address type: ${atyp}`);
 
 		if (有效数据长度(initialData) > 0) await writeWithOperationTimeout(writer, initialData, timeoutMs, 'SOCKS5 initial data write timed out');
 		writer.releaseLock(); reader.releaseLock();

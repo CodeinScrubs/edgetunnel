@@ -789,6 +789,45 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	const writes = [];
+	let closed = false;
+	const chunks = [
+		new Uint8Array([0x05]),
+		new Uint8Array([0x00]),
+		new Uint8Array([0x05]),
+		new Uint8Array([0x00, 0x00, 0x01]),
+		new Uint8Array([127, 0, 0, 1, 0x04, 0x38]),
+	];
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				for (const chunk of chunks) controller.enqueue(chunk);
+			},
+		}),
+		writable: new WritableStream({
+			write(chunk) {
+				writes.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			closed = true;
+		},
+	};
+	const result = await withTestTimeout(
+		socks5Connect('target.example', 443, new Uint8Array([0xaa, 0xbb]), () => socket, { hostname: 'proxy.example', port: 1080, timeoutMs: 400 }),
+		1_000,
+		'SOCKS5 split handshake'
+	);
+	assert.equal(result, socket);
+	assert.equal(closed, false, 'valid split SOCKS5 handshake should not close the socket');
+	assert.deepEqual(writes[0], new Uint8Array([0x05, 0x01, 0x00]));
+	assert.deepEqual(writes[1], new Uint8Array([0x05, 0x01, 0x00, 0x03, 14, 116, 97, 114, 103, 101, 116, 46, 101, 120, 97, 109, 112, 108, 101, 0x01, 0xbb]));
+	assert.deepEqual(writes[2], new Uint8Array([0xaa, 0xbb]));
+}
+
+{
 	let canceled = false;
 	const socket = makeHangingProxySocket({ readableCancel: () => { canceled = true; } });
 	await assert.rejects(
