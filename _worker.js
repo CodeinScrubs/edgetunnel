@@ -294,9 +294,9 @@ export default {
 					} else if (区分大小写访问路径 === 'admin/ADD.txt') {
 						let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
 						if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
-						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
+						return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': String(request.cf?.asn || '0') } });
 					} else if (访问路径 === 'admin/cf.json') {
-						return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						return new Response(JSON.stringify(request.cf || {}, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					}
 
 					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
@@ -837,6 +837,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	return new Response(new ReadableStream({
 		async start(controller) {
 			let 已关闭 = false;
+			let 已清理 = false;
 			let 发送队列 = [];
 			let 队列字节数 = 0;
 			let 刷新定时器 = null;
@@ -856,6 +857,11 @@ async function 处理gRPC请求(request, yourUUID) {
 					刷新发送队列(true);
 					已关闭 = true;
 					this.readyState = WebSocket.CLOSED;
+					GRPC上行写入队列?.清空();
+					try {
+						const cancelPromise = reader.cancel();
+						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
+					} catch (e) { }
 					try { controller.close() } catch (e) { }
 				}
 			};
@@ -898,9 +904,10 @@ async function 处理gRPC请求(request, yourUUID) {
 			};
 
 			const 关闭连接 = () => {
-				if (已关闭) return;
+				if (已清理) return;
+				已清理 = true;
 				GRPC上行写入队列?.清空();
-				刷新发送队列(true);
+				if (!已关闭) 刷新发送队列(true);
 				已关闭 = true;
 				grpcBridge.readyState = WebSocket.CLOSED;
 				if (刷新定时器) clearTimeout(刷新定时器);
@@ -4984,7 +4991,8 @@ async function writeRequestLogEntry(env = {}, logEntry, requestType = "Get_SUB",
 async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
 	try {
 		const 当前时间 = new Date();
-		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+		const cf = request.cf || {};
+		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON?.TG?.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
@@ -7417,6 +7425,8 @@ export const __testPerformanceHelpers = {
 	finalizeSubscriptionContent,
 	getTransportConfig: 获取传输协议配置,
 	readConfigJson: 读取config_JSON,
+	translateHTMLVisibleText,
+	injectEnglishRuntimeTranslator,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog: 请求日志记录,

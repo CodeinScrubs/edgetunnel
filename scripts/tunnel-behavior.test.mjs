@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 globalThis.WebSocket = globalThis.WebSocket || { OPEN: 1, CLOSING: 2, CLOSED: 3 };
 
-const helpers = await import('../_worker.js').then(mod => mod.__testPerformanceHelpers);
+const workerModule = await import('../_worker.js');
+const helpers = workerModule.__testPerformanceHelpers;
 
 const {
 	createTunnelContext,
@@ -23,6 +25,8 @@ const {
 	finalizeSubscriptionContent,
 	getTransportConfig,
 	readConfigJson,
+	translateHTMLVisibleText,
+	injectEnglishRuntimeTranslator,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog,
@@ -87,6 +91,14 @@ async function collectReadableStream(stream, timeoutMs = 1_000) {
 
 function uuidBytes(uuid) {
 	return new Uint8Array(uuid.replace(/-/g, '').match(/../g).map(hex => parseInt(hex, 16)));
+}
+
+function md5Hex(value) {
+	return createHash('md5').update(String(value)).digest('hex').toLowerCase();
+}
+
+function md5md5(value) {
+	return md5Hex(md5Hex(value).slice(7, 27));
 }
 
 function makeVlessTcpRequest(uuid, hostname = 'target.example', port = 443, rawData = new Uint8Array(0)) {
@@ -265,6 +277,22 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 	assert.equal(beta.gRPCUserAgent, 'UA-B');
 }
 
+{
+	const translated = translateHTMLVisibleText('<html lang="zh-CN"><body><button title="保存配置">保存配置</button><p>请稍候</p><script>const label="保存配置";</script></body></html>');
+	const visibleHtml = translated.replace(/<script\b[\s\S]*?<\/script>/gi, '');
+	assert.equal(translated.includes('lang="en"'), true);
+	assert.equal(/[\u3400-\u9fff\uf900-\ufaff]/.test(visibleHtml), false, 'visible translated HTML should not leak non-English Han text');
+	assert.equal(translated.includes('<script>const label="保存配置";</script>'), true, 'script contents should not be rewritten server-side');
+}
+
+{
+	const injected = injectEnglishRuntimeTranslator('<html><body><p>保存配置</p></body></html>');
+	const scriptMatch = injected.match(/<script data-english-runtime-translator>([\s\S]*?)<\/script>/);
+	assert.ok(scriptMatch, 'runtime translator script should be injected');
+	assert.equal(/[\u3400-\u9fff\uf900-\ufaff]/.test(scriptMatch[1]), false, 'runtime translator script should escape raw non-English text');
+	new Function(scriptMatch[1]);
+}
+
 function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	return {
 		cf: { asn: 13335, asOrganization: 'Cloudflare', country: 'US', city: 'Austin' },
@@ -312,8 +340,35 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 
 {
 	const kv = makeFakeKV();
+	await recordRequestLog({ KV: kv }, { url: 'https://worker.example/sub', headers: { get: () => null } }, '203.0.113.55', 'Get_SUB', { TG: { 启用: false } }, true);
+	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
+	assert.equal(logs.length, 1, 'request logs should be written even when request.cf is unavailable');
+	assert.equal(logs[0].ASN, 'AS0 Unknown');
+	assert.equal(logs[0].CC, 'N/A N/A');
+}
+
+{
+	const kv = makeFakeKV();
 	await recordRequestLog({ KV: kv, OFF_LOG: '1' }, fakeLogRequest(), '203.0.113.10', 'Get_SUB', { TG: { 启用: false } }, true);
 	assert.equal(kv.puts.length, 0, 'OFF_LOG should disable KV log writes');
+}
+
+{
+	const ua = 'UnitTest/1.0';
+	const admin = 'test-admin-password';
+	const key = 'default-key-change-with-KEY-env-if-needed';
+	const env = { ADMIN: admin, UUID: '11111111-1111-4111-8111-111111111111', KV: makeFakeKV({ 'ADD.txt': '203.0.113.1' }) };
+	const headers = { 'User-Agent': ua, Cookie: `auth=${md5md5(ua + key + admin)}` };
+	const ctx = { waitUntil() {} };
+
+	const addResponse = await workerModule.default.fetch(new Request('https://worker.example/admin/ADD.txt', { headers }), env, ctx);
+	assert.equal(addResponse.status, 200);
+	assert.equal(addResponse.headers.get('asn'), '0');
+	assert.equal(await addResponse.text(), '203.0.113.1');
+
+	const cfResponse = await workerModule.default.fetch(new Request('https://worker.example/admin/cf.json', { headers }), env, ctx);
+	assert.equal(cfResponse.status, 200);
+	assert.deepEqual(JSON.parse(await cfResponse.text()), {});
 }
 
 {
@@ -516,10 +571,18 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
-	await assert.doesNotReject(async () => {
-		const result = await patchSingboxSubscription('{ this is not json', { UUID: '11111111-1111-4111-8111-111111111111' });
-		assert.equal(result, '{ this is not json');
-	});
+	const originalConsoleError = console.error;
+	const capturedErrors = [];
+	console.error = (...args) => capturedErrors.push(args);
+	try {
+		await assert.doesNotReject(async () => {
+			const result = await patchSingboxSubscription('{ this is not json', { UUID: '11111111-1111-4111-8111-111111111111' });
+			assert.equal(result, '{ this is not json');
+		});
+	} finally {
+		console.error = originalConsoleError;
+	}
+	assert.equal(capturedErrors.length, 1, 'invalid Singbox JSON should be logged once without throwing');
 }
 
 {
@@ -763,6 +826,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 {
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	let upstreamClosed = false;
+	let requestBodyCanceled = false;
 	const socket = {
 		opened: Promise.resolve(),
 		readable: new ReadableStream({
@@ -780,7 +844,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const body = new ReadableStream({
 		start(controller) {
 			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]))));
-			controller.close();
+		},
+		cancel() {
+			requestBodyCanceled = true;
 		},
 	});
 	const response = await handleGrpcRequest({
@@ -792,6 +858,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const bytes = await collectReadableStream(response.body);
 	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
 	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0xbb]]);
+	await waitForCondition(() => requestBodyCanceled, 300, 'gRPC upstream EOF should cancel open request body');
 	assert.equal(upstreamClosed, true, 'gRPC upstream EOF should close upstream socket');
 }
 

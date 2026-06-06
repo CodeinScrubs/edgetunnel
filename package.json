@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/tunnel-behavior.test.mjs && node scripts/performance-cache.test.mjs",
+    "check": "node --check _worker.js && node --check scripts/grpc-live-smoke-benchmark.mjs"
+  }
+}
