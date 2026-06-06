@@ -15,7 +15,13 @@ const {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	isSpeedTestSite,
+	matchesHostPattern,
+	patchSingboxSubscription,
+	patchSurgeSubscription,
+	readGrpcFrameLength,
 	expandPreferredEndpointVariants,
 } = helpers;
 
@@ -65,9 +71,51 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 	assert.deepEqual(expandPreferredEndpointVariants('speedtest.net'), ['speedtest.net', 'www.speedtest.net']);
 	assert.deepEqual(expandPreferredEndpointVariants('www.speedtest.net'), ['www.speedtest.net', 'speedtest.net']);
 	assert.deepEqual(expandPreferredEndpointVariants('example.com:8443#edge'), ['example.com:8443#edge', 'www.example.com:8443#edge']);
+	assert.deepEqual(expandPreferredEndpointVariants('cdn.example.com:8443#sub'), ['cdn.example.com:8443#sub']);
 	assert.deepEqual(expandPreferredEndpointVariants('104.21.105.47:443#ip'), ['104.21.105.47:443#ip']);
 	assert.deepEqual(expandPreferredEndpointVariants('[2606:4700::6811:9316]:443#ipv6'), ['[2606:4700::6811:9316]:443#ipv6']);
 	assert.deepEqual(expandPreferredEndpointVariants('*.example.com:443#wildcard'), ['*.example.com:443#wildcard']);
+}
+
+{
+	const headers = { get: () => null };
+	const clashBase64 = getSubscriptionRequestOptions(new URL('https://worker.example/sub?target=clash&base64'), { headers }, 'mozilla', false);
+	assert.equal(clashBase64.type, 'clash');
+	assert.equal(clashBase64.shouldBase64Subscription, true);
+	assert.equal(clashBase64.isSubConverterRequest, false);
+
+	const rawBase64 = getSubscriptionRequestOptions(new URL('https://worker.example/sub?base64'), { headers }, 'mozilla', false);
+	assert.equal(rawBase64.type, 'mixed');
+	assert.equal(rawBase64.shouldBase64Subscription, true);
+
+	const converter = getSubscriptionRequestOptions(new URL('https://worker.example/sub?target=clash'), {
+		headers: { get: name => String(name).toLowerCase() === 'subconverter-request' ? '1' : null },
+	}, 'clash', false);
+	assert.equal(converter.type, 'mixed');
+	assert.equal(converter.isSubConverterRequest, true);
+}
+
+{
+	assert.equal(isSpeedTestSite('speed.cloudflare.com'), true);
+	assert.equal(isSpeedTestSite('SPEED.CLOUDFLARE.COM'), true);
+	assert.equal(isSpeedTestSite('edge.speed.cloudflare.com'), true);
+	assert.equal(isSpeedTestSite('not-speed.cloudflare.com.example'), false);
+}
+
+{
+	assert.equal(matchesHostPattern('api.example.com', '*.example.com'), true);
+	assert.equal(matchesHostPattern('badexample.com', '*.example.com'), false);
+	assert.equal(matchesHostPattern('xexampleycom', '*.example.com'), false);
+	assert.equal(matchesHostPattern('media.tapecontent.net', '*tapecontent.net'), true);
+	assert.equal(matchesHostPattern('media.tapecontentXnet', '*tapecontent.net'), false);
+}
+
+{
+	assert.equal(readGrpcFrameLength(new Uint8Array([0, 0, 0, 0, 1])), 1);
+	assert.throws(
+		() => readGrpcFrameLength(new Uint8Array([0, 1, 0, 0, 1])),
+		/gRPC frame too large/
+	);
 }
 
 {
@@ -171,6 +219,27 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 }
 
 {
+	const content = [
+		'- name: generated',
+		'  type: vless',
+		'  server: front.example.com',
+		'  uuid: 00000000-0000-4000-8000-000000000000',
+		'  servername: example.com',
+		'  ws-opts:',
+		'    headers:',
+		'      Host: example.com',
+	].join('\n');
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker-one.example.net', 'worker-two.example.net'],
+	});
+	const servername = result.match(/servername:\s*([^\n]+)/)?.[1]?.trim();
+	const hostHeader = result.match(/Host:\s*([^\n]+)/)?.[1]?.trim();
+
+	assert.equal(servername, hostHeader, 'generated multi-line node must use the same host for servername and Host header');
+}
+
+{
 	const first = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { PROXYIP: 'first.example.com' });
 	const second = await createTunnelContext(fakeRequest({ colo: 'AMS' }), { PROXYIP: 'second.example.com' });
 
@@ -184,6 +253,25 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 	assert.equal(second.proxyType, 'socks5');
 	assert.equal(second.globalProxyEnabled, true);
 	assert.equal(second.parsedProxyAddress.hostname, 'socks.example.com');
+}
+
+{
+	await assert.doesNotReject(async () => {
+		const result = await patchSingboxSubscription('{ this is not json', { UUID: '11111111-1111-4111-8111-111111111111' });
+		assert.equal(result, '{ this is not json');
+	});
+}
+
+{
+	assert.doesNotThrow(() => {
+		const result = patchSurgeSubscription('node = trojan, front.example.com, 443, password=pw, skip-cert-verify=false', 'https://worker.example/sub', {
+			随机路径: false,
+			完整节点路径: '/',
+			跳过证书验证: false,
+			优选订阅生成: { SUBUpdateTime: 3 },
+		});
+		assert.equal(result.includes('#!MANAGED-CONFIG https://worker.example/sub'), true);
+	});
 }
 
 {

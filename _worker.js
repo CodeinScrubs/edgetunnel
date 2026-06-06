@@ -7,6 +7,7 @@ const Pages静态页面 = 'https://edt-pages.github.io';
 const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
+const GRPC_MAX_FRAME_PAYLOAD_BYTES = 上行队列最大字节;
 const PROXY_RESOLUTION_CACHE_VERSION = 1;
 const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = 24;
 const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = 8;
@@ -322,22 +323,10 @@ export default {
 							const total = Number.isFinite(config_JSON.CF.Usage.max) ? (config_JSON.CF.Usage.max / 1000) * 1024 : 1024 * 100;
 							responseHeaders["Subscription-Userinfo"] = `upload=${pagesSum}; download=${workersSum}; total=${total}; expire=4102329600`;
 						}
-						const isSubConverterRequest = url.searchParams.has('b64') || url.searchParams.has('base64') || request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || ua.includes('subconverter') || ua.includes(('CF-Workers-SUB').toLowerCase()) || 作为优选订阅生成器;
-						const 订阅类型 = isSubConverterRequest
-							? 'mixed'
-							: url.searchParams.has('target')
-								? url.searchParams.get('target')
-								: url.searchParams.has('clash') || ua.includes('clash') || ua.includes('meta') || ua.includes('mihomo')
-									? 'clash'
-									: url.searchParams.has('sb') || url.searchParams.has('singbox') || ua.includes('singbox') || ua.includes('sing-box')
-										? 'singbox'
-										: url.searchParams.has('surge') || ua.includes('surge')
-											? 'surge&ver=4'
-											: url.searchParams.has('quanx') || ua.includes('quantumult')
-												? 'quanx'
-												: url.searchParams.has('loon') || ua.includes('loon')
-													? 'loon'
-													: 'mixed';
+						const subscriptionRequestOptions = getSubscriptionRequestOptions(url, request, ua, 作为优选订阅生成器);
+						const isSubConverterRequest = subscriptionRequestOptions.isSubConverterRequest;
+						const shouldBase64Subscription = subscriptionRequestOptions.shouldBase64Subscription;
+						const 订阅类型 = subscriptionRequestOptions.type;
 
 						if (!ua.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
 						const 协议类型 = ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
@@ -458,7 +447,7 @@ export default {
 							订阅内容 = finalizeSubscriptionContent(订阅内容, config_JSON);
 						}
 
-						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
+						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || shouldBase64Subscription)) 订阅内容 = btoa(订阅内容);
 
 						if (订阅类型 === 'singbox') {
 							订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
@@ -976,7 +965,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					merged.set(当前块, pending.length);
 					pending = merged;
 					while (pending.byteLength >= 5) {
-						const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
+						const grpcLen = readGrpcFrameLength(pending);
 						const frameSize = 5 + grpcLen;
 						if (pending.byteLength < frameSize) break;
 						const grpcPayload = pending.subarray(5, frameSize);
@@ -1718,6 +1707,14 @@ function 拼接字节数据(...chunkList) {
 	return result;
 }
 
+function readGrpcFrameLength(frameHeader) {
+	const data = 数据转Uint8Array(frameHeader);
+	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
+	const grpcLen = ((data[1] << 24) >>> 0) | (data[2] << 16) | (data[3] << 8) | data[4];
+	if (grpcLen > GRPC_MAX_FRAME_PAYLOAD_BYTES) throw new Error(`gRPC frame too large: ${grpcLen}B`);
+	return grpcLen;
+}
+
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
 	const 当前块 = 数据转Uint8Array(chunk);
 	const 缓存块 = 上下文?.缓存 instanceof Uint8Array ? 上下文.缓存 : new Uint8Array(0);
@@ -2119,7 +2116,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	if (proxyType && (proxyGlobalEnabled || socksWhitelist.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
+	if (proxyType && (proxyGlobalEnabled || socksWhitelist.some(pattern => matchesHostPattern(host, pattern)))) {
 		log(`[TCP forwarding] SOCKS5/HTTP/HTTPS/TURN/SSTP global proxy enabled`);
 		try {
 			await connecttoPry();
@@ -2592,6 +2589,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 }
 
 function isSpeedTestSite(hostname) {
+	hostname = String(hostname || '').toLowerCase();
 	const speedTestDomains = [atob('c3BlZWQuY2xvdWRmbGFyZS5jb20=')];
 	if (speedTestDomains.includes(hostname)) {
 		return true;
@@ -2603,6 +2601,22 @@ function isSpeedTestSite(hostname) {
 		}
 	}
 	return false;
+}
+
+function wildcardPatternToRegex(pattern = '') {
+	const escaped = String(pattern || '').replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+	return new RegExp(`^${escaped}$`, 'i');
+}
+
+function matchesHostPattern(hostname, pattern) {
+	const host = String(hostname || '').trim();
+	const value = String(pattern || '').trim();
+	if (!host || !value) return false;
+	try {
+		return wildcardPatternToRegex(value).test(host);
+	} catch (e) {
+		return false;
+	}
 }
 
 
@@ -4772,7 +4786,7 @@ async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, co
 		return JSON.stringify(config, null, 2);
 	} catch (e) {
 		console.error("Singbox hot patch failed:", e);
-		return JSON.stringify(JSON.parse(sb_json_text), null, 2);
+		return sb_json_text;
 	}
 }
 
@@ -4782,7 +4796,12 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 	let 输出内容 = "";
 	for (let x of 每行内容) {
 		if (x.includes('= tro' + 'jan,') && !x.includes('ws=true') && !x.includes('ws-path=')) {
-			const host = x.split("sni=")[1].split(",")[0];
+			const sniMatch = x.match(/(?:^|,\s*)sni=([^,]+)/);
+			if (!sniMatch) {
+				输出内容 += x + '\n';
+				continue;
+			}
+			const host = sniMatch[1];
 			const 备改内容 = `sni=${host}, skip-cert-verify=${config_JSON.跳过证书验证}`;
 			const 正确内容 = `sni=${host}, skip-cert-verify=${config_JSON.跳过证书验证}, ws=true, ws-path=${完整节点路径.replace(/,/g, '%2C')}, ws-headers=Host:"${host}"`;
 			输出内容 += x.replace(new RegExp(备改内容, 'g'), 正确内容).replace("[", "").replace("]", "") + '\n';
@@ -4791,7 +4810,9 @@ function Surge订阅配置文件热补丁(content, url, config_JSON) {
 		}
 	}
 
-	输出内容 = `#!MANAGED-CONFIG ${url} interval=${config_JSON.优选订阅生成.SUBUpdateTime * 60 * 60} strict=false` + 输出内容.substring(输出内容.indexOf('\n'));
+	const firstNewline = 输出内容.indexOf('\n');
+	输出内容 = `#!MANAGED-CONFIG ${url} interval=${config_JSON.优选订阅生成.SUBUpdateTime * 60 * 60} strict=false`
+		+ (firstNewline >= 0 ? 输出内容.substring(firstNewline) : '\n' + 输出内容);
 	return 输出内容;
 }
 
@@ -4893,6 +4914,35 @@ function 替换星号为随机字符(内容) {
 	});
 }
 
+function getSubscriptionRequestOptions(url, request, ua = '', asPreferredSubGenerator = false) {
+	const searchParams = url?.searchParams || new URLSearchParams();
+	const userAgent = String(ua || '').toLowerCase();
+	const shouldBase64Subscription = searchParams.has('b64') || searchParams.has('base64');
+	const isSubConverterRequest = Boolean(
+		request?.headers?.get?.('subconverter-request') ||
+		request?.headers?.get?.('subconverter-version') ||
+		userAgent.includes('subconverter') ||
+		userAgent.includes('cf-workers-sub') ||
+		asPreferredSubGenerator
+	);
+	const type = isSubConverterRequest
+		? 'mixed'
+		: searchParams.has('target')
+			? (searchParams.get('target') || 'mixed')
+			: searchParams.has('clash') || userAgent.includes('clash') || userAgent.includes('meta') || userAgent.includes('mihomo')
+				? 'clash'
+				: searchParams.has('sb') || searchParams.has('singbox') || userAgent.includes('singbox') || userAgent.includes('sing-box')
+					? 'singbox'
+					: searchParams.has('surge') || userAgent.includes('surge')
+						? 'surge&ver=4'
+						: searchParams.has('quanx') || userAgent.includes('quantumult')
+							? 'quanx'
+							: searchParams.has('loon') || userAgent.includes('loon')
+								? 'loon'
+								: 'mixed';
+	return { type, isSubConverterRequest, shouldBase64Subscription };
+}
+
 function getSubscriptionReplacementHosts(config = {}) {
 	const source = Array.isArray(config.HOSTS) ? config.HOSTS : [config.HOST];
 	const hosts = source
@@ -4917,18 +4967,52 @@ function replaceGeneratedHostPlaceholders(line, host) {
 		.replace(/("(?:server_name|servername|sni|authority|Host)"\s*:\s*")example\.com(")/g, (_, prefix, suffix) => `${prefix}${host}${suffix}`);
 }
 
+function finalizeJsonSubscriptionValue(value, uuid, hostPicker, inheritedHost = null) {
+	if (Array.isArray(value)) return value.map(item => finalizeJsonSubscriptionValue(item, uuid, hostPicker, null));
+	if (!value || typeof value !== 'object') {
+		if (typeof value === 'string') {
+			return value
+				.replace(/00000000-0000-4000-8000-000000000000/g, uuid)
+				.replace(/MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw/g, btoa(uuid));
+		}
+		return value;
+	}
+
+	const isGenerated = value.uuid === '00000000-0000-4000-8000-000000000000' || value.password === '00000000-0000-4000-8000-000000000000';
+	const host = isGenerated ? (inheritedHost || hostPicker()) : inheritedHost;
+	const output = {};
+	for (const [key, raw] of Object.entries(value)) {
+		let nextValue = finalizeJsonSubscriptionValue(raw, uuid, hostPicker, host);
+		if (host && typeof nextValue === 'string' && nextValue === 'example.com' && /^(server_name|servername|sni|authority|Host)$/i.test(key)) {
+			nextValue = host;
+		}
+		output[key] = nextValue;
+	}
+	return output;
+}
+
 function finalizeSubscriptionContent(content, config = {}) {
 	const uuid = String(config.UUID || '00000000-0000-4000-8000-000000000000');
 	const placeholderUUID = '00000000-0000-4000-8000-000000000000';
 	const placeholderUUIDBase64 = 'MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw';
 	const hostPicker = createSubscriptionHostPicker(config);
-	const finalized = String(content || '')
-		.replace(new RegExp(placeholderUUID, 'g'), uuid)
-		.replace(new RegExp(placeholderUUIDBase64, 'g'), btoa(uuid));
-	return finalized.split(/(\r?\n)/).map(part => {
-		if (!part || part === '\n' || part === '\r\n' || !part.includes('example.com')) return part;
-		const replaced = replaceGeneratedHostPlaceholders(part, hostPicker());
-		return replaced;
+	const source = String(content || '');
+	const trimmed = source.trim();
+	if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+		try {
+			return JSON.stringify(finalizeJsonSubscriptionValue(JSON.parse(source), uuid, hostPicker), null, 2);
+		} catch (e) { }
+	}
+	let currentHost = null;
+	return source.split(/(\r?\n)/).map(part => {
+		if (!part || part === '\n' || part === '\r\n') return part;
+		if (/^\s*-\s+(?:name:|\{)/.test(part)) currentHost = null;
+		if ((part.includes(placeholderUUID) || part.includes(placeholderUUIDBase64)) && !currentHost) currentHost = hostPicker();
+		let line = part
+			.replace(new RegExp(placeholderUUID, 'g'), uuid)
+			.replace(new RegExp(placeholderUUIDBase64, 'g'), btoa(uuid));
+		if (currentHost && line.includes('example.com')) line = replaceGeneratedHostPlaceholders(line, currentHost);
+		return line;
 	}).join('');
 }
 
@@ -7026,7 +7110,12 @@ function expandPreferredEndpointVariants(value) {
 	if (!parsed) return [value];
 	const address = parsed.address;
 	if (address.includes('*') || address.startsWith('[') || isIPHostname(address) || !address.includes('.')) return [value];
-	const pairedAddress = address.toLowerCase().startsWith('www.') ? address.slice(4) : `www.${address}`;
+	const lowerAddress = address.toLowerCase();
+	const labelCount = lowerAddress.split('.').filter(Boolean).length;
+	const isWwwApexPair = lowerAddress.startsWith('www.') && labelCount === 3;
+	const isBareApexPair = !lowerAddress.startsWith('www.') && labelCount === 2;
+	if (!isWwwApexPair && !isBareApexPair) return [formatPreferredEndpointVariant(parsed, address)];
+	const pairedAddress = isWwwApexPair ? address.slice(4) : `www.${address}`;
 	if (!pairedAddress || pairedAddress === address || !isValidProxyEndpointHost(pairedAddress) || isIPHostname(pairedAddress)) return [value];
 	return [...new Set([
 		formatPreferredEndpointVariant(parsed, address),
@@ -7127,7 +7216,13 @@ export const __testPerformanceHelpers = {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
+	isSpeedTestSite,
+	matchesHostPattern,
+	patchSingboxSubscription: Singbox订阅配置文件热补丁,
+	patchSurgeSubscription: Surge订阅配置文件热补丁,
+	readGrpcFrameLength,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
