@@ -15,6 +15,7 @@ const {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	finalizeSubscriptionContent,
 	expandPreferredEndpointVariants,
 } = helpers;
 
@@ -67,6 +68,106 @@ function makeHangingProxySocket({ opened = Promise.resolve(), readableCancel = (
 	assert.deepEqual(expandPreferredEndpointVariants('104.21.105.47:443#ip'), ['104.21.105.47:443#ip']);
 	assert.deepEqual(expandPreferredEndpointVariants('[2606:4700::6811:9316]:443#ipv6'), ['[2606:4700::6811:9316]:443#ipv6']);
 	assert.deepEqual(expandPreferredEndpointVariants('*.example.com:443#wildcard'), ['*.example.com:443#wildcard']);
+}
+
+{
+	const content = [
+		'vless://00000000-0000-4000-8000-000000000000@front.example.com:443?security=tls&type=ws&host=example.com&fp=chrome&sni=example.com&path=%2F&encryption=none#front.example.com',
+		'vless://external-user@front.example.com:443?security=tls&type=ws&host=origin.example.com&sni=origin.example.com&path=%2F#external',
+	].join('\n');
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker.example.net'],
+	});
+	const [generated, external] = result.split('\n');
+
+	assert.equal(generated.includes('11111111-1111-4111-8111-111111111111@front.example.com:443'), true);
+	assert.equal(generated.includes('host=worker.example.net'), true);
+	assert.equal(generated.includes('sni=worker.example.net'), true);
+	assert.equal(generated.includes('#front.example.com'), true);
+	assert.equal(external.includes('front.example.com:443'), true);
+	assert.equal(external.includes('host=origin.example.com'), true);
+	assert.equal(external.includes('sni=origin.example.com'), true);
+}
+
+{
+	const content = 'ss://MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw@front.example.com:443?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dexample.com%3Bpath%3D%252F%3Btls#ss-node';
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker.example.net'],
+	});
+
+	assert.equal(result.includes('front.example.com:443'), true);
+	assert.equal(result.includes(btoa('11111111-1111-4111-8111-111111111111')), true);
+	assert.equal(result.includes('host%3Dworker.example.net%3Bpath'), true);
+}
+
+{
+	const content = [
+		'- name: generated',
+		'  type: vless',
+		'  server: front.example.com',
+		'  uuid: 00000000-0000-4000-8000-000000000000',
+		'  servername: example.com',
+		'  ws-opts:',
+		'    headers:',
+		'      Host: example.com',
+		'- name: external',
+		'  type: vless',
+		'  server: front.example.com',
+		'  uuid: external-user',
+		'  servername: origin.example.com',
+		'  ws-opts:',
+		'    headers:',
+		'      Host: origin.example.com',
+	].join('\n');
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker.example.net'],
+	});
+
+	assert.equal(result.includes('server: front.example.com'), true);
+	assert.equal(result.includes('uuid: 11111111-1111-4111-8111-111111111111'), true);
+	assert.equal(result.includes('servername: worker.example.net'), true);
+	assert.equal(result.includes('Host: worker.example.net'), true);
+	assert.equal(result.includes('uuid: external-user'), true);
+	assert.equal(result.includes('servername: origin.example.com'), true);
+	assert.equal(result.includes('Host: origin.example.com'), true);
+}
+
+{
+	const content = JSON.stringify({
+		outbounds: [
+			{
+				type: 'vless',
+				server: 'front.example.com',
+				uuid: '00000000-0000-4000-8000-000000000000',
+				tls: { server_name: 'example.com' },
+				transport: { type: 'ws', headers: { Host: 'example.com' } },
+			},
+			{
+				type: 'vless',
+				server: 'front.example.com',
+				uuid: 'external-user',
+				tls: { server_name: 'origin.example.com' },
+				transport: { type: 'ws', headers: { Host: 'origin.example.com' } },
+			},
+		],
+	});
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker.example.net'],
+	});
+	const parsed = JSON.parse(result);
+
+	assert.equal(parsed.outbounds[0].server, 'front.example.com');
+	assert.equal(parsed.outbounds[0].uuid, '11111111-1111-4111-8111-111111111111');
+	assert.equal(parsed.outbounds[0].tls.server_name, 'worker.example.net');
+	assert.equal(parsed.outbounds[0].transport.headers.Host, 'worker.example.net');
+	assert.equal(parsed.outbounds[1].server, 'front.example.com');
+	assert.equal(parsed.outbounds[1].uuid, 'external-user');
+	assert.equal(parsed.outbounds[1].tls.server_name, 'origin.example.com');
+	assert.equal(parsed.outbounds[1].transport.headers.Host, 'origin.example.com');
 }
 
 {

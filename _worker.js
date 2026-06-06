@@ -455,19 +455,7 @@ export default {
 						}
 
 						if (!ua.includes('subconverter') && 用户客户端请求订阅) {
-							const 打乱后HOSTS = [...config_JSON.HOSTS].sort(() => Math.random() - 0.5);
-							let 替换域名计数 = 0, 当前随机HOST = null;
-							订阅内容 = 订阅内容
-								.replace(/00000000-0000-4000-8000-000000000000/g, config_JSON.UUID)
-								.replace(/MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw/g, btoa(config_JSON.UUID))
-								.replace(/example\.com/g, () => {
-									if (替换域名计数 % 2 === 0) {
-										const 原始host = 打乱后HOSTS[Math.floor(替换域名计数 / 2) % 打乱后HOSTS.length];
-										当前随机HOST = 替换星号为随机字符(原始host);
-									}
-									替换域名计数++;
-									return 当前随机HOST;
-								});
+							订阅内容 = finalizeSubscriptionContent(订阅内容, config_JSON);
 						}
 
 						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
@@ -4905,6 +4893,45 @@ function 替换星号为随机字符(内容) {
 	});
 }
 
+function getSubscriptionReplacementHosts(config = {}) {
+	const source = Array.isArray(config.HOSTS) ? config.HOSTS : [config.HOST];
+	const hosts = source
+		.map(host => String(host || '').trim())
+		.filter(Boolean);
+	return hosts.length ? hosts : ['example.com'];
+}
+
+function createSubscriptionHostPicker(config = {}) {
+	const hosts = [...getSubscriptionReplacementHosts(config)].sort(() => Math.random() - 0.5);
+	let index = 0;
+	return () => 替换星号为随机字符(hosts[index++ % hosts.length]);
+}
+
+function replaceGeneratedHostPlaceholders(line, host) {
+	const encodedHost = encodeURIComponent(host);
+	return String(line || '')
+		.replace(/(^|[?&;,])((?:host|sni|authority)=)example\.com(?=([?&;,#]|\r?$))/gi, (_, prefix, field) => `${prefix}${field}${host}`)
+		.replace(/((?:host|sni|authority)%3D)example\.com(?=($|%26|%3B|%2C|%23|&|;|,|#))/gi, (_, field) => `${field}${encodedHost}`)
+		.replace(/^(\s*(?:servername|sni|server_name|authority)\s*:\s*)example\.com(\s*(?:#.*)?)$/i, (_, prefix, suffix) => `${prefix}${host}${suffix}`)
+		.replace(/^(\s*Host\s*:\s*)example\.com(\s*(?:#.*)?)$/i, (_, prefix, suffix) => `${prefix}${host}${suffix}`)
+		.replace(/("(?:server_name|servername|sni|authority|Host)"\s*:\s*")example\.com(")/g, (_, prefix, suffix) => `${prefix}${host}${suffix}`);
+}
+
+function finalizeSubscriptionContent(content, config = {}) {
+	const uuid = String(config.UUID || '00000000-0000-4000-8000-000000000000');
+	const placeholderUUID = '00000000-0000-4000-8000-000000000000';
+	const placeholderUUIDBase64 = 'MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw';
+	const hostPicker = createSubscriptionHostPicker(config);
+	const finalized = String(content || '')
+		.replace(new RegExp(placeholderUUID, 'g'), uuid)
+		.replace(new RegExp(placeholderUUIDBase64, 'g'), btoa(uuid));
+	return finalized.split(/(\r?\n)/).map(part => {
+		if (!part || part === '\n' || part === '\r\n' || !part.includes('example.com')) return part;
+		const replaced = replaceGeneratedHostPlaceholders(part, hostPicker());
+		return replaced;
+	}).join('');
+}
+
 async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query") {
 	const 开始时间 = performance.now();
 	log(`[DoH lookup] Starting query for ${域名} ${记录类型} via ${DoH解析服务}`);
@@ -7100,6 +7127,7 @@ export const __testPerformanceHelpers = {
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
+	finalizeSubscriptionContent,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
