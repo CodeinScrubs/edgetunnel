@@ -33,6 +33,8 @@ const REQUEST_LOG_DEDUPE_TTL_SECONDS = 30 * 60;
 const DOH_LOOKUP_TIMEOUT_MS = 850;
 const DNS_TCP_RESPONSE_TIMEOUT_MS = 1200;
 const DIAL_STAGGER_MS = 90;
+const DEFAULT_DOH_LOOKUP_URL = 'https://cloudflare-dns.com/dns-query';
+const DEFAULT_DNS_TCP_SERVER = '8.8.4.4:53';
 const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
@@ -48,6 +50,26 @@ function isKvRequestLoggingEnabled(env = {}) {
 
 function isProxyResolutionKvCacheEnabled(env = {}) {
 	return isEnabledEnvFlag(env.ENABLE_KV_PROXY_CACHE) || isEnabledEnvFlag(env.KV_PROXY_CACHE);
+}
+
+function getDohLookupUrl(env = {}) {
+	const raw = String(env?.DOH_URL || env?.DOH_ENDPOINT || '').trim();
+	if (!raw) return DEFAULT_DOH_LOOKUP_URL;
+	try {
+		const url = new URL(raw);
+		if (url.protocol === 'https:' || url.protocol === 'http:') return url.href;
+	} catch (error) { }
+	return DEFAULT_DOH_LOOKUP_URL;
+}
+
+function getDnsTcpEndpoint(env = {}) {
+	const raw = String(env?.DNS_SERVER || env?.DNS_TCP_SERVER || DEFAULT_DNS_TCP_SERVER).trim().replace(/^(?:tcp|udp):\/\//i, '');
+	const parsed = parsePreferredEndpointText(raw);
+	if (!parsed) return { hostname: '8.8.4.4', port: 53 };
+	const hostname = parsed.address.startsWith('[') && parsed.address.endsWith(']') ? parsed.address.slice(1, -1) : parsed.address;
+	const port = parsed.hasExplicitPort ? Number(parsed.port) : 53;
+	if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) return { hostname: '8.8.4.4', port: 53 };
+	return { hostname, port };
 }
 
 export default {
@@ -2022,7 +2044,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
-	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒 };
+	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
 
@@ -2055,9 +2077,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	async function 构建预加载竞速候选列表(address, port) {
 		if (!tunnelContext.preloadRaceDial || isIPHostname(address)) return null;
 		log(`[TCP direct] Preload race dialing enabled; querying A/AAAA records for ${address} concurrently`);
+		const dohLookupUrl = getDohLookupUrl(env);
 		const [aRecords, aaaaRecords] = await Promise.all([
-			DoH查询(address, 'A'),
-			DoH查询(address, 'AAAA')
+			DoH查询(address, 'A', dohLookupUrl),
+			DoH查询(address, 'AAAA', dohLookupUrl)
 		]);
 		const ipv4List = [...new Set(aRecords.flatMap(r => {
 			const data = r.data;
@@ -2167,7 +2190,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					: await httpConnect(host, portNum, 本次首包数据, true, TCP连接, proxyAddressForConnect);
 			} else if (proxyType === 'turn') {
 				log(`[TURN proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await turnConnect(parsedProxyAddress, host, portNum, TCP连接);
+				newSocket = await turnConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
 					try { await writer.write(数据转Uint8Array(本次首包数据)) }
@@ -2175,7 +2198,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				}
 			} else if (proxyType === 'sstp') {
 				log(`[SSTP proxy] Proxying to: ${host}:${portNum}`);
-				newSocket = await sstpConnect(parsedProxyAddress, host, portNum, TCP连接);
+				newSocket = await sstpConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
 					try { await writer.write(数据转Uint8Array(本次首包数据)) }
@@ -2261,14 +2284,15 @@ async function readOneDnsTcpFrame(tcpSocket, timeoutMs) {
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
 	const requestData = 数据转Uint8Array(udpChunk);
 	const requestBytes = requestData.byteLength;
-	log(`[UDP forwarding] Received DNS request: ${requestBytes}B -> 8.8.4.4:53`);
 	let tcpSocket = null;
 	let writer = null;
 	try {
 		const { env } = getWorkerRequestContext(request);
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		const TCP连接 = 创建请求TCP连接器(request);
-		tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
+		const dnsEndpoint = getDnsTcpEndpoint(env);
+		log(`[UDP forwarding] Received DNS request: ${requestBytes}B -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
+		tcpSocket = TCP连接(dnsEndpoint);
 		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
 		writer = tcpSocket.writable.getWriter();
 		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
@@ -3762,7 +3786,7 @@ async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
 	/** @type {string | null} */
 	let targetIp = isIPv4(resolvedTargetHost) ? resolvedTargetHost : null;
 	if (!targetIp) {
-		const records = await DoH查询(resolvedTargetHost, 'A');
+		const records = await DoH查询(resolvedTargetHost, 'A', proxy.dohLookupUrl || DEFAULT_DOH_LOOKUP_URL);
 		const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
 		targetIp = typeof recordData === 'string' ? recordData : null;
 	}
@@ -4181,7 +4205,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		/** @type {string | null} */
 		let targetIp = isIPv4(target) ? target : null;
 		if (!targetIp) {
-			const records = await DoH查询(target, 'A');
+			const records = await DoH查询(target, 'A', proxy.dohLookupUrl || DEFAULT_DOH_LOOKUP_URL);
 			const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
 			targetIp = typeof recordData === 'string' ? recordData : null;
 		}
@@ -5275,7 +5299,7 @@ function finalizeSubscriptionContent(content, config = {}) {
 	}).join('');
 }
 
-async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query") {
+async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOOKUP_URL) {
 	const 开始时间 = performance.now();
 	log(`[DoH lookup] Starting query for ${域名} ${记录类型} via ${DoH解析服务}`);
 	try {
@@ -6897,7 +6921,7 @@ function sha224(s) {
 
 function getWorkerRequestContext(request) {
 	if (!request || typeof request !== 'object') return {};
-	return WORKER_REQUEST_CONTEXT.get(request) || {};
+	return WORKER_REQUEST_CONTEXT.get(request) || (request.env ? { env: request.env, ctx: request.ctx || null, tunnel: request.tunnel || null } : {});
 }
 
 function emptyTunnelContext() {
@@ -7475,11 +7499,17 @@ async function resolveProxyEndpointsLive(proxyIP, 目标域名 = 'dash.cloudflar
 	return 解析地址端口Legacy(proxyIP, 目标域名, UUID);
 }
 
+async function resolveProxyEndpointsLiveWithEnv(env, proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
+	return 解析地址端口Legacy(proxyIP, 目标域名, UUID, env);
+}
+
 export const __testPerformanceHelpers = {
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
 	getProxyConnectTimeoutMs,
+	getDohLookupUrl,
+	getDnsTcpEndpoint,
 	createTunnelContext,
 	applyProxyParamsToTunnelContext,
 	getProxyResolutionRecord,
@@ -7522,7 +7552,8 @@ export const __testPerformanceHelpers = {
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
 	proxyIP = String(proxyIP || '').toLowerCase();
 	const now = Date.now();
-	const resolution = await getProxyResolutionRecord(env, ctx, proxyIP, 目标域名, UUID);
+	const liveResolver = (proxyValue, targetValue, uuidValue) => resolveProxyEndpointsLiveWithEnv(env, proxyValue, targetValue, uuidValue);
+	const resolution = await getProxyResolutionRecord(env, ctx, proxyIP, 目标域名, UUID, liveResolver);
 	if (resolution.record) {
 		const ordered = orderProxyEndpoints(resolution.record.endpoints, resolution.record.health, now, `${目标域名}|${UUID}`);
 		log(`[ProxyIP resolver] Loaded ${resolution.source} resolver (${resolution.record.isFresh ? 'fresh' : 'stale'}). Total: ${ordered.length}\n${ordered.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
@@ -7534,8 +7565,9 @@ async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com',
 	return ordered;
 }
 
-async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
+async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null) {
 	proxyIP = String(proxyIP || '').toLowerCase();
+	const dohLookupUrl = getDohLookupUrl(env);
 
 		function 解析地址端口字符串(str) {
 			let 地址 = str, 端口 = 443;
@@ -7580,8 +7612,8 @@ async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare
 			}
 
 			const [txtRecords, aRecords] = await Promise.all([
-				DoH查询(地址, 'TXT'),
-				DoH查询(地址, 'A')
+				DoH查询(地址, 'TXT', dohLookupUrl),
+				DoH查询(地址, 'A', dohLookupUrl)
 			]);
 
 			const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
@@ -7599,7 +7631,7 @@ async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare
 				continue;
 			}
 
-			const aaaaRecords = await DoH查询(地址, 'AAAA');
+			const aaaaRecords = await DoH查询(地址, 'AAAA', dohLookupUrl);
 			const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
 			if (ipv6List.length > 0) {
 				log(`[ProxyIP resolver] ${地址} had no TXT or A records; using AAAA records with ${ipv6List.length} results`);

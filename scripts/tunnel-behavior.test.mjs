@@ -25,6 +25,8 @@ const {
 	finalizeSubscriptionContent,
 	getTransportConfig,
 	readConfigJson,
+	getDohLookupUrl,
+	getDnsTcpEndpoint,
 	translateHTMLVisibleText,
 	injectEnglishRuntimeTranslator,
 	buildRequestLogEntryKey,
@@ -796,8 +798,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		},
 	};
 	const request = {
+		env: { DNS_SERVER: '1.1.1.1' },
 		fetcher: {
-			connect() {
+			connect(address) {
+				assert.deepEqual(address, { hostname: '1.1.1.1', port: 53 });
 				return tcpSocket;
 			},
 		},
@@ -814,6 +818,16 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(writes, [new Uint8Array([0, 2, 0x12, 0x34])]);
 	assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])]);
 	assert.equal(upstreamClosed, true, 'DNS TCP socket should be closed after one complete response frame');
+}
+
+{
+	assert.equal(getDohLookupUrl({}), 'https://cloudflare-dns.com/dns-query');
+	assert.equal(getDohLookupUrl({ DOH_URL: 'https://dns.google/dns-query' }), 'https://dns.google/dns-query');
+	assert.equal(getDohLookupUrl({ DOH_URL: 'ftp://invalid.example/dns-query' }), 'https://cloudflare-dns.com/dns-query');
+	assert.deepEqual(getDnsTcpEndpoint({ DNS_SERVER: '1.0.0.1' }), { hostname: '1.0.0.1', port: 53 });
+	assert.deepEqual(getDnsTcpEndpoint({ DNS_SERVER: 'tcp://9.9.9.9:9953' }), { hostname: '9.9.9.9', port: 9953 });
+	assert.deepEqual(getDnsTcpEndpoint({ DNS_SERVER: '[2606:4700:4700::1111]:53' }), { hostname: '2606:4700:4700::1111', port: 53 });
+	assert.deepEqual(getDnsTcpEndpoint({ DNS_SERVER: 'bad host name' }), { hostname: '8.8.4.4', port: 53 });
 }
 
 {
