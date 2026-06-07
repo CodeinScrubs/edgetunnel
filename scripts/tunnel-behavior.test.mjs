@@ -340,7 +340,15 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 {
 	const kv = makeFakeKV();
 	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/a' }, 'Get_SUB', 1000);
-	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1001, URL: 'https://worker.example/b' }, 'Get_SUB', 1001);
+
+	assert.equal(kv.puts.length, 0, 'KV request logging should be opt-in by default');
+}
+
+{
+	const kv = makeFakeKV();
+	const env = { KV: kv, ENABLE_KV_LOG: '1' };
+	await writeRequestLogEntry(env, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/a' }, 'Get_SUB', 1000);
+	await writeRequestLogEntry(env, { TYPE: 'Get_SUB', TIME: 1001, URL: 'https://worker.example/b' }, 'Get_SUB', 1001);
 
 	assert.equal(kv.puts.filter(call => call.key.startsWith('log:entry:')).length, 2);
 	assert.equal(kv.puts.some(call => call.key === 'log.json'), false, 'append-only logging must not write the legacy shared log.json key');
@@ -348,8 +356,8 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 
 {
 	const kv = makeFakeKV();
-	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/old' }, 'Get_SUB', 1000);
-	await writeRequestLogEntry({ KV: kv }, { TYPE: 'Get_SUB', TIME: 2000, URL: 'https://worker.example/new' }, 'Get_SUB', 2000);
+	await writeRequestLogEntry({ KV: kv, ENABLE_KV_LOG: '1' }, { TYPE: 'Get_SUB', TIME: 1000, URL: 'https://worker.example/old' }, 'Get_SUB', 1000);
+	await writeRequestLogEntry({ KV: kv, ENABLE_KV_LOG: '1' }, { TYPE: 'Get_SUB', TIME: 2000, URL: 'https://worker.example/new' }, 'Get_SUB', 2000);
 
 	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
 	assert.deepEqual(logs.map(log => log.URL), ['https://worker.example/new', 'https://worker.example/old']);
@@ -364,7 +372,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 
 {
 	const kv = makeFakeKV();
-	await recordRequestLog({ KV: kv }, { url: 'https://worker.example/sub', headers: { get: () => null } }, '203.0.113.55', 'Get_SUB', { TG: { 启用: false } }, true);
+	await recordRequestLog({ KV: kv, ENABLE_KV_LOG: '1' }, { url: 'https://worker.example/sub', headers: { get: () => null } }, '203.0.113.55', 'Get_SUB', { TG: { 启用: false } }, true);
 	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
 	assert.equal(logs.length, 1, 'request logs should be written even when request.cf is unavailable');
 	assert.equal(logs[0].ASN, 'AS0 Unknown');
@@ -373,7 +381,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 
 {
 	const kv = makeFakeKV();
-	await recordRequestLog({ KV: kv, OFF_LOG: '1' }, fakeLogRequest(), '203.0.113.10', 'Get_SUB', { TG: { 启用: false } }, true);
+	await recordRequestLog({ KV: kv, ENABLE_KV_LOG: '1', OFF_LOG: '1' }, fakeLogRequest(), '203.0.113.10', 'Get_SUB', { TG: { 启用: false } }, true);
 	assert.equal(kv.puts.length, 0, 'OFF_LOG should disable KV log writes');
 }
 
@@ -430,8 +438,8 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const kv = makeFakeKV();
 	const config = { TG: { 启用: false } };
 	const request = fakeLogRequest('https://worker.example/admin/saveConfig');
-	await recordRequestLog({ KV: kv }, request, '203.0.113.10', 'Save_Config', config, true);
-	await recordRequestLog({ KV: kv }, request, '203.0.113.10', 'Save_Config', config, true);
+	await recordRequestLog({ KV: kv, ENABLE_KV_LOG: '1' }, request, '203.0.113.10', 'Save_Config', config, true);
+	await recordRequestLog({ KV: kv, ENABLE_KV_LOG: '1' }, request, '203.0.113.10', 'Save_Config', config, true);
 
 	assert.equal(kv.puts.filter(call => call.key.startsWith('log:entry:')).length, 1, 'duplicate non-subscription admin logs should be throttled');
 	assert.equal(kv.puts.some(call => call.key.startsWith('log:dedupe:')), true);

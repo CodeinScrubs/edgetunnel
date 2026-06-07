@@ -179,6 +179,7 @@ const now = 1_700_000_000_000;
 	});
 	let getCalls = 0;
 	const env = {
+		ENABLE_KV_PROXY_CACHE: '1',
 		KV: {
 			async get(key) {
 				getCalls++;
@@ -202,6 +203,7 @@ const now = 1_700_000_000_000;
 	const puts = [];
 	const waitUntilPromises = [];
 	const env = {
+		ENABLE_KV_PROXY_CACHE: '1',
 		KV: {
 			put(key, value, options) {
 				puts.push({ key, value: JSON.parse(value), options });
@@ -232,6 +234,27 @@ const now = 1_700_000_000_000;
 }
 
 {
+	const puts = [];
+	const record = normalizeProxyCacheRecord({
+		version: 1,
+		updatedAt: now,
+		endpoints: [['default-off.example.com', 443]],
+		health: {},
+	}, now);
+
+	scheduleProxyCacheWrite({
+		KV: {
+			put(key, value, options) {
+				puts.push({ key, value, options });
+				return Promise.resolve();
+			},
+		},
+	}, null, 'cache-key', record, now, true);
+
+	assert.equal(puts.length, 0, 'persistent proxy KV cache should be opt-in by default');
+}
+
+{
 	const record = normalizeProxyCacheRecord({
 		version: 1,
 		updatedAt: now,
@@ -239,6 +262,7 @@ const now = 1_700_000_000_000;
 		health: {},
 	}, now);
 	assert.doesNotThrow(() => scheduleProxyCacheWrite({
+		ENABLE_KV_PROXY_CACHE: '1',
 		KV: {
 			put() {
 				throw new Error('KV full');

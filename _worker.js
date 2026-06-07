@@ -37,6 +37,19 @@ const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
 
+function isEnabledEnvFlag(value) {
+	return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function isKvRequestLoggingEnabled(env = {}) {
+	if (isEnabledEnvFlag(env.OFF_LOG)) return false;
+	return isEnabledEnvFlag(env.ENABLE_KV_LOG) || isEnabledEnvFlag(env.KV_LOG);
+}
+
+function isProxyResolutionKvCacheEnabled(env = {}) {
+	return isEnabledEnvFlag(env.ENABLE_KV_PROXY_CACHE) || isEnabledEnvFlag(env.KV_PROXY_CACHE);
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const workerRequestContext = { env, ctx, tunnel: null };
@@ -5010,6 +5023,7 @@ async function readRequestLogs(env = {}, options = {}) {
 }
 
 async function writeRequestLogEntry(env = {}, logEntry, requestType = "Get_SUB", now = Date.now()) {
+	if (!isKvRequestLoggingEnabled(env)) return false;
 	if (!env?.KV || typeof env.KV.put !== 'function') return false;
 	const entry = { ...logEntry, TIME: Number(logEntry?.TIME) || now };
 
@@ -5066,7 +5080,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 				}
 			} catch (error) { console.error(`Failed to read tg.json: ${error.message}`) }
 		}
-		是否写入KV日志 = ['1', 'true'].includes(env.OFF_LOG) ? false : 是否写入KV日志;
+		是否写入KV日志 = Boolean(是否写入KV日志) && isKvRequestLoggingEnabled(env);
 		if (!是否写入KV日志) return;
 		await writeRequestLogEntry(env, 日志内容, 请求类型, 当前时间.getTime());
 	} catch (error) { console.error(`Failed to record log: ${error.message}`) }
@@ -7225,6 +7239,7 @@ async function readProxyResolutionCache(env, proxyIP, now = Date.now(), targetHo
 		touchProxyL1Cache(key, memoryRecord);
 		return { key, record: memoryRecord, source: 'memory' };
 	}
+	if (!isProxyResolutionKvCacheEnabled(env)) return { key, record: null, source: 'none' };
 	if (!env?.KV || typeof env.KV.get !== 'function') return { key, record: null, source: 'none' };
 	try {
 		const raw = await env.KV.get(key);
@@ -7256,6 +7271,7 @@ function serializeProxyCacheRecord(record, now = Date.now()) {
 }
 
 function scheduleProxyCacheWrite(env, ctx, cacheKey, record, now = Date.now(), force = false) {
+	if (!isProxyResolutionKvCacheEnabled(env)) return;
 	if (!env?.KV || typeof env.KV.put !== 'function' || !cacheKey || !record) return;
 	if (!force && record.lastKvWriteAt && now - record.lastKvWriteAt < PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS) return;
 	record.lastKvWriteAt = now;
