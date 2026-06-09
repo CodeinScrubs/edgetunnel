@@ -2,6 +2,31 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 
 globalThis.WebSocket = globalThis.WebSocket || { OPEN: 1, CLOSING: 2, CLOSED: 3 };
+globalThis.WebSocketPair = globalThis.WebSocketPair || class WebSocketPair {
+	constructor() {
+		const makeSocket = () => ({
+			readyState: WebSocket.OPEN,
+			binaryType: 'arraybuffer',
+			accept() {},
+			send() {},
+			close() { this.readyState = WebSocket.CLOSED; },
+			addEventListener() {},
+			removeEventListener() {},
+		});
+		return [makeSocket(), makeSocket()];
+	}
+};
+const NativeResponse = globalThis.Response;
+globalThis.Response = class TestResponse extends NativeResponse {
+	constructor(body, init) {
+		if (init?.status === 101) {
+			super(body, { ...init, status: 200 });
+			Object.defineProperty(this, 'status', { value: 101, writable: false });
+		} else {
+			super(body, init);
+		}
+	}
+};
 
 const workerModule = await import('../_worker.js');
 const helpers = workerModule.__testPerformanceHelpers;
@@ -416,6 +441,17 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const body = await response.text();
 	assert.equal(body.includes('1101'), true);
 	assert.equal(body.includes('Worker threw exception'), true);
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	for (const path of ['/', `/${uuid}`, `/assets/${uuid}`]) {
+		const request = new Request(`https://worker.example${path}`, {
+			headers: { Upgrade: 'websocket', 'User-Agent': 'UnitTest/1.0' },
+		});
+		const response = await workerModule.default.fetch(request, { ADMIN: 'admin-password', UUID: uuid }, { waitUntil() {} });
+		assert.equal(response.status, 101, `WebSocket tunnel route should accept generated path ${path}`);
+	}
 }
 
 {
