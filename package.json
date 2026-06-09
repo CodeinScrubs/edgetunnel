@@ -2,7 +2,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node scripts/tunnel-behavior.test.mjs && node scripts/performance-cache.test.mjs",
-    "check": "node --check _worker.js && node --check scripts/grpc-live-smoke-benchmark.mjs"
+    "build": "node scripts/build-worker.mjs",
+    "test": "npm run build && node scripts/config-defaults.test.mjs && node scripts/tunnel-behavior.test.mjs && node scripts/performance-cache.test.mjs",
+    "check": "npm run build && node --check src/core/config.js && node --check src/worker.js && node --check _worker.js && node --check scripts/config-defaults.test.mjs && node --check scripts/grpc-live-smoke-benchmark.mjs"
   }
 }

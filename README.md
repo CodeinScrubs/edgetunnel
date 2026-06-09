@@ -10,6 +10,18 @@ This repository contains a Cloudflare Worker / Pages deployment with an admin pa
 4. Deploy `_worker.js`.
 5. Open `/admin` on your deployed domain and sign in with the admin password.
 
+## Source And Build
+
+`src/worker.js` is the source of truth. `_worker.js` is the generated deployable Worker file for Wrangler or manual copy-paste deployment.
+
+```bash
+npm run build
+npm test
+npm run check
+```
+
+Edit user-facing static defaults in `src/core/config.js`, then run `npm run build`.
+
 ## Worker Deployment
 
 1. Create a new Cloudflare Worker.

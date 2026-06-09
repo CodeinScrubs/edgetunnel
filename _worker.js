@@ -1,40 +1,118 @@
-const Version = '2026-06-01 15:49:39';
-const DEFAULT_SOCKS5_WHITELIST = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
-let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
-const Pages静态页面 = 'https://edt-pages.github.io';
+// Generated from src/worker.js by scripts/build-worker.mjs.
+// Edit src/worker.js or src/core/config.js, then run npm run build.
+// User-editable defaults.
+// Cloudflare environment variables and KV/admin settings still override these values.
+const USER_CONFIG = {
+	ADMIN: undefined,
+	KEY: undefined,
+	UUID: undefined,
+	HOST: undefined,
+	PROXYIP: undefined,
+	GO2SOCKS5: undefined,
+	URL: undefined,
+	DEBUG: undefined,
+	ENABLE_KV_LOG: undefined,
+	OFF_LOG: undefined,
+	ENABLE_KV_PROXY_CACHE: undefined,
+	PRELOAD_RACE_DIAL: undefined,
+	CONNECT_TIMEOUT_MS: undefined,
+	DNS_TIMEOUT_MS: undefined,
+	DNS_SERVER: undefined,
+	DOH_URL: undefined,
+	PATH: undefined,
+	TRANSPORT: undefined,
+	FP: undefined,
+	FINGERPRINT: undefined,
+	GRPC_MODE: undefined,
+	GRPC_USER_AGENT: undefined,
+	SUBNAME: undefined,
+	SUB_UPDATE_TIME: undefined,
+};
 
-const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
-const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
-const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
-const GRPC_MAX_FRAME_PAYLOAD_BYTES = 上行队列最大字节;
-const PROXY_RESOLUTION_CACHE_VERSION = 1;
-const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = 24;
-const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = 8;
-const PROXY_RESOLUTION_CACHE_FRESH_TTL_MS = 10 * 60 * 1000;
-const PROXY_RESOLUTION_CACHE_STALE_TTL_MS = 6 * 60 * 60 * 1000;
+// Advanced engine defaults. Keep these behavior-preserving unless benchmark data says otherwise.
+const ENGINE_DEFAULTS = {
+	DEFAULT_SOCKS5_WHITELIST: ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'],
+	PAGES_STATIC_URL: 'https://edt-pages.github.io',
+	WS_EARLY_DATA_MAX_BYTES: 8 * 1024,
+	UPLINK_BUNDLE_TARGET_BYTES: 16 * 1024,
+	UPLINK_QUEUE_MAX_BYTES: 16 * 1024 * 1024,
+	UPLINK_QUEUE_MAX_ITEMS: 4096,
+	DOWNLINK_GRAIN_PACKET_BYTES: 32 * 1024,
+	DOWNLINK_GRAIN_TAIL_THRESHOLD: 512,
+	DOWNLINK_GRAIN_QUIET_MS: 0,
+	GRPC_MAX_FRAME_PAYLOAD_BYTES: 16 * 1024 * 1024,
+	PROXY_RESOLUTION_CACHE_VERSION: 1,
+	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 24,
+	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
+	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
+	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
+	PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS: 60 * 1000,
+	PROXY_ENDPOINT_FAILURE_COOLDOWN_MS: 10 * 60 * 1000,
+	PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD: 2,
+	PROXY_ENDPOINT_HEALTH_MAX_AGE_MS: 24 * 60 * 60 * 1000,
+	PROXY_CONNECT_TIMEOUT_DEFAULT_MS: 850,
+	PROXY_CONNECT_TIMEOUT_MIN_MS: 400,
+	PROXY_CONNECT_TIMEOUT_MAX_MS: 1500,
+	REQUEST_LOG_DEFAULT_READ_LIMIT: 500,
+	REQUEST_LOG_MAX_READ_LIMIT: 1000,
+	REQUEST_LOG_DEFAULT_TTL_SECONDS: 7 * 24 * 60 * 60,
+	REQUEST_LOG_MIN_TTL_SECONDS: 60 * 60,
+	REQUEST_LOG_MAX_TTL_SECONDS: 30 * 24 * 60 * 60,
+	REQUEST_LOG_DEDUPE_TTL_SECONDS: 30 * 60,
+	DOH_LOOKUP_TIMEOUT_MS: 850,
+	DNS_TCP_RESPONSE_TIMEOUT_MS: 1200,
+	DIAL_STAGGER_MS: 90,
+	DEFAULT_DOH_LOOKUP_URL: 'https://cloudflare-dns.com/dns-query',
+	DEFAULT_DNS_TCP_SERVER: '8.8.4.4:53',
+};
+
+function applyUserConfigDefaults(env = {}) {
+	const merged = Object.create(Object.getPrototypeOf(env) || null);
+	for (const key of Reflect.ownKeys(env)) merged[key] = env[key];
+	for (const [key, value] of Object.entries(USER_CONFIG)) {
+		if (value !== undefined && value !== null && value !== '' && merged[key] === undefined) merged[key] = value;
+	}
+	return merged;
+}
+
+
+const Version = '2026-06-01 15:49:39';
+const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
+const Pages静态页面 = ENGINE_DEFAULTS.PAGES_STATIC_URL;
+
+const WS早期数据最大字节 = ENGINE_DEFAULTS.WS_EARLY_DATA_MAX_BYTES, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
+const 上行合包目标字节 = ENGINE_DEFAULTS.UPLINK_BUNDLE_TARGET_BYTES, 上行队列最大字节 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_BYTES, 上行队列最大条目 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_ITEMS;
+const 下行Grain包字节 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_PACKET_BYTES, 下行Grain尾部阈值 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_TAIL_THRESHOLD, 下行Grain静默毫秒 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_QUIET_MS;
+const GRPC_MAX_FRAME_PAYLOAD_BYTES = ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES;
+const PROXY_RESOLUTION_CACHE_VERSION = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_VERSION;
+const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES;
+const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS;
+const PROXY_RESOLUTION_CACHE_FRESH_TTL_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_FRESH_TTL_MS;
+const PROXY_RESOLUTION_CACHE_STALE_TTL_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_STALE_TTL_MS;
 const PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS = Math.ceil(PROXY_RESOLUTION_CACHE_STALE_TTL_MS / 1000);
-const PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS = 60 * 1000;
-const PROXY_ENDPOINT_FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
-const PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD = 2;
-const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = 850;
-const PROXY_CONNECT_TIMEOUT_MIN_MS = 400;
-const PROXY_CONNECT_TIMEOUT_MAX_MS = 1500;
+const PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS;
+const PROXY_ENDPOINT_FAILURE_COOLDOWN_MS = ENGINE_DEFAULTS.PROXY_ENDPOINT_FAILURE_COOLDOWN_MS;
+const PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD = ENGINE_DEFAULTS.PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD;
+const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = ENGINE_DEFAULTS.PROXY_ENDPOINT_HEALTH_MAX_AGE_MS;
+const PROXY_CONNECT_TIMEOUT_DEFAULT_MS = ENGINE_DEFAULTS.PROXY_CONNECT_TIMEOUT_DEFAULT_MS;
+const PROXY_CONNECT_TIMEOUT_MIN_MS = ENGINE_DEFAULTS.PROXY_CONNECT_TIMEOUT_MIN_MS;
+const PROXY_CONNECT_TIMEOUT_MAX_MS = ENGINE_DEFAULTS.PROXY_CONNECT_TIMEOUT_MAX_MS;
 const REQUEST_LOG_ENTRY_PREFIX = 'log:entry:';
 const REQUEST_LOG_DEDUPE_PREFIX = 'log:dedupe:';
 const REQUEST_LOG_LEGACY_KEY = 'log.json';
 const REQUEST_LOG_MAX_REVERSE_TIME = 9999999999999;
-const REQUEST_LOG_DEFAULT_READ_LIMIT = 500;
-const REQUEST_LOG_MAX_READ_LIMIT = 1000;
-const REQUEST_LOG_DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60;
-const REQUEST_LOG_MIN_TTL_SECONDS = 60 * 60;
-const REQUEST_LOG_MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
-const REQUEST_LOG_DEDUPE_TTL_SECONDS = 30 * 60;
-const DOH_LOOKUP_TIMEOUT_MS = 850;
-const DNS_TCP_RESPONSE_TIMEOUT_MS = 1200;
-const DIAL_STAGGER_MS = 90;
-const DEFAULT_DOH_LOOKUP_URL = 'https://cloudflare-dns.com/dns-query';
-const DEFAULT_DNS_TCP_SERVER = '8.8.4.4:53';
+const REQUEST_LOG_DEFAULT_READ_LIMIT = ENGINE_DEFAULTS.REQUEST_LOG_DEFAULT_READ_LIMIT;
+const REQUEST_LOG_MAX_READ_LIMIT = ENGINE_DEFAULTS.REQUEST_LOG_MAX_READ_LIMIT;
+const REQUEST_LOG_DEFAULT_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_DEFAULT_TTL_SECONDS;
+const REQUEST_LOG_MIN_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_MIN_TTL_SECONDS;
+const REQUEST_LOG_MAX_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_MAX_TTL_SECONDS;
+const REQUEST_LOG_DEDUPE_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_DEDUPE_TTL_SECONDS;
+const DOH_LOOKUP_TIMEOUT_MS = ENGINE_DEFAULTS.DOH_LOOKUP_TIMEOUT_MS;
+const DNS_TCP_RESPONSE_TIMEOUT_MS = ENGINE_DEFAULTS.DNS_TCP_RESPONSE_TIMEOUT_MS;
+const DIAL_STAGGER_MS = ENGINE_DEFAULTS.DIAL_STAGGER_MS;
+const DEFAULT_DOH_LOOKUP_URL = ENGINE_DEFAULTS.DEFAULT_DOH_LOOKUP_URL;
+const DEFAULT_DNS_TCP_SERVER = ENGINE_DEFAULTS.DEFAULT_DNS_TCP_SERVER;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
@@ -74,6 +152,7 @@ function getDnsTcpEndpoint(env = {}) {
 
 export default {
 	async fetch(request, env, ctx) {
+		env = applyUserConfigDefaults(env);
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
 		let config_JSON;
@@ -6228,6 +6307,40 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 	}
 }
 
+function applyTopConfigAliases(config_JSON, env = {}) {
+	const read = (...keys) => {
+		for (const key of keys) {
+			const value = env?.[key];
+			if (value !== undefined && value !== null && value !== '') return value;
+		}
+		return undefined;
+	};
+	const subscriptionConfigKey = '\u4f18\u9009\u8ba2\u9605\u751f\u6210';
+	const grpcModeKey = 'gRPC\u6a21\u5f0f';
+	const transportKey = '\u4f20\u8f93\u534f\u8bae';
+
+	const transport = read('TRANSPORT', 'TRANSPORT_PROTOCOL');
+	if (transport !== undefined) config_JSON[transportKey] = String(transport).trim().toLowerCase();
+
+	const grpcMode = read('GRPC_MODE', 'gRPC_MODE');
+	if (grpcMode !== undefined) config_JSON[grpcModeKey] = String(grpcMode).trim().toLowerCase();
+
+	const grpcUserAgent = read('GRPC_USER_AGENT', 'gRPC_USER_AGENT');
+	if (grpcUserAgent !== undefined) config_JSON.gRPCUserAgent = String(grpcUserAgent).trim();
+
+	const fingerprint = read('FP', 'FINGERPRINT');
+	if (fingerprint !== undefined) config_JSON.Fingerprint = String(fingerprint).trim();
+
+	const subName = read('SUBNAME', 'SUB_NAME');
+	if (subName !== undefined && config_JSON[subscriptionConfigKey]) config_JSON[subscriptionConfigKey].SUBNAME = String(subName).trim();
+
+	const subUpdateTime = read('SUB_UPDATE_TIME', 'SUBUpdateTime');
+	if (subUpdateTime !== undefined && config_JSON[subscriptionConfigKey]) {
+		const parsed = Number(subUpdateTime);
+		if (Number.isFinite(parsed) && parsed > 0) config_JSON[subscriptionConfigKey].SUBUpdateTime = parsed;
+	}
+}
+
 async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
 	const _p = atob("UFJPWFlJUA==");
 	const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
@@ -6358,6 +6471,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	config_JSON.CF = 合并对象默认值(默认配置JSON.CF, config_JSON.CF);
 	config_JSON.CF.Usage = 合并对象默认值(默认配置JSON.CF.Usage, config_JSON.CF.Usage);
 
+	applyTopConfigAliases(config_JSON, env);
 	if (!config_JSON.gRPCUserAgent) config_JSON.gRPCUserAgent = UA;
 	const normalizeConfigHost = h => String(h || '').toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0].trim();
 	const currentHostname = normalizeConfigHost(hostname);
