@@ -406,6 +406,19 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	const response = await workerModule.default.fetch(
+		new Request('https://worker.example/not-a-tunnel', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+		{ ADMIN: 'admin-password', UUID: '11111111-1111-4111-8111-111111111111', URL: '1101' },
+		{ waitUntil() {} }
+	);
+	assert.equal(response.status, 530);
+	assert.equal(response.statusText, 'Origin Error');
+	const body = await response.text();
+	assert.equal(body.includes('1101'), true);
+	assert.equal(body.includes('Worker threw exception'), true);
+}
+
+{
 	const ua = 'UnitTest/1.0';
 	const admin = 'test-admin-password';
 	const key = 'default-key-change-with-KEY-env-if-needed';
@@ -617,6 +630,29 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const hostHeader = result.match(/Host:\s*([^\n]+)/)?.[1]?.trim();
 
 	assert.equal(servername, hostHeader, 'generated multi-line node must use the same host for servername and Host header');
+}
+
+{
+	const content = [
+		'- name: generated',
+		'  type: vless',
+		'  server: front.example.com',
+		'  servername: example.com',
+		'  ws-opts:',
+		'    headers:',
+		'      Host: example.com',
+		'  uuid: 00000000-0000-4000-8000-000000000000',
+	].join('\n');
+	const result = finalizeSubscriptionContent(content, {
+		UUID: '11111111-1111-4111-8111-111111111111',
+		HOSTS: ['worker-order.example.net'],
+	});
+
+	assert.equal(result.includes('servername: example.com'), false, 'generated YAML block should replace servername placeholder even when it appears before uuid');
+	assert.equal(result.includes('Host: example.com'), false, 'generated YAML block should replace Host placeholder even when it appears before uuid');
+	assert.equal(result.includes('servername: worker-order.example.net'), true);
+	assert.equal(result.includes('Host: worker-order.example.net'), true);
+	assert.equal(result.includes('uuid: 11111111-1111-4111-8111-111111111111'), true);
 }
 
 {

@@ -525,7 +525,7 @@ export default {
 			if (伪装页URL.toLowerCase().startsWith('http://')) 伪装页URL = 'https://' + 伪装页URL.substring(7);
 			try { const u = new URL(伪装页URL); 伪装页URL = u.protocol + '//' + u.host } catch (e) { 伪装页URL = 'nginx' }
 		}
-		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 530, statusText: 'Origin Error', headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		try {
 			const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
 			新请求头.set('Host', 反代URL.host);
@@ -5286,16 +5286,29 @@ function finalizeSubscriptionContent(content, config = {}) {
 			return JSON.stringify(finalizeJsonSubscriptionValue(JSON.parse(source), uuid, hostPicker), null, 2);
 		} catch (e) { }
 	}
-	let currentHost = null;
-	return source.split(/(\r?\n)/).map(part => {
-		if (!part || part === '\n' || part === '\r\n') return part;
-		if (/^\s*-\s+(?:name:|\{)/.test(part)) currentHost = null;
-		if ((part.includes(placeholderUUID) || part.includes(placeholderUUIDBase64)) && !currentHost) currentHost = hostPicker();
-		let line = part
-			.replace(new RegExp(placeholderUUID, 'g'), uuid)
-			.replace(new RegExp(placeholderUUIDBase64, 'g'), btoa(uuid));
-		if (currentHost && line.includes('example.com')) line = replaceGeneratedHostPlaceholders(line, currentHost);
-		return line;
+	const blockStartRegex = /^\s*-\s+(?:name:|\{)/;
+	const blocks = [];
+	let currentBlock = [];
+	for (const part of source.split(/(\r?\n)/)) {
+		if (part && part !== '\n' && part !== '\r\n' && blockStartRegex.test(part) && currentBlock.length > 0) {
+			blocks.push(currentBlock);
+			currentBlock = [];
+		}
+		currentBlock.push(part);
+	}
+	if (currentBlock.length > 0) blocks.push(currentBlock);
+
+	return blocks.map(block => {
+		const blockText = block.join('');
+		const blockHost = (blockText.includes(placeholderUUID) || blockText.includes(placeholderUUIDBase64)) ? hostPicker() : null;
+		return block.map(part => {
+			if (!part || part === '\n' || part === '\r\n') return part;
+			let line = part
+				.replace(new RegExp(placeholderUUID, 'g'), uuid)
+				.replace(new RegExp(placeholderUUIDBase64, 'g'), btoa(uuid));
+			if (blockHost && line.includes('example.com')) line = replaceGeneratedHostPlaceholders(line, blockHost);
+			return line;
+		}).join('');
 	}).join('');
 }
 
