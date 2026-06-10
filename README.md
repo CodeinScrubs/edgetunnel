@@ -19,6 +19,7 @@ npm run build
 npm run verify-generated
 npm test
 npm run check
+npm run bench:live -- --help
 ```
 
 Edit user-facing static defaults in `src/core/config.js`, then run `npm run build`.
@@ -86,6 +87,38 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.
 - gRPC flush timing should be tuned only from measurements. Use `node scripts/grpc-live-smoke-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid` to smoke-test a deployed gRPC endpoint before changing batching constants.
 - Use `node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports all --runs 5` to compare deployed WS, gRPC, and XHTTP first-byte latency, total time, and success rate before tuning speed-related defaults.
+
+## Post-Deploy Benchmark Runbook
+
+Run benchmarks only against the deployed Worker or custom domain you actually use. For gRPC, a custom domain is usually required. `--url`, `--sni`, and `--authority` should normally be the Worker/custom domain identity, while `--front-host` is the clean/front domain being tested.
+
+Latency and front-host stability:
+
+```bash
+node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 30 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --profile latency
+```
+
+Burst behavior for Telegram/reel-style request fan-out:
+
+```bash
+node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 24 --concurrency 6 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --profile burst
+```
+
+Download and upload profiles need a plain HTTP endpoint that serves or accepts the requested payload. The current script sends inner plain HTTP through the tunnel; `--port 80` is the inner destination port, not the outer Worker HTTPS port.
+
+```bash
+node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 10 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target speedtest.tele2.net --port 80 --http-path /1MB.zip --profile download --timeout 30000
+node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 10 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target httpbin.org --port 80 --http-method POST --body-bytes 1048576 --profile upload --timeout 30000
+```
+
+Interpret the result this way:
+
+- `acceptRate` proves the Worker accepted and decoded the tunnel protocol.
+- `successRate` proves the inner HTTP response looked valid.
+- `firstByteP50Ms` and `firstByteP95Ms` show instant-open latency and jitter.
+- `totalP50Ms` and `totalP95Ms` show completion time for the chosen payload.
+- `throughputP50Mbps` is useful only for download/upload profiles with meaningful payload sizes.
+- Do not tune `DIAL_STAGGER_MS`, DNS preload, queue limits, or gRPC flush settings from a single small-response latency run.
 
 ## Disclaimer
 

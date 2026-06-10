@@ -49,6 +49,6 @@ Goal: fast VPN behavior on Cloudflare Workers, measured by low latency, low pack
 
 1. Keep `_worker.js` deployable and generated from `src/worker.js`.
 2. Use `npm run verify-generated` before deployment to prove `_worker.js` matches `src/` without rewriting it.
-3. Run `node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports all --runs 5` before changing speed-related defaults.
+3. Run the README post-deploy benchmark matrix before changing speed-related defaults: latency, burst, download, and upload profiles against the deployed custom domain.
 4. Continue behavior-preserving extraction by moving one core function group at a time into `src/`.
 5. Consider migrating the connector adapter to `cloudflare:sockets` only after proving parity on the current deployment.

@@ -34,6 +34,7 @@ const USER_CONFIG = {
 const ENGINE_DEFAULTS = {
 	DEFAULT_SOCKS5_WHITELIST: ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'],
 	PAGES_STATIC_URL: 'https://edt-pages.github.io',
+	ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES: 32,
 	WS_EARLY_DATA_MAX_BYTES: 8 * 1024,
 	UPLINK_BUNDLE_TARGET_BYTES: 16 * 1024,
 	UPLINK_QUEUE_MAX_BYTES: 16 * 1024 * 1024,
@@ -81,6 +82,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
+const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
@@ -6370,7 +6372,7 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 			createdAt: Date.now(),
 		};
 		ENGLISH_STATIC_PAGE_CACHE.set(cacheKey, cacheEntry);
-		if (ENGLISH_STATIC_PAGE_CACHE.size > 8) {
+		if (ENGLISH_STATIC_PAGE_CACHE.size > ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES) {
 			const oldestKey = ENGLISH_STATIC_PAGE_CACHE.keys().next().value;
 			ENGLISH_STATIC_PAGE_CACHE.delete(oldestKey);
 		}

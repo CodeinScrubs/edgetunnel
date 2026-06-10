@@ -21,8 +21,13 @@ function usage() {
 		'',
 		'Options:',
 		'  --runs 5                 Number of requests per transport',
-		'  --target example.com     Plain HTTP target reached through the tunnel',
-		'  --port 80                Target port',
+		'  --profile latency        latency, download, upload, or burst',
+		'  --target example.com     Inner plain HTTP target reached through the tunnel',
+		'  --port 80                Inner target port, not the Worker HTTPS port',
+		'  --http-method GET        Inner HTTP method',
+		'  --http-path /            Inner HTTP path, for example / or /files/1Mb.dat',
+		'  --body-bytes 0           Deterministic upload body bytes for POST/upload tests',
+		'  --concurrency 1          Concurrent runs per transport for burst checks',
 		'  --ua "Mozilla/5.0 ..."   User-Agent',
 		'  --timeout 15000          Per-run timeout in milliseconds',
 		'  --transports all         all, grpc, ws, xhttp, or a comma-separated list',
@@ -143,8 +148,60 @@ function hasVlessResponseHeader(bytes) {
 	return bytes.byteLength >= 2 && bytes[0] === 0 && bytes[1] === 0;
 }
 
-function makeHttpPayload({ uuid, target, port, ua }) {
-	const httpRequest = new TextEncoder().encode(`GET / HTTP/1.1\r\nHost: ${target}\r\nUser-Agent: ${ua}\r\nConnection: close\r\n\r\n`);
+function normalizeBenchmarkProfile(value) {
+	const profile = String(value || 'latency').trim().toLowerCase();
+	if (!['latency', 'download', 'upload', 'burst'].includes(profile)) {
+		throw new Error(`Unsupported benchmark profile: ${value}`);
+	}
+	return profile;
+}
+
+function normalizeHttpMethod(value, profile) {
+	const method = String(value || (profile === 'upload' ? 'POST' : 'GET')).trim().toUpperCase();
+	if (!/^[A-Z]{1,16}$/.test(method)) throw new Error(`Invalid HTTP method: ${value}`);
+	return method;
+}
+
+function normalizeHttpPath(value) {
+	const path = String(value || '/').trim();
+	if (!path.startsWith('/')) throw new Error(`HTTP path must start with /: ${value}`);
+	if (/[\r\n]/.test(path)) throw new Error('HTTP path must not contain CR/LF');
+	return path;
+}
+
+function normalizeByteCount(value, fallback = 0) {
+	const parsed = Number(value ?? fallback);
+	if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`Invalid byte count: ${value}`);
+	return Math.min(16 * 1024 * 1024, Math.round(parsed));
+}
+
+function normalizePort(value) {
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) throw new Error(`Invalid port: ${value}`);
+	return parsed;
+}
+
+function makeDeterministicBody(size) {
+	const body = new Uint8Array(size);
+	for (let i = 0; i < body.byteLength; i++) body[i] = 97 + (i % 26);
+	return body;
+}
+
+function makeHttpPayload({ uuid, target, port, ua, httpMethod = 'GET', httpPath = '/', bodyBytes = 0 }) {
+	if (new TextEncoder().encode(target).byteLength > 255) throw new Error('Target hostname is too long for VLESS domain address');
+	const body = makeDeterministicBody(bodyBytes);
+	const headers = [
+		`${httpMethod} ${httpPath} HTTP/1.1`,
+		`Host: ${target}`,
+		`User-Agent: ${ua}`,
+		'Accept: */*',
+		'Connection: close',
+	];
+	if (body.byteLength > 0 || httpMethod !== 'GET') headers.push(`Content-Length: ${body.byteLength}`);
+	const head = new TextEncoder().encode(`${headers.join('\r\n')}\r\n\r\n`);
+	const httpRequest = new Uint8Array(head.byteLength + body.byteLength);
+	httpRequest.set(head, 0);
+	httpRequest.set(body, head.byteLength);
 	return makeVlessTcpRequest(uuid, target, port, httpRequest);
 }
 
@@ -257,7 +314,7 @@ async function runGrpc(options) {
 			const accepted = hasVlessResponseHeader(rawTunneled);
 			const tunneled = stripVlessResponseHeader(rawTunneled);
 			const text = new TextDecoder().decode(tunneled.subarray(0, 160));
-			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, bodyBytes.byteLength, text, accepted));
+			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, bodyBytes.byteLength, tunneled.byteLength, text, accepted));
 		});
 		req.on('error', error => finish(reject, error));
 		req.write(Buffer.from(encodeGrpcFrame([makeHttpPayload(options)])));
@@ -266,18 +323,26 @@ async function runGrpc(options) {
 
 async function runXhttp(options) {
 	const startedAt = performance.now();
-	const response = await fetch(options.url, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/octet-stream',
-			'User-Agent': options.ua,
-		},
-		body: makeHttpPayload(options),
-	});
-	const body = await collectResponseBody(response, startedAt, options.timeoutMs);
-	const accepted = hasVlessResponseHeader(body.bytes);
-	const text = new TextDecoder().decode(stripVlessResponseHeader(body.bytes).subarray(0, 160));
-	return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, text, accepted);
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/octet-stream',
+				'User-Agent': options.ua,
+			},
+			body: makeHttpPayload(options),
+			signal: controller.signal,
+		});
+		const body = await collectResponseBody(response, startedAt, options.timeoutMs);
+		const accepted = hasVlessResponseHeader(body.bytes);
+		const tunneled = stripVlessResponseHeader(body.bytes);
+		const text = new TextDecoder().decode(tunneled.subarray(0, 160));
+		return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, tunneled.byteLength, text, accepted);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 async function websocketMessageBytes(data) {
@@ -299,6 +364,7 @@ async function runWs(options) {
 	const result = await new Promise((resolve, reject) => {
 		const ws = new WebSocket(wsUrl.href);
 		ws.binaryType = 'arraybuffer';
+		const pendingMessages = [];
 		const timer = setTimeout(() => {
 			try { ws.close(); } catch {}
 			reject(new Error('websocket benchmark timed out'));
@@ -307,17 +373,19 @@ async function runWs(options) {
 			ws.send(makeHttpPayload(options));
 		});
 		ws.addEventListener('message', event => {
-			Promise.resolve(websocketMessageBytes(event.data)).then(bytes => {
+			const pending = Promise.resolve(websocketMessageBytes(event.data)).then(bytes => {
 				if (bytes.byteLength) {
 					if (firstByteMs === null) firstByteMs = performance.now() - startedAt;
 					chunks.push(bytes);
 				}
-			}).catch(reject);
+			});
+			pendingMessages.push(pending);
+			pending.catch(reject);
 		});
 		ws.addEventListener('close', () => {
 			clearTimeout(timer);
 			status = 101;
-			resolve(concatBytes(chunks));
+			Promise.allSettled(pendingMessages).then(() => resolve(concatBytes(chunks))).catch(reject);
 		});
 		ws.addEventListener('error', event => {
 			clearTimeout(timer);
@@ -325,11 +393,12 @@ async function runWs(options) {
 		});
 	});
 	const accepted = hasVlessResponseHeader(result);
-	const text = new TextDecoder().decode(stripVlessResponseHeader(result).subarray(0, 160));
-	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, text, accepted);
+	const tunneled = stripVlessResponseHeader(result);
+	const text = new TextDecoder().decode(tunneled.subarray(0, 160));
+	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, tunneled.byteLength, text, accepted);
 }
 
-function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, text, accepted = false) {
+function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, tunneledBytes, text, accepted = false) {
 	const totalMs = performance.now() - startedAt;
 	return {
 		transport,
@@ -337,6 +406,8 @@ function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, by
 		firstByteMs,
 		totalMs,
 		bytes,
+		tunneledBytes,
+		throughputMbps: totalMs > 0 ? Number(((tunneledBytes * 8) / totalMs / 1000).toFixed(3)) : null,
 		accepted,
 		ok: Boolean(transportOk && /HTTP\/1\.[01]\s+\d+/.test(text)),
 	};
@@ -355,6 +426,7 @@ function summarizeTransport(transport, results) {
 	const firstByteValues = successful.map(result => result.firstByteMs).filter(value => Number.isFinite(value));
 	const acceptedFirstByteValues = accepted.map(result => result.firstByteMs).filter(value => Number.isFinite(value));
 	const totalValues = successful.map(result => result.totalMs).filter(value => Number.isFinite(value));
+	const throughputValues = successful.map(result => result.throughputMbps).filter(value => Number.isFinite(value));
 	return {
 		transport,
 		runs: results.length,
@@ -369,7 +441,28 @@ function summarizeTransport(transport, results) {
 		totalP50Ms: totalValues.length ? Math.round(percentile(totalValues, 50)) : null,
 		totalP95Ms: totalValues.length ? Math.round(percentile(totalValues, 95)) : null,
 		bytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + result.bytes, 0) / successful.length) : 0,
+		tunneledBytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + (result.tunneledBytes || 0), 0) / successful.length) : 0,
+		throughputP50Mbps: throughputValues.length ? Number(percentile(throughputValues, 50).toFixed(3)) : null,
+		throughputP95Mbps: throughputValues.length ? Number(percentile(throughputValues, 95).toFixed(3)) : null,
 	};
+}
+
+function applyProfileDefaults(options, explicitArgs) {
+	if (options.profile === 'download') {
+		if (!explicitArgs['http-path']) options.httpPath = '/';
+		if (!explicitArgs.timeout) options.timeoutMs = Math.max(options.timeoutMs, 30000);
+	}
+	if (options.profile === 'upload') {
+		if (!explicitArgs['http-method']) options.httpMethod = 'POST';
+		if (!explicitArgs['body-bytes']) options.bodyBytes = 1024 * 1024;
+		if (!explicitArgs.timeout) options.timeoutMs = Math.max(options.timeoutMs, 30000);
+	}
+	if (options.profile === 'burst') {
+		if (!explicitArgs.concurrency) options.concurrency = 6;
+		if (!explicitArgs.runs) options.runs = 24;
+		if (!explicitArgs.timeout) options.timeoutMs = Math.max(options.timeoutMs, 20000);
+	}
+	return options;
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -385,38 +478,57 @@ if (!url || !uuid) {
 	process.exit(2);
 }
 
-const options = {
+const profile = normalizeBenchmarkProfile(args.profile || process.env.TUNNEL_BENCH_PROFILE || 'latency');
+const options = applyProfileDefaults({
 	url,
 	uuid,
+	profile,
 	target: args.target || process.env.TUNNEL_BENCH_TARGET || process.env.GRPC_BENCH_TARGET || 'example.com',
-	port: Number(args.port || process.env.TUNNEL_BENCH_PORT || process.env.GRPC_BENCH_PORT || 80),
+	port: normalizePort(args.port || process.env.TUNNEL_BENCH_PORT || process.env.GRPC_BENCH_PORT || 80),
+	httpMethod: normalizeHttpMethod(args['http-method'] || args.method || process.env.TUNNEL_BENCH_HTTP_METHOD, profile),
+	httpPath: normalizeHttpPath(args['http-path'] || args.path || process.env.TUNNEL_BENCH_HTTP_PATH || '/'),
+	bodyBytes: normalizeByteCount(args['body-bytes'] || process.env.TUNNEL_BENCH_BODY_BYTES || 0),
 	ua: args.ua || process.env.TUNNEL_BENCH_UA || process.env.GRPC_BENCH_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
 	timeoutMs: Math.max(1000, Math.min(60000, Number(args.timeout || process.env.TUNNEL_BENCH_TIMEOUT || 15000))),
+	concurrency: Math.max(1, Math.min(32, Math.round(Number(args.concurrency || process.env.TUNNEL_BENCH_CONCURRENCY || 1)))),
+	runs: Math.max(1, Math.min(200, Number(args.runs || process.env.TUNNEL_BENCH_RUNS || process.env.GRPC_BENCH_RUNS || 5))),
 	frontHost: args['front-host'] || args.front || process.env.TUNNEL_BENCH_FRONT_HOST || process.env.GRPC_BENCH_FRONT_HOST || '',
 	sni: args.sni || process.env.TUNNEL_BENCH_SNI || process.env.GRPC_BENCH_SNI || '',
 	authority: args.authority || process.env.TUNNEL_BENCH_AUTHORITY || process.env.GRPC_BENCH_AUTHORITY || '',
 	serviceName: args['service-name'] || args.serviceName || process.env.TUNNEL_BENCH_SERVICE_NAME || process.env.GRPC_BENCH_SERVICE_NAME || '',
-};
-const runs = Math.max(1, Math.min(50, Number(args.runs || process.env.TUNNEL_BENCH_RUNS || process.env.GRPC_BENCH_RUNS || 5)));
+}, args);
 const transports = normalizeTransports(args.transports || process.env.TUNNEL_BENCH_TRANSPORTS || 'grpc');
 const runners = { grpc: runGrpc, ws: runWs, xhttp: runXhttp };
 const allResults = [];
 
+async function runOne(transport, run) {
+	try {
+		const result = await runners[transport](options);
+		allResults.push(result);
+		console.log(JSON.stringify({ run, profile: options.profile, ...result }));
+	} catch (error) {
+		const result = { transport, status: 0, firstByteMs: null, totalMs: null, bytes: 0, tunneledBytes: 0, throughputMbps: null, accepted: false, ok: false, error: error?.message || String(error) };
+		allResults.push(result);
+		console.log(JSON.stringify({ run, profile: options.profile, ...result }));
+	}
+}
+
 for (const transport of transports) {
-	for (let i = 0; i < runs; i++) {
-		try {
-			const result = await runners[transport](options);
-			allResults.push(result);
-			console.log(JSON.stringify({ run: i + 1, ...result }));
-		} catch (error) {
-			const result = { transport, status: 0, firstByteMs: null, totalMs: null, bytes: 0, accepted: false, ok: false, error: error?.message || String(error) };
-			allResults.push(result);
-			console.log(JSON.stringify({ run: i + 1, ...result }));
+	for (let nextRun = 1; nextRun <= options.runs;) {
+		const batch = [];
+		for (let slot = 0; slot < options.concurrency && nextRun <= options.runs; slot++, nextRun++) {
+			batch.push(runOne(transport, nextRun));
 		}
+		await Promise.all(batch);
 	}
 }
 
 console.log(JSON.stringify({
+	profile: options.profile,
+	target: `${options.target}:${options.port}${options.httpPath}`,
+	httpMethod: options.httpMethod,
+	bodyBytes: options.bodyBytes,
+	concurrency: options.concurrency,
 	summary: transports.map(transport => summarizeTransport(transport, allResults.filter(result => result.transport === transport))),
 }, null, 2));
 

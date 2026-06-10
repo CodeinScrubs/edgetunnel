@@ -32,6 +32,7 @@ export const USER_CONFIG = {
 export const ENGINE_DEFAULTS = {
 	DEFAULT_SOCKS5_WHITELIST: ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'],
 	PAGES_STATIC_URL: 'https://edt-pages.github.io',
+	ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES: 32,
 	WS_EARLY_DATA_MAX_BYTES: 8 * 1024,
 	UPLINK_BUNDLE_TARGET_BYTES: 16 * 1024,
 	UPLINK_QUEUE_MAX_BYTES: 16 * 1024 * 1024,
