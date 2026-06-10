@@ -40,6 +40,15 @@ import { join } from 'node:path';
 }
 
 {
+	const result = spawnSync(process.execPath, ['scripts/compare-benchmark-reports.mjs', '--help'], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'comparator --help should exit successfully');
+	assert.match(result.stderr, /--baseline/);
+	assert.match(result.stderr, /--candidate/);
+}
+
+{
 	const result = spawnSync(process.execPath, ['scripts/live-tunnel-benchmark.mjs'], {
 		encoding: 'utf8',
 	});
@@ -114,6 +123,41 @@ import { join } from 'node:path';
 	const source = readFileSync('scripts/analyze-benchmark-report.mjs', 'utf8');
 	assert.match(source, /makeSignals/, 'analyzer should turn raw metrics into tuning signals');
 	assert.match(source, /bestByProfile/, 'analyzer should report the best scenario per profile and transport');
+}
+
+{
+	const dir = mkdtempSync(join(tmpdir(), 'edgetunnel-compare-'));
+	const baselinePath = join(dir, 'baseline.json');
+	const betterPath = join(dir, 'better.json');
+	const worsePath = join(dir, 'worse.json');
+	const makeReport = summary => JSON.stringify({
+		scenarios: [{
+			scenario: { profile: 'latency', frontHost: 'sourceforge.net' },
+			summary: { summary: [{ transport: 'grpc', runs: 20, acceptRate: 1, successRate: 1, ...summary }] },
+		}],
+	});
+	writeFileSync(baselinePath, makeReport({ firstByteP95Ms: 500, totalP95Ms: 1500, throughputP50Mbps: 1 }));
+	writeFileSync(betterPath, makeReport({ firstByteP95Ms: 420, totalP95Ms: 1200, throughputP50Mbps: 1.2 }));
+	writeFileSync(worsePath, makeReport({ firstByteP95Ms: 900, totalP95Ms: 2200, throughputP50Mbps: 0.7 }));
+
+	const better = spawnSync(process.execPath, ['scripts/compare-benchmark-reports.mjs', '--baseline', baselinePath, '--candidate', betterPath, '--json'], {
+		encoding: 'utf8',
+	});
+	assert.equal(better.status, 0, 'better candidate should pass comparator');
+	assert.equal(JSON.parse(better.stdout).verdict, 'pass');
+
+	const worse = spawnSync(process.execPath, ['scripts/compare-benchmark-reports.mjs', '--baseline', baselinePath, '--candidate', worsePath, '--json'], {
+		encoding: 'utf8',
+	});
+	assert.notEqual(worse.status, 0, 'regressed candidate should fail comparator');
+	assert.equal(JSON.parse(worse.stdout).verdict, 'fail');
+}
+
+{
+	const source = readFileSync('scripts/compare-benchmark-reports.mjs', 'utf8');
+	assert.match(source, /maxLatencyRegressionPct/, 'comparator should enforce latency regression thresholds');
+	assert.match(source, /maxThroughputRegressionPct/, 'comparator should enforce throughput regression thresholds');
+	assert.match(source, /verdict/, 'comparator should emit a pass/fail verdict');
 }
 
 {

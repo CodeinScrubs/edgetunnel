@@ -22,6 +22,7 @@ npm run check
 npm run bench:live -- --help
 npm run bench:matrix -- --help
 npm run bench:analyze -- --help
+npm run bench:compare -- --help
 ```
 
 Edit user-facing static defaults in `src/core/config.js`, then run `npm run build`.
@@ -118,6 +119,12 @@ Analyze a saved benchmark report before tuning:
 node scripts/analyze-benchmark-report.mjs benchmark-baseline.json --min-runs 10
 ```
 
+After changing one tuning knob, run the same matrix again with a new output file and compare:
+
+```bash
+node scripts/compare-benchmark-reports.mjs --baseline benchmark-baseline.json --candidate benchmark-candidate.json
+```
+
 Download and upload profiles need a plain HTTP endpoint that serves or accepts the requested payload. The current script sends inner plain HTTP through the tunnel; `--port 80` is the inner destination port, not the outer Worker HTTPS port.
 
 For cleaner throughput measurements, deploy the optional benchmark target Worker in `benchmarks/` and use its hostname as `--target`.
@@ -136,6 +143,7 @@ Interpret the result this way:
 - `throughputP50Mbps` is useful only for download/upload profiles with meaningful payload sizes.
 - Do not tune `DIAL_STAGGER_MS`, DNS preload, queue limits, or gRPC flush settings from a single small-response latency run.
 - Treat analyzer `FAIL` signals as blockers for speed tuning. Fix reliability, target selection, or front-host choice first.
+- Treat comparator failures as rollback signals unless the failed metric is unrelated to the knob being tested and you intentionally accept that tradeoff.
 
 ## Disclaimer
 
