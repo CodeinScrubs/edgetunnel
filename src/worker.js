@@ -2074,7 +2074,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function 并发打开候选连接(候选列表) {
-		return openStaggeredCandidates(候选列表, 候选 => 打开TCP连接(候选.hostname, 候选.port), { staggerMs: DIAL_STAGGER_MS });
+		return openStaggeredCandidates(候选列表, 候选 => 打开TCP连接(候选.hostname, 候选.port), { staggerMs: getDialStaggerMs(env) });
 	}
 
 	async function 构建预加载竞速候选列表(address, port) {
@@ -7152,6 +7152,12 @@ function getDnsTcpResponseTimeoutMs(env) {
 	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
 }
 
+function getDialStaggerMs(env) {
+	const configured = Number(env?.DIAL_STAGGER_MS);
+	if (!Number.isFinite(configured) || configured < 0) return DIAL_STAGGER_MS;
+	return Math.max(0, Math.min(500, Math.round(configured)));
+}
+
 async function withOperationTimeout(operation, timeoutMs, message, onTimeout = null) {
 	let timedOut = false;
 	let timer = null;
@@ -7559,6 +7565,7 @@ export const __testPerformanceHelpers = {
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
 	getProxyConnectTimeoutMs,
+	getDialStaggerMs,
 	getDohLookupUrl,
 	getDnsTcpEndpoint,
 	createTunnelContext,

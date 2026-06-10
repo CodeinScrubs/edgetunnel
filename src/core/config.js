@@ -15,6 +15,7 @@ export const USER_CONFIG = {
 	PRELOAD_RACE_DIAL: undefined,
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
+	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
 	PATH: undefined,

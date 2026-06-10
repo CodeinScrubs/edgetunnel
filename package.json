@@ -3,7 +3,8 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build-worker.mjs",
+    "verify-generated": "node scripts/build-worker.mjs --check",
     "test": "npm run build && node scripts/config-defaults.test.mjs && node scripts/tunnel-behavior.test.mjs && node scripts/performance-cache.test.mjs",
-    "check": "npm run build && node --check src/core/config.js && node --check src/worker.js && node --check _worker.js && node --check scripts/config-defaults.test.mjs && node --check scripts/grpc-live-smoke-benchmark.mjs"
+    "check": "npm run build && node --check src/core/config.js && node --check src/worker.js && node --check _worker.js && node --check scripts/config-defaults.test.mjs && node --check scripts/grpc-live-smoke-benchmark.mjs && node --check scripts/live-tunnel-benchmark.mjs && npm run verify-generated"
   }
 }

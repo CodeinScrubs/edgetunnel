@@ -34,6 +34,7 @@ const helpers = workerModule.__testPerformanceHelpers;
 const {
 	createTunnelContext,
 	applyProxyParamsToTunnelContext,
+	getDialStaggerMs,
 	getProxyResolutionRecord,
 	fetchWithTimeout,
 	openStaggeredCandidates,
@@ -504,6 +505,14 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(expandPreferredEndpointVariants('104.21.105.47:443#ip'), ['104.21.105.47:443#ip']);
 	assert.deepEqual(expandPreferredEndpointVariants('[2606:4700::6811:9316]:443#ipv6'), ['[2606:4700::6811:9316]:443#ipv6']);
 	assert.deepEqual(expandPreferredEndpointVariants('*.example.com:443#wildcard'), ['*.example.com:443#wildcard']);
+}
+
+{
+	assert.equal(getDialStaggerMs({}), 90);
+	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '0' }), 0);
+	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '37.6' }), 38);
+	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '9000' }), 500);
+	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '-1' }), 90);
 }
 
 {

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const srcEntry = resolve(rootDir, 'src/worker.js');
 const outFile = resolve(rootDir, '_worker.js');
+const checkOnly = process.argv.includes('--check');
 
 async function readSource(path) {
 	return readFile(path, 'utf8');
@@ -48,4 +49,15 @@ const banner = [
 	'',
 ].join('\n');
 
-await writeFile(outFile, banner + bundled, 'utf8');
+const output = banner + bundled;
+
+if (checkOnly) {
+	const current = await readFile(outFile, 'utf8');
+	if (current !== output) {
+		console.error('_worker.js is out of date. Run npm run build.');
+		process.exit(1);
+	}
+	console.log('_worker.js matches src output');
+} else {
+	await writeFile(outFile, output, 'utf8');
+}

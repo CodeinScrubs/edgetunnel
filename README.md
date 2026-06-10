@@ -16,6 +16,7 @@ This repository contains a Cloudflare Worker / Pages deployment with an admin pa
 
 ```bash
 npm run build
+npm run verify-generated
 npm test
 npm run check
 ```
@@ -59,6 +60,7 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 | `PRELOAD_RACE_DIAL` | No | `1` | Enables preload race dialing when set to `1` or `true`. |
 | `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `1500` ms. |
 | `DNS_TIMEOUT_MS` | No | `1200` | Optional DNS-over-TCP response timeout. Falls back to `CONNECT_TIMEOUT_MS` when set, otherwise `1200` ms. Values are clamped from `400` to `1500` ms. |
+| `DIAL_STAGGER_MS` | No | `90` | Optional stagger between clean-IP/proxy candidate dials. Defaults to `90` ms and is clamped from `0` to `500` ms. |
 | `DNS_SERVER` | No | `1.1.1.1:53` | Optional TCP DNS upstream for tunneled UDP DNS requests. Defaults to `8.8.4.4:53`. |
 | `DOH_URL` | No | `https://dns.google/dns-query` | Optional DoH endpoint for preload race dialing and proxy-domain resolution. Defaults to Cloudflare DoH. |
 
@@ -83,6 +85,7 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - `PRELOAD_RACE_DIAL=1` can improve first-open latency when DoH is fast and nearby, but it adds a DoH lookup before dialing each new hostname. Leave it off on networks where DoH is slow or blocked.
 - TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.
 - gRPC flush timing should be tuned only from measurements. Use `node scripts/grpc-live-smoke-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid` to smoke-test a deployed gRPC endpoint before changing batching constants.
+- Use `node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports all --runs 5` to compare deployed WS, gRPC, and XHTTP first-byte latency, total time, and success rate before tuning speed-related defaults.
 
 ## Disclaimer
 

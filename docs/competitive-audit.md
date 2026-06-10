@@ -6,11 +6,11 @@ Goal: fast VPN behavior on Cloudflare Workers, measured by low latency, low pack
 
 | Project | Engine rating | Summary |
 | --- | ---: | --- |
-| Our deployed copy | 88/100 | Strongest verified Worker tunnel engine: WS, gRPC, XHTTP, bounded timeouts, staggered dialing, DNS TCP framing, proxy cache/health, and regression tests. |
-| cmliu/edgetunnel | 80/100 | Strong upstream compatibility base with active community changes, but less locally hardened than our copy. |
-| IRNova/Nova-Proxy | 78/100 | Good product/UX and feature claims, but public Worker is obfuscated, so engine claims need live verification. |
-| BPB-Worker-Panel | 73/100 | Best modular/config-generation architecture, rich WARP/routing/DNS/client output, but narrower Worker tunnel runtime. |
-| itsyebekhe/nahan | 43/100 | Clean and auditable, with useful top defaults and D1 config ideas, but a much thinner WS-only tunnel core from inspected code. |
+| Our deployed copy | 89/100 | Strongest verified Worker tunnel engine: WS, gRPC, XHTTP, bounded timeouts, staggered dialing, DNS TCP framing, proxy cache/health, and regression tests. |
+| cmliu/edgetunnel | 81/100 | Strong upstream compatibility base with active community changes, but less locally hardened than our copy. |
+| IRNova/Nova-Proxy | 76/100 | Good product/UX and feature claims, but public Worker is obfuscated, so engine claims need live verification. |
+| BPB-Worker-Panel | 74/100 | Best modular/config-generation architecture, rich WARP/routing/DNS/client output, but narrower Worker tunnel runtime. |
+| itsyebekhe/nahan | 53/100 | Clean and auditable, with useful D1/multi-user/config ideas, but a much thinner WS-only tunnel core from inspected code. |
 
 ## What Others Do Better
 
@@ -48,6 +48,7 @@ Goal: fast VPN behavior on Cloudflare Workers, measured by low latency, low pack
 ## Next Engine Work
 
 1. Keep `_worker.js` deployable and generated from `src/worker.js`.
-2. Continue behavior-preserving extraction by moving one core function group at a time into `src/`.
-3. Add live benchmark output for WS vs gRPC, clean IP/domain candidates, connect latency, first byte, retry count, and throughput.
-4. Consider migrating the connector adapter to `cloudflare:sockets` only after proving parity on the current deployment.
+2. Use `npm run verify-generated` before deployment to prove `_worker.js` matches `src/` without rewriting it.
+3. Run `node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports all --runs 5` before changing speed-related defaults.
+4. Continue behavior-preserving extraction by moving one core function group at a time into `src/`.
+5. Consider migrating the connector adapter to `cloudflare:sockets` only after proving parity on the current deployment.
