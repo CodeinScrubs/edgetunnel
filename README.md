@@ -113,6 +113,8 @@ node scripts/live-benchmark-matrix.mjs --url https://your-domain.example/ --uuid
 
 Download and upload profiles need a plain HTTP endpoint that serves or accepts the requested payload. The current script sends inner plain HTTP through the tunnel; `--port 80` is the inner destination port, not the outer Worker HTTPS port.
 
+For cleaner throughput measurements, deploy the optional benchmark target Worker in `benchmarks/` and use its hostname as `--target`.
+
 ```bash
 node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 10 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target speedtest.tele2.net --port 80 --http-path /1MB.zip --profile download --timeout 30000
 node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 10 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target httpbin.org --port 80 --http-method POST --body-bytes 1048576 --profile upload --timeout 30000

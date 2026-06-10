@@ -76,4 +76,18 @@ import { readFileSync } from 'node:fs';
 	assert.match(source, /writeFileSync\(args\.out/, 'matrix runner should support saving reports for later tuning comparisons');
 }
 
+{
+	const source = readFileSync('benchmarks/target-worker.js', 'utf8');
+	assert.match(source, /\/bytes/, 'benchmark target should expose deterministic download endpoint');
+	assert.match(source, /\/sink/, 'benchmark target should expose upload sink endpoint');
+	assert.match(source, /ReadableStream/, 'benchmark target downloads should stream instead of allocating one giant response');
+	assert.match(source, /cache-control/, 'benchmark target responses should disable cache for throughput tests');
+}
+
+{
+	const source = readFileSync('benchmarks/wrangler.benchmark-target.toml', 'utf8');
+	assert.match(source, /main = "target-worker\.js"/);
+	assert.match(source, /name = "edgetunnel-benchmark-target"/);
+}
+
 console.log('tooling tests passed');
