@@ -22,6 +22,7 @@ npm run check
 npm run bench:live -- --help
 npm run bench:https -- --help
 npm run bench:matrix -- --help
+npm run bench:suite -- --help
 npm run bench:analyze -- --help
 npm run bench:compare -- --help
 ```
@@ -95,6 +96,14 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 ## Post-Deploy Benchmark Runbook
 
 Run benchmarks only against the deployed Worker or custom domain you actually use. For gRPC, a custom domain is usually required. `--url`, `--sni`, and `--authority` should normally be the Worker/custom domain identity, while `--front-host` is the clean/front domain being tested.
+
+Full baseline suite:
+
+```bash
+node scripts/run-benchmark-suite.mjs --url https://your-domain.example/ --uuid your-vless-uuid --front-hosts sourceforge.net,www.modrinth.com,www.speedtest.net --sni your-domain.example --authority your-domain.example --bench-target your-benchmark-target.example --out-dir benchmark-runs --prefix baseline
+```
+
+This writes separate reports for latency/burst and HTTPS, and includes download/upload runs when `--bench-target` is provided.
 
 Latency and front-host stability:
 

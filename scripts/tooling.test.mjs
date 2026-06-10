@@ -42,6 +42,15 @@ import { join } from 'node:path';
 }
 
 {
+	const result = spawnSync(process.execPath, ['scripts/run-benchmark-suite.mjs', '--help'], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'suite --help should exit successfully');
+	assert.match(result.stderr, /--bench-target/);
+	assert.match(result.stderr, /--https-target/);
+}
+
+{
 	const result = spawnSync(process.execPath, ['scripts/analyze-benchmark-report.mjs', '--help'], {
 		encoding: 'utf8',
 	});
@@ -90,6 +99,27 @@ import { join } from 'node:path';
 }
 
 {
+	const result = spawnSync(process.execPath, [
+		'scripts/run-benchmark-suite.mjs',
+		'--dry-run',
+		'--url', 'https://worker.example/',
+		'--uuid', '00000000-0000-4000-8000-000000000000',
+		'--front-hosts', 'sourceforge.net,www.modrinth.com',
+		'--sni', 'worker.example',
+		'--authority', 'worker.example',
+		'--bench-target', 'bench.example',
+	], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'suite dry-run should not require network access');
+	assert.match(result.stdout, /--profiles latency,burst/);
+	assert.match(result.stdout, /--profiles https/);
+	assert.match(result.stdout, /--profile download/);
+	assert.match(result.stdout, /--profile upload/);
+	assert.match(result.stdout, /"type": "suite-summary"/);
+}
+
+{
 	const source = readFileSync('scripts/live-tunnel-benchmark.mjs', 'utf8');
 	assert.match(source, /req\.write\(Buffer\.from\(encodeGrpcFrame/, 'gRPC benchmark should keep the upload stream open after the first frame');
 	assert.doesNotMatch(source, /req\.end\(Buffer\.from\(encodeGrpcFrame/, 'gRPC benchmark must not half-close the upload stream immediately');
@@ -112,6 +142,14 @@ import { join } from 'node:path';
 	assert.match(source, /parseSummaryLine/, 'matrix runner should consume compact summary lines instead of parsing pretty JSON');
 	assert.match(source, /compareScenarioResults/, 'matrix runner should rank front-host/profile scenarios');
 	assert.match(source, /writeFileSync\(args\.out/, 'matrix runner should support saving reports for later tuning comparisons');
+}
+
+{
+	const source = readFileSync('scripts/run-benchmark-suite.mjs', 'utf8');
+	assert.match(source, /latency,burst/, 'suite should include latency and burst baseline matrix');
+	assert.match(source, /profiles: 'https'/, 'suite should include HTTPS baseline matrix');
+	assert.match(source, /bench-target/, 'suite should optionally include deterministic throughput target runs');
+	assert.match(source, /suite-summary/, 'suite should emit a compact summary');
 }
 
 {

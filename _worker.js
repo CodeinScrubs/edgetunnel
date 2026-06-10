@@ -6334,7 +6334,7 @@ function normalizeEnglishLoginPage(html) {
 }
 
 async function fetchEnglishStaticPage(path, statusOverride) {
-	const cacheKey = `${path}|${statusOverride ?? ''}`;
+	const cacheKey = `${normalizeEnglishStaticPageCachePath(path)}|${statusOverride ?? ''}`;
 	const cached = ENGLISH_STATIC_PAGE_CACHE.get(cacheKey);
 	const now = Date.now();
 	if (cached && now - cached.createdAt < ENGLISH_STATIC_PAGE_CACHE_TTL_MS) {
@@ -6419,6 +6419,16 @@ function applyTopConfigAliases(config_JSON, env = {}) {
 		const parsed = Number(subUpdateTime);
 		if (Number.isFinite(parsed) && parsed > 0) config_JSON[subscriptionConfigKey].SUBUpdateTime = parsed;
 	}
+}
+
+function normalizeEnglishStaticPageCachePath(path) {
+	const value = String(path || '/');
+	const queryIndex = value.indexOf('?');
+	const pathname = queryIndex === -1 ? value : value.slice(0, queryIndex);
+	const search = queryIndex === -1 ? '' : value.slice(queryIndex);
+	const normalizedPathname = pathname || '/';
+	if (/^\/(?:admin|login|noADMIN|noKV)(?:\/)?$/i.test(normalizedPathname)) return normalizedPathname.replace(/\/$/, '') || '/';
+	return normalizedPathname + search
 }
 
 async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
@@ -7771,6 +7781,7 @@ export const __testPerformanceHelpers = {
 	readConfigJson: 读取config_JSON,
 	translateHTMLVisibleText,
 	injectEnglishRuntimeTranslator,
+	normalizeEnglishStaticPageCachePath,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog: 请求日志记录,

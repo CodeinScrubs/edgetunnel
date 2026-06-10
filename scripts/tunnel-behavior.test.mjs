@@ -55,6 +55,7 @@ const {
 	getDnsTcpEndpoint,
 	translateHTMLVisibleText,
 	injectEnglishRuntimeTranslator,
+	normalizeEnglishStaticPageCachePath,
 	buildRequestLogEntryKey,
 	readRequestLogs,
 	recordRequestLog,
@@ -343,6 +344,13 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 	assert.ok(scriptMatch, 'runtime translator script should be injected');
 	assert.equal(/[\u3400-\u9fff\uf900-\ufaff]/.test(scriptMatch[1]), false, 'runtime translator script should escape raw non-English text');
 	new Function(scriptMatch[1]);
+}
+
+{
+	assert.equal(normalizeEnglishStaticPageCachePath('/admin?tab=config&ts=1'), '/admin');
+	assert.equal(normalizeEnglishStaticPageCachePath('/login?next=%2Fadmin'), '/login');
+	assert.equal(normalizeEnglishStaticPageCachePath('/noKV?reason=missing'), '/noKV');
+	assert.equal(normalizeEnglishStaticPageCachePath('/assets/app.js?v=1'), '/assets/app.js?v=1');
 }
 
 function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
