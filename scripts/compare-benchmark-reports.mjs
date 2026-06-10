@@ -52,6 +52,7 @@ function normalizeSummaryEntry(item, sourceFile) {
 		runs: Number(summary.runs || 0),
 		acceptRate: Number(summary.acceptRate || 0),
 		successRate: Number(summary.successRate || 0),
+		tlsP95Ms: numberOrNull(summary.tlsP95Ms),
 		firstByteP95Ms: numberOrNull(summary.firstByteP95Ms),
 		totalP95Ms: numberOrNull(summary.totalP95Ms),
 		throughputP50Mbps: numberOrNull(summary.throughputP50Mbps),
@@ -76,6 +77,7 @@ function compareEntry(baseline, candidate, options) {
 	const changes = {
 		acceptRateDelta: candidate.acceptRate - baseline.acceptRate,
 		successRateDelta: candidate.successRate - baseline.successRate,
+		tlsP95DeltaPct: percentDelta(baseline.tlsP95Ms, candidate.tlsP95Ms, true),
 		firstByteP95DeltaPct: percentDelta(baseline.firstByteP95Ms, candidate.firstByteP95Ms, true),
 		totalP95DeltaPct: percentDelta(baseline.totalP95Ms, candidate.totalP95Ms, true),
 		throughputP50DeltaPct: percentDelta(baseline.throughputP50Mbps, candidate.throughputP50Mbps, false),
@@ -83,6 +85,9 @@ function compareEntry(baseline, candidate, options) {
 	const signals = [];
 	if (candidate.acceptRate < baseline.acceptRate) signals.push({ level: 'fail', message: `acceptRate dropped from ${baseline.acceptRate} to ${candidate.acceptRate}` });
 	if (candidate.successRate < baseline.successRate) signals.push({ level: 'fail', message: `successRate dropped from ${baseline.successRate} to ${candidate.successRate}` });
+	if (changes.tlsP95DeltaPct !== null && changes.tlsP95DeltaPct < -options.maxLatencyRegressionPct) {
+		signals.push({ level: 'fail', message: `tlsP95 regressed ${Math.abs(changes.tlsP95DeltaPct).toFixed(1)}%` });
+	}
 	if (changes.firstByteP95DeltaPct !== null && changes.firstByteP95DeltaPct < -options.maxLatencyRegressionPct) {
 		signals.push({ level: 'fail', message: `firstByteP95 regressed ${Math.abs(changes.firstByteP95DeltaPct).toFixed(1)}%` });
 	}
@@ -94,6 +99,7 @@ function compareEntry(baseline, candidate, options) {
 	}
 	if (!signals.length) {
 		const improved = [
+			changes.tlsP95DeltaPct,
 			changes.firstByteP95DeltaPct,
 			changes.totalP95DeltaPct,
 			changes.throughputP50DeltaPct,
@@ -164,12 +170,14 @@ if (args.json) {
 	}
 	for (const comparison of comparisons) {
 		const label = `${comparison.profile}/${comparison.transport}/${comparison.frontHost || '(none)'}`;
+		const tls = comparison.changes.tlsP95DeltaPct;
 		const first = comparison.changes.firstByteP95DeltaPct;
 		const total = comparison.changes.totalP95DeltaPct;
 		const throughput = comparison.changes.throughputP50DeltaPct;
 		console.log(`\n${label}`);
 		console.log(`  acceptRate: ${comparison.baseline.acceptRate} -> ${comparison.candidate.acceptRate}`);
 		console.log(`  successRate: ${comparison.baseline.successRate} -> ${comparison.candidate.successRate}`);
+		console.log(`  tlsP95: ${comparison.baseline.tlsP95Ms ?? 'n/a'}ms -> ${comparison.candidate.tlsP95Ms ?? 'n/a'}ms (${tls === null ? 'n/a' : tls.toFixed(1) + '%'})`);
 		console.log(`  firstByteP95: ${comparison.baseline.firstByteP95Ms ?? 'n/a'}ms -> ${comparison.candidate.firstByteP95Ms ?? 'n/a'}ms (${first === null ? 'n/a' : first.toFixed(1) + '%'})`);
 		console.log(`  totalP95: ${comparison.baseline.totalP95Ms ?? 'n/a'}ms -> ${comparison.candidate.totalP95Ms ?? 'n/a'}ms (${total === null ? 'n/a' : total.toFixed(1) + '%'})`);
 		console.log(`  throughputP50: ${comparison.baseline.throughputP50Mbps ?? 'n/a'}Mbps -> ${comparison.candidate.throughputP50Mbps ?? 'n/a'}Mbps (${throughput === null ? 'n/a' : throughput.toFixed(1) + '%'})`);

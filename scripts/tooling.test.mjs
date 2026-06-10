@@ -73,7 +73,7 @@ import { join } from 'node:path';
 		'--url', 'https://worker.example/',
 		'--uuid', '00000000-0000-4000-8000-000000000000',
 		'--front-hosts', 'sourceforge.net,www.modrinth.com',
-		'--profiles', 'latency,burst',
+		'--profiles', 'latency,burst,https',
 		'--sni', 'worker.example',
 		'--authority', 'worker.example',
 		'--service-name', '/',
@@ -85,6 +85,7 @@ import { join } from 'node:path';
 	assert.match(result.stdout, /--front-host www\.modrinth\.com/);
 	assert.match(result.stdout, /--profile latency/);
 	assert.match(result.stdout, /--profile burst/);
+	assert.match(result.stdout, /scripts\/live-https-benchmark\.mjs/);
 	assert.match(result.stdout, /"type": "matrix-summary"/);
 }
 
@@ -126,6 +127,10 @@ import { join } from 'node:path';
 				scenario: { profile: 'latency', frontHost: 'fast.example' },
 				summary: { summary: [{ transport: 'grpc', runs: 10, acceptRate: 1, successRate: 1, firstByteP95Ms: 400, totalP95Ms: 900, throughputP50Mbps: 0.02 }] },
 			},
+			{
+				scenario: { profile: 'https', frontHost: 'fast.example' },
+				summary: { summary: [{ transport: 'grpc', runs: 10, acceptRate: 1, successRate: 1, tlsP95Ms: 700, firstByteP95Ms: 850, totalP95Ms: 1000 }] },
+			},
 		],
 	}));
 	const result = spawnSync(process.execPath, ['scripts/analyze-benchmark-report.mjs', reportPath, '--json', '--min-runs', '5'], {
@@ -134,6 +139,7 @@ import { join } from 'node:path';
 	assert.equal(result.status, 0, 'analyzer should parse matrix reports');
 	const parsed = JSON.parse(result.stdout);
 	assert.equal(parsed.bestByProfile[0].best.frontHost, 'fast.example');
+	assert.equal(parsed.ranked.some(entry => entry.tlsP95Ms === 700), true);
 	assert.equal(parsed.signals.some(signal => /Only 3 runs/.test(signal.message)), true);
 }
 
@@ -141,6 +147,7 @@ import { join } from 'node:path';
 	const source = readFileSync('scripts/analyze-benchmark-report.mjs', 'utf8');
 	assert.match(source, /makeSignals/, 'analyzer should turn raw metrics into tuning signals');
 	assert.match(source, /bestByProfile/, 'analyzer should report the best scenario per profile and transport');
+	assert.match(source, /tlsP95Ms/, 'analyzer should preserve HTTPS inner TLS metrics');
 }
 
 {
@@ -154,9 +161,9 @@ import { join } from 'node:path';
 			summary: { summary: [{ transport: 'grpc', runs: 20, acceptRate: 1, successRate: 1, ...summary }] },
 		}],
 	});
-	writeFileSync(baselinePath, makeReport({ firstByteP95Ms: 500, totalP95Ms: 1500, throughputP50Mbps: 1 }));
-	writeFileSync(betterPath, makeReport({ firstByteP95Ms: 420, totalP95Ms: 1200, throughputP50Mbps: 1.2 }));
-	writeFileSync(worsePath, makeReport({ firstByteP95Ms: 900, totalP95Ms: 2200, throughputP50Mbps: 0.7 }));
+	writeFileSync(baselinePath, makeReport({ tlsP95Ms: 800, firstByteP95Ms: 500, totalP95Ms: 1500, throughputP50Mbps: 1 }));
+	writeFileSync(betterPath, makeReport({ tlsP95Ms: 700, firstByteP95Ms: 420, totalP95Ms: 1200, throughputP50Mbps: 1.2 }));
+	writeFileSync(worsePath, makeReport({ tlsP95Ms: 1300, firstByteP95Ms: 900, totalP95Ms: 2200, throughputP50Mbps: 0.7 }));
 
 	const better = spawnSync(process.execPath, ['scripts/compare-benchmark-reports.mjs', '--baseline', baselinePath, '--candidate', betterPath, '--json'], {
 		encoding: 'utf8',
@@ -174,6 +181,7 @@ import { join } from 'node:path';
 {
 	const source = readFileSync('scripts/compare-benchmark-reports.mjs', 'utf8');
 	assert.match(source, /maxLatencyRegressionPct/, 'comparator should enforce latency regression thresholds');
+	assert.match(source, /tlsP95DeltaPct/, 'comparator should enforce HTTPS TLS regression thresholds');
 	assert.match(source, /maxThroughputRegressionPct/, 'comparator should enforce throughput regression thresholds');
 	assert.match(source, /verdict/, 'comparator should emit a pass/fail verdict');
 }

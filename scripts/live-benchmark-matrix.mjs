@@ -20,13 +20,13 @@ function usage() {
 		'',
 		'Options:',
 		'  --front-hosts a,b        Comma-separated gRPC clean/front hosts to compare',
-		'  --profiles latency,burst latency, burst, download, upload',
+		'  --profiles latency,burst latency, burst, download, upload, https',
 		'  --transports grpc        grpc, ws, xhttp, all, or comma-separated list',
 		'  --runs 10               Runs per scenario',
 		'  --out report.json       Optional JSON report path',
 		'  --dry-run               Print commands without running them',
 		'',
-		'All other common live benchmark flags are forwarded: --sni, --authority, --service-name, --target, --port, --timeout, --http-path, --http-method, --body-bytes, --concurrency.',
+		'All other common live benchmark flags are forwarded: --sni, --authority, --service-name, --target, --port, --timeout, --path, --http-path, --http-method, --body-bytes, --concurrency.',
 	].join('\n'));
 }
 
@@ -43,16 +43,19 @@ function addFlag(args, name, value) {
 }
 
 function buildScenarioCommand(baseArgs, scenario) {
-	const commandArgs = ['scripts/live-tunnel-benchmark.mjs'];
-	for (const name of ['url', 'uuid', 'transports', 'sni', 'authority', 'target', 'port', 'timeout', 'ua']) addFlag(commandArgs, name, baseArgs[name]);
+	const isHttpsProfile = scenario.profile === 'https';
+	const commandArgs = [isHttpsProfile ? 'scripts/live-https-benchmark.mjs' : 'scripts/live-tunnel-benchmark.mjs'];
+	for (const name of ['url', 'uuid', 'sni', 'authority', 'target', 'port', 'timeout', 'ua']) addFlag(commandArgs, name, baseArgs[name]);
+	if (!isHttpsProfile) addFlag(commandArgs, 'transports', baseArgs.transports);
 	addFlag(commandArgs, 'service-name', baseArgs['service-name']);
+	addFlag(commandArgs, 'path', baseArgs.path);
 	addFlag(commandArgs, 'http-path', baseArgs['http-path']);
-	addFlag(commandArgs, 'http-method', baseArgs['http-method']);
-	addFlag(commandArgs, 'body-bytes', baseArgs['body-bytes']);
-	addFlag(commandArgs, 'concurrency', baseArgs.concurrency);
+	if (!isHttpsProfile) addFlag(commandArgs, 'http-method', baseArgs['http-method']);
+	if (!isHttpsProfile) addFlag(commandArgs, 'body-bytes', baseArgs['body-bytes']);
+	if (!isHttpsProfile) addFlag(commandArgs, 'concurrency', baseArgs.concurrency);
 	addFlag(commandArgs, 'runs', baseArgs.runs);
 	addFlag(commandArgs, 'front-host', scenario.frontHost);
-	addFlag(commandArgs, 'profile', scenario.profile);
+	if (!isHttpsProfile) addFlag(commandArgs, 'profile', scenario.profile);
 	commandArgs.push('--summary-line');
 	return commandArgs;
 }

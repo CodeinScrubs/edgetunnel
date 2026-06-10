@@ -122,6 +122,12 @@ To compare several front hosts with the same settings and save a baseline report
 node scripts/live-benchmark-matrix.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --front-hosts sourceforge.net,www.modrinth.com,www.speedtest.net --profiles latency,burst --runs 30 --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --out benchmark-baseline.json
 ```
 
+For real HTTPS front-host comparison, run a separate matrix with an HTTPS target and port `443`:
+
+```bash
+node scripts/live-benchmark-matrix.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --front-hosts sourceforge.net,www.modrinth.com,www.speedtest.net --profiles https --runs 10 --sni your-domain.example --authority your-domain.example --service-name / --target example.com --port 443 --out benchmark-https-baseline.json
+```
+
 Analyze a saved benchmark report before tuning:
 
 ```bash

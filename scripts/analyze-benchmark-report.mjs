@@ -55,6 +55,8 @@ function normalizeSummaryEntry(item, sourceFile) {
 		runs: Number(summary.runs || 0),
 		acceptRate: Number(summary.acceptRate || 0),
 		successRate: Number(summary.successRate || 0),
+		tlsP50Ms: numberOrNull(summary.tlsP50Ms),
+		tlsP95Ms: numberOrNull(summary.tlsP95Ms),
 		firstByteP50Ms: numberOrNull(summary.firstByteP50Ms),
 		firstByteP95Ms: numberOrNull(summary.firstByteP95Ms),
 		totalP50Ms: numberOrNull(summary.totalP50Ms),
@@ -86,6 +88,7 @@ function score(entry) {
 	return {
 		successRate: entry.successRate,
 		acceptRate: entry.acceptRate,
+		tlsP95Ms: entry.tlsP95Ms ?? Infinity,
 		firstByteP95Ms: entry.firstByteP95Ms ?? Infinity,
 		totalP95Ms: entry.totalP95Ms ?? Infinity,
 		throughputP50Mbps: entry.throughputP50Mbps ?? 0,
@@ -97,6 +100,7 @@ function compareEntries(a, b) {
 	const right = score(b);
 	return right.successRate - left.successRate
 		|| right.acceptRate - left.acceptRate
+		|| left.tlsP95Ms - right.tlsP95Ms
 		|| left.firstByteP95Ms - right.firstByteP95Ms
 		|| left.totalP95Ms - right.totalP95Ms
 		|| right.throughputP50Mbps - left.throughputP50Mbps;
@@ -108,6 +112,7 @@ function makeSignals(entries, minRuns) {
 		if (entry.runs < minRuns) signals.push({ level: 'warn', label: entry.label, message: `Only ${entry.runs} runs; use at least ${minRuns} before tuning.` });
 		if (entry.acceptRate < 1) signals.push({ level: 'fail', label: entry.label, message: `Tunnel accept rate is ${entry.acceptRate}; fix reliability before speed tuning.` });
 		if (entry.successRate < 1) signals.push({ level: 'fail', label: entry.label, message: `Inner success rate is ${entry.successRate}; target/front/transport is not stable enough.` });
+		if ((entry.tlsP95Ms ?? 0) > 1500) signals.push({ level: 'warn', label: entry.label, message: `Inner TLS p95 is ${entry.tlsP95Ms}ms; real HTTPS browsing may feel slow before page data starts.` });
 		if ((entry.firstByteP95Ms ?? 0) > 1000) signals.push({ level: 'warn', label: entry.label, message: `First-byte p95 is ${entry.firstByteP95Ms}ms; users may feel stalls on browsing or Telegram bursts.` });
 		if ((entry.totalP95Ms ?? 0) > 3000 && ['latency', 'burst'].includes(entry.profile)) signals.push({ level: 'warn', label: entry.label, message: `Small-response total p95 is ${entry.totalP95Ms}ms; front host or path is jittery.` });
 		if (['download', 'upload'].includes(entry.profile) && entry.throughputP50Mbps !== null && entry.throughputP50Mbps < 5) {
@@ -162,7 +167,7 @@ if (args.json) {
 	console.log(`Analyzed ${entries.length} benchmark scenarios from ${args.files.length} file(s).`);
 	for (const group of bestByProfile) {
 		const best = group.best;
-		console.log(`Best ${group.key}: ${best.frontHost || '(none)'} success=${best.successRate} accept=${best.acceptRate} p95=${best.firstByteP95Ms ?? 'n/a'}ms totalP95=${best.totalP95Ms ?? 'n/a'}ms throughput=${best.throughputP50Mbps ?? 'n/a'}Mbps`);
+		console.log(`Best ${group.key}: ${best.frontHost || '(none)'} success=${best.successRate} accept=${best.acceptRate} tlsP95=${best.tlsP95Ms ?? 'n/a'}ms p95=${best.firstByteP95Ms ?? 'n/a'}ms totalP95=${best.totalP95Ms ?? 'n/a'}ms throughput=${best.throughputP50Mbps ?? 'n/a'}Mbps`);
 	}
 	if (signals.length) {
 		console.log('\nSignals:');
