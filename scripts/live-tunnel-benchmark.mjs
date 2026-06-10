@@ -208,6 +208,7 @@ async function runGrpc(options) {
 		let status = 0;
 		let firstByteMs = null;
 		let timer = null;
+		let req = null;
 		const chunks = [];
 		const client = http2.connect(origin, {
 			createConnection: () => tls.connect({
@@ -221,6 +222,7 @@ async function runGrpc(options) {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			try { req?.close?.() } catch {}
 			try { client.close(); } catch {}
 			fn(value);
 		};
@@ -230,7 +232,7 @@ async function runGrpc(options) {
 		}, options.timeoutMs);
 		client.on('error', error => finish(reject, error));
 
-		const req = client.request({
+		req = client.request({
 			':method': 'POST',
 			':scheme': 'https',
 			':authority': authority,
@@ -258,7 +260,7 @@ async function runGrpc(options) {
 			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, bodyBytes.byteLength, text, accepted));
 		});
 		req.on('error', error => finish(reject, error));
-		req.end(Buffer.from(encodeGrpcFrame([makeHttpPayload(options)])));
+		req.write(Buffer.from(encodeGrpcFrame([makeHttpPayload(options)])));
 	});
 }
 

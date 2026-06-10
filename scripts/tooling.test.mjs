@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 {
 	const result = spawnSync(process.execPath, ['scripts/live-tunnel-benchmark.mjs', '--help'], {
@@ -19,6 +20,12 @@ import { spawnSync } from 'node:child_process';
 	});
 	assert.equal(result.status, 2, 'missing URL/UUID should remain a usage error');
 	assert.match(result.stderr, /Usage:/);
+}
+
+{
+	const source = readFileSync('scripts/live-tunnel-benchmark.mjs', 'utf8');
+	assert.match(source, /req\.write\(Buffer\.from\(encodeGrpcFrame/, 'gRPC benchmark should keep the upload stream open after the first frame');
+	assert.doesNotMatch(source, /req\.end\(Buffer\.from\(encodeGrpcFrame/, 'gRPC benchmark must not half-close the upload stream immediately');
 }
 
 console.log('tooling tests passed');
