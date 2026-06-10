@@ -4,6 +4,9 @@ const {
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
+	DNS_RESULT_CACHE,
+	MD5MD5_RESULT_CACHE,
+	SHA224_RESULT_CACHE,
 	getProxyConnectTimeoutMs,
 	normalizeProxyCacheRecord,
 	orderProxyEndpoints,
@@ -12,9 +15,92 @@ const {
 	recordProxyEndpointResult,
 	parsePreferredEndpoint,
 	scheduleProxyCacheWrite,
+	DoH查询,
+	MD5MD5,
+	sha224,
 } = await import('../_worker.js').then(mod => mod.__testPerformanceHelpers);
 
 const now = 1_700_000_000_000;
+
+function encodeDnsName(name) {
+	const encoder = new TextEncoder();
+	const labels = String(name).split('.').filter(Boolean);
+	const chunks = labels.map(label => encoder.encode(label));
+	const length = chunks.reduce((sum, chunk) => sum + 1 + chunk.byteLength, 1);
+	const out = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		out[offset++] = chunk.byteLength;
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	out[offset] = 0;
+	return out;
+}
+
+function makeDnsAResponse(name, ttl, ipBytes) {
+	const qname = encodeDnsName(name);
+	const response = new Uint8Array(12 + qname.byteLength + 4 + 16);
+	const view = new DataView(response.buffer);
+	view.setUint16(0, 0x1234);
+	view.setUint16(2, 0x8180);
+	view.setUint16(4, 1);
+	view.setUint16(6, 1);
+	response.set(qname, 12);
+	let offset = 12 + qname.byteLength;
+	view.setUint16(offset, 1); offset += 2;
+	view.setUint16(offset, 1); offset += 2;
+	response[offset++] = 0xc0;
+	response[offset++] = 0x0c;
+	view.setUint16(offset, 1); offset += 2;
+	view.setUint16(offset, 1); offset += 2;
+	view.setUint32(offset, ttl); offset += 4;
+	view.setUint16(offset, 4); offset += 2;
+	response.set(ipBytes, offset);
+	return response;
+}
+
+{
+	MD5MD5_RESULT_CACHE.clear();
+	SHA224_RESULT_CACHE.clear();
+	const firstMd5 = await MD5MD5('same-admin-key');
+	const secondMd5 = await MD5MD5('same-admin-key');
+	assert.equal(firstMd5, secondMd5);
+	assert.equal(MD5MD5_RESULT_CACHE.size, 1, 'repeated MD5MD5 inputs should use the bounded hash cache');
+
+	const firstSha = sha224('same-trojan-password');
+	const secondSha = sha224('same-trojan-password');
+	assert.equal(firstSha, secondSha);
+	assert.equal(SHA224_RESULT_CACHE.size, 1, 'repeated Trojan sha224 inputs should use the bounded hash cache');
+	MD5MD5_RESULT_CACHE.clear();
+	SHA224_RESULT_CACHE.clear();
+}
+
+{
+	DNS_RESULT_CACHE.clear();
+	const originalFetch = globalThis.fetch;
+	let fetchCalls = 0;
+	globalThis.fetch = async () => {
+		fetchCalls++;
+		return new Response(makeDnsAResponse('cache.example', 120, new Uint8Array([203, 0, 113, 7])), {
+			status: 200,
+			headers: { 'Content-Type': 'application/dns-message' },
+		});
+	};
+	try {
+		const first = await DoH查询('cache.example', 'A', 'https://resolver.test/dns-query');
+		const second = await DoH查询('CACHE.example', 'a', 'https://resolver.test/dns-query');
+		assert.equal(fetchCalls, 1, 'second equivalent DoH lookup should use the in-memory DNS result cache');
+		assert.equal(first[0].data, '203.0.113.7');
+		assert.equal(second[0].data, '203.0.113.7');
+		second[0].rdata[0] = 1;
+		const third = await DoH查询('cache.example', 'A', 'https://resolver.test/dns-query');
+		assert.equal(third[0].rdata[0], 203, 'cached DoH answers should be cloned before returning');
+	} finally {
+		globalThis.fetch = originalFetch;
+		DNS_RESULT_CACHE.clear();
+	}
+}
 
 {
 	const record = normalizeProxyCacheRecord({

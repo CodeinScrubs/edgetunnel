@@ -61,6 +61,10 @@ const ENGINE_DEFAULTS = {
 	REQUEST_LOG_MAX_TTL_SECONDS: 30 * 24 * 60 * 60,
 	REQUEST_LOG_DEDUPE_TTL_SECONDS: 30 * 60,
 	DOH_LOOKUP_TIMEOUT_MS: 850,
+	DNS_RESULT_CACHE_MAX_ENTRIES: 256,
+	DNS_RESULT_CACHE_MIN_TTL_MS: 30 * 1000,
+	DNS_RESULT_CACHE_MAX_TTL_MS: 5 * 60 * 1000,
+	HASH_CACHE_MAX_ENTRIES: 256,
 	DNS_TCP_RESPONSE_TIMEOUT_MS: 1200,
 	DIAL_STAGGER_MS: 90,
 	DEFAULT_DOH_LOOKUP_URL: 'https://cloudflare-dns.com/dns-query',
@@ -110,16 +114,40 @@ const REQUEST_LOG_MIN_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_MIN_TTL_SECONDS;
 const REQUEST_LOG_MAX_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_MAX_TTL_SECONDS;
 const REQUEST_LOG_DEDUPE_TTL_SECONDS = ENGINE_DEFAULTS.REQUEST_LOG_DEDUPE_TTL_SECONDS;
 const DOH_LOOKUP_TIMEOUT_MS = ENGINE_DEFAULTS.DOH_LOOKUP_TIMEOUT_MS;
+const DNS_RESULT_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MAX_ENTRIES;
+const DNS_RESULT_CACHE_MIN_TTL_MS = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MIN_TTL_MS;
+const DNS_RESULT_CACHE_MAX_TTL_MS = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MAX_TTL_MS;
+const HASH_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.HASH_CACHE_MAX_ENTRIES;
 const DNS_TCP_RESPONSE_TIMEOUT_MS = ENGINE_DEFAULTS.DNS_TCP_RESPONSE_TIMEOUT_MS;
 const DIAL_STAGGER_MS = ENGINE_DEFAULTS.DIAL_STAGGER_MS;
 const DEFAULT_DOH_LOOKUP_URL = ENGINE_DEFAULTS.DEFAULT_DOH_LOOKUP_URL;
 const DEFAULT_DNS_TCP_SERVER = ENGINE_DEFAULTS.DEFAULT_DNS_TCP_SERVER;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
+const DNS_RESULT_CACHE = new Map();
+const SHA224_RESULT_CACHE = new Map();
+const MD5MD5_RESULT_CACHE = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
+let cachedProxyIPRaw = null;
+let cachedProxyIPList = null;
 
 function isEnabledEnvFlag(value) {
 	return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function getLruCacheValue(cache, key) {
+	if (!cache.has(key)) return undefined;
+	const value = cache.get(key);
+	cache.delete(key);
+	cache.set(key, value);
+	return value;
+}
+
+function setLruCacheValue(cache, key, value, maxEntries) {
+	if (cache.has(key)) cache.delete(key);
+	cache.set(key, value);
+	while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+	return value;
 }
 
 function isKvRequestLoggingEnabled(env = {}) {
@@ -843,11 +871,11 @@ async function 读取XHTTP首包(reader, token) {
 	};
 
 	const 尝试解析木马首包 = (data) => {
-		const 密码哈希 = sha224(token);
-		const 密码哈希字节 = new TextEncoder().encode(密码哈希);
 		const length = data.byteLength;
 		if (length < 58) return { 状态: 'need_more' };
 		if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
+		const 密码哈希 = sha224(token);
+		const 密码哈希字节 = new TextEncoder().encode(密码哈希);
 		for (let i = 0; i < 56; i++) {
 			if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
 		}
@@ -1636,10 +1664,10 @@ const 木马文本解码器 = new TextDecoder();
 
 function 解析木马请求(buffer, passwordPlainText) {
 	const data = 数据转Uint8Array(buffer);
-	const sha224Password = sha224(passwordPlainText);
 	if (data.byteLength < 58) return { hasError: true, message: "invalid data" };
 	let crLfIndex = 56;
 	if (data[crLfIndex] !== 0x0d || data[crLfIndex + 1] !== 0x0a) return { hasError: true, message: "invalid header format" };
+	const sha224Password = sha224(passwordPlainText);
 	for (let i = 0; i < crLfIndex; i++) {
 		if (data[i] !== sha224Password.charCodeAt(i)) return { hasError: true, message: "invalid password" };
 	}
@@ -2287,7 +2315,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
 				const 所有反代数组 = await 解析地址端口(proxyIP, host, yourUUID, env, ctx);
-				newSocket = await connectProxyIP(atob('UFJPWFlJUC50cDEuMDkwMjI3Lnh5eg=='), 1, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
+				const proxyFallbackEndpoint = parsePreferredEndpointText(proxyIP) || { address: proxyIP, port: '443' };
+				const proxyFallbackHost = stripIPv6Brackets(proxyFallbackEndpoint.address);
+				newSocket = await connectProxyIP(proxyFallbackHost, Number(proxyFallbackEndpoint.port) || 443, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
@@ -5255,8 +5285,20 @@ async function md5Hex(文本) {
 }
 
 async function MD5MD5(文本) {
-	const 第一次十六进制 = await md5Hex(文本);
-	return (await md5Hex(第一次十六进制.slice(7, 27))).toLowerCase();
+	const cacheKey = String(文本);
+	const cached = getLruCacheValue(MD5MD5_RESULT_CACHE, cacheKey);
+	if (cached !== undefined) return cached;
+	const resultPromise = (async () => {
+		const 第一次十六进制 = await md5Hex(cacheKey);
+		return (await md5Hex(第一次十六进制.slice(7, 27))).toLowerCase();
+	})();
+	setLruCacheValue(MD5MD5_RESULT_CACHE, cacheKey, resultPromise, HASH_CACHE_MAX_ENTRIES);
+	try {
+		return await resultPromise;
+	} catch (error) {
+		if (MD5MD5_RESULT_CACHE.get(cacheKey) === resultPromise) MD5MD5_RESULT_CACHE.delete(cacheKey);
+		throw error;
+	}
 }
 
 function 随机路径(完整节点路径 = "/") {
@@ -5392,8 +5434,42 @@ function finalizeSubscriptionContent(content, config = {}) {
 	}).join('');
 }
 
+function cloneDohAnswer(answer) {
+	return {
+		...answer,
+		rdata: answer?.rdata instanceof Uint8Array ? new Uint8Array(answer.rdata) : answer?.rdata,
+	};
+}
+
+function readDohCache(cacheKey, now = Date.now()) {
+	const cached = getLruCacheValue(DNS_RESULT_CACHE, cacheKey);
+	if (!cached || cached.expiresAt <= now) {
+		if (cached) DNS_RESULT_CACHE.delete(cacheKey);
+		return null;
+	}
+	return cached.answers.map(cloneDohAnswer);
+}
+
+function writeDohCache(cacheKey, answers, now = Date.now()) {
+	const ttlValues = (answers || [])
+		.map(answer => Number(answer?.TTL))
+		.filter(ttl => Number.isFinite(ttl) && ttl > 0)
+		.map(ttl => ttl * 1000);
+	const dnsTtlMs = ttlValues.length ? Math.min(...ttlValues) : DNS_RESULT_CACHE_MIN_TTL_MS;
+	const ttlMs = Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs));
+	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
+		expiresAt: now + ttlMs,
+		answers: (answers || []).map(cloneDohAnswer),
+	}, DNS_RESULT_CACHE_MAX_ENTRIES);
+}
+
 async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOOKUP_URL) {
 	const 开始时间 = performance.now();
+	const normalizedDomain = String(域名 || '').trim().toLowerCase();
+	const normalizedType = String(记录类型 || 'A').trim().toUpperCase();
+	const cacheKey = `${DoH解析服务}\n${normalizedType}\n${normalizedDomain}`;
+	const cachedAnswers = readDohCache(cacheKey);
+	if (cachedAnswers) return cachedAnswers;
 	log(`[DoH lookup] Starting query for ${域名} ${记录类型} via ${DoH解析服务}`);
 	try {
 
@@ -5518,6 +5594,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		}
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
 		log(`[DoH lookup] Query complete for ${域名} ${记录类型} via ${DoH解析服务} in ${耗时}ms with ${answers.length} results${answers.length > 0 ? '\n' + answers.map((a, i) => `  ${i + 1}. ${a.name} type=${a.type} TTL=${a.TTL} data=${a.data}`).join('\n') : ''}`);
+		writeDohCache(cacheKey, answers);
 		return answers;
 	} catch (error) {
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
@@ -7015,9 +7092,12 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 }
 
 function sha224(s) {
+	const cacheKey = String(s);
+	const cached = getLruCacheValue(SHA224_RESULT_CACHE, cacheKey);
+	if (cached !== undefined) return cached;
 	const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
 	const r = (n, b) => ((n >>> b) | (n << (32 - b))) >>> 0;
-	s = unescape(encodeURIComponent(s));
+	s = unescape(encodeURIComponent(cacheKey));
 	const l = s.length * 8; s += String.fromCharCode(0x80);
 	while ((s.length * 8) % 512 !== 448) s += String.fromCharCode(0);
 	const h = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
@@ -7044,7 +7124,7 @@ function sha224(s) {
 	for (let i = 0; i < 7; i++) {
 		for (let j = 24; j >= 0; j -= 8)hex += ((h[i] >>> j) & 0xFF).toString(16).padStart(2, '0');
 	}
-	return hex;
+	return setLruCacheValue(SHA224_RESULT_CACHE, cacheKey, hex, HASH_CACHE_MAX_ENTRIES);
 }
 
 function getWorkerRequestContext(request) {
@@ -7075,9 +7155,19 @@ async function getSocksWhitelist(env) {
 	return 缓存SOCKS5白名单;
 }
 
+async function getProxyIPList(env) {
+	const raw = String(env?.PROXYIP || '');
+	if (cachedProxyIPList && cachedProxyIPRaw === raw) return cachedProxyIPList;
+	cachedProxyIPList = raw.trim()
+		? (await 整理成数组(raw)).map(value => String(value || '').trim()).filter(Boolean)
+		: [];
+	cachedProxyIPRaw = raw;
+	return cachedProxyIPList;
+}
+
 async function createTunnelContext(request, env = {}) {
 	const tunnelContext = emptyTunnelContext();
-	const proxyIPList = env?.PROXYIP ? (await 整理成数组(env.PROXYIP)).map(value => String(value || '').trim()).filter(Boolean) : [];
+	const proxyIPList = await getProxyIPList(env);
 	if (proxyIPList.length) {
 		tunnelContext.proxyIP = proxyIPList[Math.floor(Math.random() * proxyIPList.length)];
 		tunnelContext.proxyFallbackEnabled = false;
@@ -7641,6 +7731,9 @@ export const __testPerformanceHelpers = {
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
+	DNS_RESULT_CACHE,
+	MD5MD5_RESULT_CACHE,
+	SHA224_RESULT_CACHE,
 	getProxyConnectTimeoutMs,
 	getDialStaggerMs,
 	getDohLookupUrl,
@@ -7655,6 +7748,9 @@ export const __testPerformanceHelpers = {
 	proxyCacheKey,
 	readProxyResolutionCache,
 	recordProxyEndpointResult,
+	DoH查询,
+	MD5MD5,
+	sha224,
 	parsePreferredEndpoint,
 	expandPreferredEndpointVariants,
 	scheduleProxyCacheWrite,
