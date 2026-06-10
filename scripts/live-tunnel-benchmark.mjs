@@ -35,6 +35,7 @@ function usage() {
 		'  --sni worker.example     gRPC only: TLS SNI/servername override',
 		'  --authority worker.example gRPC only: HTTP/2 :authority override',
 		'  --service-name /         gRPC only: request path/serviceName override',
+		'  --summary-line           Also emit compact JSON summary for wrapper scripts',
 	].join('\n'));
 }
 
@@ -523,13 +524,16 @@ for (const transport of transports) {
 	}
 }
 
-console.log(JSON.stringify({
+const summaryPayload = {
 	profile: options.profile,
 	target: `${options.target}:${options.port}${options.httpPath}`,
 	httpMethod: options.httpMethod,
 	bodyBytes: options.bodyBytes,
 	concurrency: options.concurrency,
 	summary: transports.map(transport => summarizeTransport(transport, allResults.filter(result => result.transport === transport))),
-}, null, 2));
+};
+
+console.log(JSON.stringify(summaryPayload, null, 2));
+if (args['summary-line']) console.log(JSON.stringify({ type: 'summary', ...summaryPayload }));
 
 if (!allResults.some(result => result.ok)) process.exit(1);

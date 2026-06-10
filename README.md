@@ -20,6 +20,7 @@ npm run verify-generated
 npm test
 npm run check
 npm run bench:live -- --help
+npm run bench:matrix -- --help
 ```
 
 Edit user-facing static defaults in `src/core/config.js`, then run `npm run build`.
@@ -102,6 +103,12 @@ Burst behavior for Telegram/reel-style request fan-out:
 
 ```bash
 node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 24 --concurrency 6 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --profile burst
+```
+
+To compare several front hosts with the same settings and save a baseline report:
+
+```bash
+node scripts/live-benchmark-matrix.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --front-hosts sourceforge.net,www.modrinth.com,www.speedtest.net --profiles latency,burst --runs 30 --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --out benchmark-baseline.json
 ```
 
 Download and upload profiles need a plain HTTP endpoint that serves or accepts the requested payload. The current script sends inner plain HTTP through the tunnel; `--port 80` is the inner destination port, not the outer Worker HTTPS port.
