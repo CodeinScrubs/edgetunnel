@@ -21,6 +21,7 @@ npm test
 npm run check
 npm run bench:live -- --help
 npm run bench:matrix -- --help
+npm run bench:analyze -- --help
 ```
 
 Edit user-facing static defaults in `src/core/config.js`, then run `npm run build`.
@@ -111,6 +112,12 @@ To compare several front hosts with the same settings and save a baseline report
 node scripts/live-benchmark-matrix.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --front-hosts sourceforge.net,www.modrinth.com,www.speedtest.net --profiles latency,burst --runs 30 --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --out benchmark-baseline.json
 ```
 
+Analyze a saved benchmark report before tuning:
+
+```bash
+node scripts/analyze-benchmark-report.mjs benchmark-baseline.json --min-runs 10
+```
+
 Download and upload profiles need a plain HTTP endpoint that serves or accepts the requested payload. The current script sends inner plain HTTP through the tunnel; `--port 80` is the inner destination port, not the outer Worker HTTPS port.
 
 For cleaner throughput measurements, deploy the optional benchmark target Worker in `benchmarks/` and use its hostname as `--target`.
@@ -128,6 +135,7 @@ Interpret the result this way:
 - `totalP50Ms` and `totalP95Ms` show completion time for the chosen payload.
 - `throughputP50Mbps` is useful only for download/upload profiles with meaningful payload sizes.
 - Do not tune `DIAL_STAGGER_MS`, DNS preload, queue limits, or gRPC flush settings from a single small-response latency run.
+- Treat analyzer `FAIL` signals as blockers for speed tuning. Fix reliability, target selection, or front-host choice first.
 
 ## Disclaimer
 

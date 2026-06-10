@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 {
 	const result = spawnSync(process.execPath, ['scripts/live-tunnel-benchmark.mjs', '--help'], {
@@ -27,6 +29,14 @@ import { readFileSync } from 'node:fs';
 	assert.match(result.stderr, /--front-hosts/);
 	assert.match(result.stderr, /--profiles/);
 	assert.match(result.stderr, /--dry-run/);
+}
+
+{
+	const result = spawnSync(process.execPath, ['scripts/analyze-benchmark-report.mjs', '--help'], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'analyzer --help should exit successfully');
+	assert.match(result.stderr, /--min-runs/);
 }
 
 {
@@ -74,6 +84,36 @@ import { readFileSync } from 'node:fs';
 	assert.match(source, /parseSummaryLine/, 'matrix runner should consume compact summary lines instead of parsing pretty JSON');
 	assert.match(source, /compareScenarioResults/, 'matrix runner should rank front-host/profile scenarios');
 	assert.match(source, /writeFileSync\(args\.out/, 'matrix runner should support saving reports for later tuning comparisons');
+}
+
+{
+	const dir = mkdtempSync(join(tmpdir(), 'edgetunnel-bench-'));
+	const reportPath = join(dir, 'report.json');
+	writeFileSync(reportPath, JSON.stringify({
+		scenarios: [
+			{
+				scenario: { profile: 'latency', frontHost: 'slow.example' },
+				summary: { summary: [{ transport: 'grpc', runs: 3, acceptRate: 1, successRate: 1, firstByteP95Ms: 900, totalP95Ms: 1600, throughputP50Mbps: 0.01 }] },
+			},
+			{
+				scenario: { profile: 'latency', frontHost: 'fast.example' },
+				summary: { summary: [{ transport: 'grpc', runs: 10, acceptRate: 1, successRate: 1, firstByteP95Ms: 400, totalP95Ms: 900, throughputP50Mbps: 0.02 }] },
+			},
+		],
+	}));
+	const result = spawnSync(process.execPath, ['scripts/analyze-benchmark-report.mjs', reportPath, '--json', '--min-runs', '5'], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'analyzer should parse matrix reports');
+	const parsed = JSON.parse(result.stdout);
+	assert.equal(parsed.bestByProfile[0].best.frontHost, 'fast.example');
+	assert.equal(parsed.signals.some(signal => /Only 3 runs/.test(signal.message)), true);
+}
+
+{
+	const source = readFileSync('scripts/analyze-benchmark-report.mjs', 'utf8');
+	assert.match(source, /makeSignals/, 'analyzer should turn raw metrics into tuning signals');
+	assert.match(source, /bestByProfile/, 'analyzer should report the best scenario per profile and transport');
 }
 
 {
