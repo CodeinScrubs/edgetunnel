@@ -20,6 +20,7 @@ npm run verify-generated
 npm test
 npm run check
 npm run bench:live -- --help
+npm run bench:https -- --help
 npm run bench:matrix -- --help
 npm run bench:analyze -- --help
 npm run bench:compare -- --help
@@ -106,6 +107,14 @@ Burst behavior for Telegram/reel-style request fan-out:
 ```bash
 node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports grpc --runs 24 --concurrency 6 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target neverssl.com --port 80 --profile burst
 ```
+
+Real HTTPS browsing behavior:
+
+```bash
+node scripts/live-https-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --runs 10 --front-host sourceforge.net --sni your-domain.example --authority your-domain.example --service-name / --target example.com --port 443 --path /
+```
+
+This performs an inner TLS handshake through the gRPC tunnel and reports `tlsP50Ms` / `tlsP95Ms` in addition to first-byte and total time.
 
 To compare several front hosts with the same settings and save a baseline report:
 

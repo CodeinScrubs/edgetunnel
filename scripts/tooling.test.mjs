@@ -32,6 +32,16 @@ import { join } from 'node:path';
 }
 
 {
+	const result = spawnSync(process.execPath, ['scripts/live-https-benchmark.mjs', '--help'], {
+		encoding: 'utf8',
+	});
+	assert.equal(result.status, 0, 'HTTPS benchmark --help should exit successfully');
+	assert.match(result.stderr, /--target example\.com/);
+	assert.match(result.stderr, /--allow-insecure/);
+	assert.match(result.stderr, /--summary-line/);
+}
+
+{
 	const result = spawnSync(process.execPath, ['scripts/analyze-benchmark-report.mjs', '--help'], {
 		encoding: 'utf8',
 	});
@@ -86,6 +96,14 @@ import { join } from 'node:path';
 	assert.match(source, /normalizeBenchmarkProfile/, 'live benchmark should have explicit latency/download/upload/burst profiles');
 	assert.match(source, /Content-Length: \$\{body\.byteLength\}/, 'upload benchmarks should send a deterministic HTTP body size');
 	assert.match(source, /concurrency/, 'live benchmark should support concurrent runs for burst behavior checks');
+}
+
+{
+	const source = readFileSync('scripts/live-https-benchmark.mjs', 'utf8');
+	assert.match(source, /class GrpcTunnelSocket extends Duplex/, 'HTTPS benchmark should expose a virtual socket over gRPC frames');
+	assert.match(source, /tls\.connect\(\{[\s\S]*socket: tunnelSocket/, 'HTTPS benchmark should perform a real inner TLS handshake through the tunnel');
+	assert.match(source, /makeVlessTcpRequest\(this\.options\.uuid/, 'first TLS bytes should be wrapped in the VLESS TCP request');
+	assert.match(source, /tlsP95Ms/, 'HTTPS benchmark should summarize inner TLS handshake latency');
 }
 
 {
