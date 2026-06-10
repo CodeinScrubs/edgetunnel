@@ -285,6 +285,11 @@ function summarizeTransport(transport, results) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+if (args.help || args.h) {
+	usage();
+	process.exit(0);
+}
+
 const url = args.url || process.env.TUNNEL_BENCH_URL || process.env.GRPC_BENCH_URL;
 const uuid = args.uuid || process.env.TUNNEL_BENCH_UUID || process.env.GRPC_BENCH_UUID;
 if (!url || !uuid) {
