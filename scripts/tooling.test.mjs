@@ -8,6 +8,9 @@ import { spawnSync } from 'node:child_process';
 	assert.equal(result.status, 0, '--help should exit successfully');
 	assert.match(result.stderr, /Usage:/);
 	assert.match(result.stderr, /--transports all/);
+	assert.match(result.stderr, /--front-host/);
+	assert.match(result.stderr, /--authority/);
+	assert.match(result.stderr, /--sni/);
 }
 
 {

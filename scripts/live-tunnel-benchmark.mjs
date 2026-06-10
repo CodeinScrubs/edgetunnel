@@ -1,4 +1,6 @@
 import { performance } from 'node:perf_hooks';
+import http2 from 'node:http2';
+import tls from 'node:tls';
 
 function parseArgs(argv) {
 	const out = {};
@@ -24,6 +26,10 @@ function usage() {
 		'  --ua "Mozilla/5.0 ..."   User-Agent',
 		'  --timeout 15000          Per-run timeout in milliseconds',
 		'  --transports all         all, grpc, ws, xhttp, or a comma-separated list',
+		'  --front-host example.com gRPC only: connect to this clean/front host',
+		'  --sni worker.example     gRPC only: TLS SNI/servername override',
+		'  --authority worker.example gRPC only: HTTP/2 :authority override',
+		'  --service-name /         gRPC only: request path/serviceName override',
 	].join('\n'));
 }
 
@@ -133,6 +139,10 @@ function stripVlessResponseHeader(bytes) {
 	return bytes.byteLength >= 2 && bytes[0] === 0 && bytes[1] === 0 ? bytes.subarray(2) : bytes;
 }
 
+function hasVlessResponseHeader(bytes) {
+	return bytes.byteLength >= 2 && bytes[0] === 0 && bytes[1] === 0;
+}
+
 function makeHttpPayload({ uuid, target, port, ua }) {
 	const httpRequest = new TextEncoder().encode(`GET / HTTP/1.1\r\nHost: ${target}\r\nUser-Agent: ${ua}\r\nConnection: close\r\n\r\n`);
 	return makeVlessTcpRequest(uuid, target, port, httpRequest);
@@ -145,6 +155,19 @@ function normalizeTransports(value) {
 		if (!['grpc', 'ws', 'xhttp'].includes(item)) throw new Error(`Unsupported transport: ${item}`);
 	}
 	return [...new Set(list)];
+}
+
+function parseHostPort(value, defaultPort = 443) {
+	const text = String(value || '').trim();
+	if (!text) return null;
+	if (text.startsWith('[')) {
+		const match = text.match(/^\[([^\]]+)\](?::(\d+))?$/);
+		if (!match) throw new Error(`Invalid front host: ${value}`);
+		return { hostname: match[1], port: Number(match[2] || defaultPort) };
+	}
+	const parts = text.split(':');
+	if (parts.length > 2) throw new Error(`Invalid front host: ${value}`);
+	return { hostname: parts[0], port: Number(parts[1] || defaultPort) };
 }
 
 async function collectResponseBody(response, startedAt, timeoutMs) {
@@ -170,19 +193,73 @@ async function collectResponseBody(response, startedAt, timeoutMs) {
 
 async function runGrpc(options) {
 	const startedAt = performance.now();
-	const response = await fetch(options.url, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/grpc',
-			'User-Agent': options.ua,
-		},
-		body: encodeGrpcFrame([makeHttpPayload(options)]),
+	const targetUrl = new URL(options.url);
+	if (targetUrl.protocol !== 'https:') throw new Error('gRPC benchmark requires an https:// URL');
+	const authority = options.authority || targetUrl.host;
+	const serviceName = options.serviceName || `${targetUrl.pathname || '/'}${targetUrl.search || ''}` || '/';
+	const front = parseHostPort(options.frontHost, Number(targetUrl.port || 443));
+	const connectHost = front?.hostname || targetUrl.hostname;
+	const connectPort = front?.port || Number(targetUrl.port || 443);
+	const servername = options.sni || targetUrl.hostname;
+	const origin = `https://${authority}`;
+
+	return await new Promise((resolve, reject) => {
+		let settled = false;
+		let status = 0;
+		let firstByteMs = null;
+		let timer = null;
+		const chunks = [];
+		const client = http2.connect(origin, {
+			createConnection: () => tls.connect({
+				host: connectHost,
+				port: connectPort,
+				servername,
+				ALPNProtocols: ['h2'],
+			}),
+		});
+		const finish = (fn, value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			try { client.close(); } catch {}
+			fn(value);
+		};
+		timer = setTimeout(() => {
+			try { client.destroy(); } catch {}
+			finish(reject, new Error('gRPC benchmark timed out'));
+		}, options.timeoutMs);
+		client.on('error', error => finish(reject, error));
+
+		const req = client.request({
+			':method': 'POST',
+			':scheme': 'https',
+			':authority': authority,
+			':path': serviceName,
+			'content-type': 'application/grpc',
+			'user-agent': options.ua,
+			te: 'trailers',
+		});
+		req.on('response', headers => {
+			status = Number(headers[':status'] || 0);
+		});
+		req.on('data', chunk => {
+			if (chunk.byteLength) {
+				if (firstByteMs === null) firstByteMs = performance.now() - startedAt;
+				chunks.push(new Uint8Array(chunk));
+			}
+		});
+		req.on('end', () => {
+			const bodyBytes = concatBytes(chunks);
+			const payloads = decodeGrpcPayloads(bodyBytes);
+			const rawTunneled = concatBytes(payloads);
+			const accepted = hasVlessResponseHeader(rawTunneled);
+			const tunneled = stripVlessResponseHeader(rawTunneled);
+			const text = new TextDecoder().decode(tunneled.subarray(0, 160));
+			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, bodyBytes.byteLength, text, accepted));
+		});
+		req.on('error', error => finish(reject, error));
+		req.end(Buffer.from(encodeGrpcFrame([makeHttpPayload(options)])));
 	});
-	const body = await collectResponseBody(response, startedAt, options.timeoutMs);
-	const payloads = decodeGrpcPayloads(body.bytes);
-	const tunneled = concatBytes(payloads.slice(1));
-	const text = new TextDecoder().decode(tunneled.subarray(0, 160));
-	return summarizeRun('grpc', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, text);
 }
 
 async function runXhttp(options) {
@@ -196,8 +273,9 @@ async function runXhttp(options) {
 		body: makeHttpPayload(options),
 	});
 	const body = await collectResponseBody(response, startedAt, options.timeoutMs);
+	const accepted = hasVlessResponseHeader(body.bytes);
 	const text = new TextDecoder().decode(stripVlessResponseHeader(body.bytes).subarray(0, 160));
-	return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, text);
+	return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, text, accepted);
 }
 
 async function websocketMessageBytes(data) {
@@ -244,11 +322,12 @@ async function runWs(options) {
 			reject(event.error || new Error('websocket error'));
 		});
 	});
+	const accepted = hasVlessResponseHeader(result);
 	const text = new TextDecoder().decode(stripVlessResponseHeader(result).subarray(0, 160));
-	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, text);
+	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, text, accepted);
 }
 
-function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, text) {
+function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, text, accepted = false) {
 	const totalMs = performance.now() - startedAt;
 	return {
 		transport,
@@ -256,6 +335,7 @@ function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, by
 		firstByteMs,
 		totalMs,
 		bytes,
+		accepted,
 		ok: Boolean(transportOk && /HTTP\/1\.[01]\s+\d+/.test(text)),
 	};
 }
@@ -269,13 +349,19 @@ function percentile(values, p) {
 
 function summarizeTransport(transport, results) {
 	const successful = results.filter(result => result.ok);
+	const accepted = results.filter(result => result.accepted);
 	const firstByteValues = successful.map(result => result.firstByteMs).filter(value => Number.isFinite(value));
+	const acceptedFirstByteValues = accepted.map(result => result.firstByteMs).filter(value => Number.isFinite(value));
 	const totalValues = successful.map(result => result.totalMs).filter(value => Number.isFinite(value));
 	return {
 		transport,
 		runs: results.length,
+		accepted: accepted.length,
+		acceptRate: results.length ? accepted.length / results.length : 0,
 		successful: successful.length,
 		successRate: results.length ? successful.length / results.length : 0,
+		acceptedFirstByteP50Ms: acceptedFirstByteValues.length ? Math.round(percentile(acceptedFirstByteValues, 50)) : null,
+		acceptedFirstByteP95Ms: acceptedFirstByteValues.length ? Math.round(percentile(acceptedFirstByteValues, 95)) : null,
 		firstByteP50Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 50)) : null,
 		firstByteP95Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 95)) : null,
 		totalP50Ms: totalValues.length ? Math.round(percentile(totalValues, 50)) : null,
@@ -304,6 +390,10 @@ const options = {
 	port: Number(args.port || process.env.TUNNEL_BENCH_PORT || process.env.GRPC_BENCH_PORT || 80),
 	ua: args.ua || process.env.TUNNEL_BENCH_UA || process.env.GRPC_BENCH_UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
 	timeoutMs: Math.max(1000, Math.min(60000, Number(args.timeout || process.env.TUNNEL_BENCH_TIMEOUT || 15000))),
+	frontHost: args['front-host'] || args.front || process.env.TUNNEL_BENCH_FRONT_HOST || process.env.GRPC_BENCH_FRONT_HOST || '',
+	sni: args.sni || process.env.TUNNEL_BENCH_SNI || process.env.GRPC_BENCH_SNI || '',
+	authority: args.authority || process.env.TUNNEL_BENCH_AUTHORITY || process.env.GRPC_BENCH_AUTHORITY || '',
+	serviceName: args['service-name'] || args.serviceName || process.env.TUNNEL_BENCH_SERVICE_NAME || process.env.GRPC_BENCH_SERVICE_NAME || '',
 };
 const runs = Math.max(1, Math.min(50, Number(args.runs || process.env.TUNNEL_BENCH_RUNS || process.env.GRPC_BENCH_RUNS || 5)));
 const transports = normalizeTransports(args.transports || process.env.TUNNEL_BENCH_TRANSPORTS || 'grpc');
@@ -317,7 +407,7 @@ for (const transport of transports) {
 			allResults.push(result);
 			console.log(JSON.stringify({ run: i + 1, ...result }));
 		} catch (error) {
-			const result = { transport, status: 0, firstByteMs: null, totalMs: null, bytes: 0, ok: false, error: error?.message || String(error) };
+			const result = { transport, status: 0, firstByteMs: null, totalMs: null, bytes: 0, accepted: false, ok: false, error: error?.message || String(error) };
 			allResults.push(result);
 			console.log(JSON.stringify({ run: i + 1, ...result }));
 		}
