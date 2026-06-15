@@ -3,6 +3,9 @@ main = "_worker.js"
 compatibility_date = "2025-11-04"
 keep_vars = true
 
+# No cron triggers: automated background ProxyIP scanning rapidly probes many Cloudflare IPs,
+# which Cloudflare flags as network abuse. ProxyIP scanning is manual-only (admin panel button).
+
 #[[kv_namespaces]]
 #binding = "KV"			#KV binding name; keep this unchanged by default
 #id = ""				#KV namespace id

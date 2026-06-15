@@ -42,13 +42,24 @@ const ENGINE_DEFAULTS = {
 	DOWNLINK_GRAIN_PACKET_BYTES: 32 * 1024,
 	DOWNLINK_GRAIN_TAIL_THRESHOLD: 512,
 	DOWNLINK_GRAIN_QUIET_MS: 0,
-	GRPC_MAX_FRAME_PAYLOAD_BYTES: 16 * 1024 * 1024,
+	// Downstream backpressure: cap how much un-delivered data buffers in the isolate before the
+	// reader from the remote is paused. Prevents unbounded RAM growth (and isolate OOM / dropped
+	// connections) on large downloads when the client link is slower than the origin.
+	DOWNLINK_BACKPRESSURE_HWM_BYTES: 256 * 1024,
+	// WebSocket downstream pacing: when the runtime exposes bufferedAmount, pause reading the
+	// remote once the socket's outbound buffer exceeds this, so a slow client can't OOM the isolate.
+	WS_BUFFERED_AMOUNT_LIMIT_BYTES: 1 * 1024 * 1024,
+	WS_BUFFERED_AMOUNT_MAX_WAIT_MS: 1000,
+	GRPC_MAX_FRAME_PAYLOAD_BYTES: 4 * 1024 * 1024,
 	PROXY_RESOLUTION_CACHE_VERSION: 1,
 	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 24,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS: 60 * 1000,
+	// Global floor between ANY two proxy-cache KV writes per isolate. Caps total writes so
+	// active browsing can't exhaust the free-plan 1000/day KV write quota (3 min => <=480/day).
+	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS: 3 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_MS: 10 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD: 2,
 	PROXY_ENDPOINT_HEALTH_MAX_AGE_MS: 24 * 60 * 60 * 1000,
@@ -91,6 +102,8 @@ const Pages静态页面 = ENGINE_DEFAULTS.PAGES_STATIC_URL;
 const WS早期数据最大字节 = ENGINE_DEFAULTS.WS_EARLY_DATA_MAX_BYTES, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = ENGINE_DEFAULTS.UPLINK_BUNDLE_TARGET_BYTES, 上行队列最大字节 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_BYTES, 上行队列最大条目 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_ITEMS;
 const 下行Grain包字节 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_PACKET_BYTES, 下行Grain尾部阈值 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_TAIL_THRESHOLD, 下行Grain静默毫秒 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_QUIET_MS;
+const 下行背压高水位字节 = ENGINE_DEFAULTS.DOWNLINK_BACKPRESSURE_HWM_BYTES;
+const WS缓冲上限字节 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_LIMIT_BYTES, WS缓冲最大等待毫秒 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_MAX_WAIT_MS;
 const GRPC_MAX_FRAME_PAYLOAD_BYTES = ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES;
 const PROXY_RESOLUTION_CACHE_VERSION = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_VERSION;
 const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES;
@@ -99,6 +112,8 @@ const PROXY_RESOLUTION_CACHE_FRESH_TTL_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CAC
 const PROXY_RESOLUTION_CACHE_STALE_TTL_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_STALE_TTL_MS;
 const PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS = Math.ceil(PROXY_RESOLUTION_CACHE_STALE_TTL_MS / 1000);
 const PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS;
+const PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS;
+let 上次代理缓存KV写入 = 0;
 const PROXY_ENDPOINT_FAILURE_COOLDOWN_MS = ENGINE_DEFAULTS.PROXY_ENDPOINT_FAILURE_COOLDOWN_MS;
 const PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD = ENGINE_DEFAULTS.PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD;
 const PROXY_ENDPOINT_HEALTH_MAX_AGE_MS = ENGINE_DEFAULTS.PROXY_ENDPOINT_HEALTH_MAX_AGE_MS;
@@ -158,7 +173,12 @@ function isKvRequestLoggingEnabled(env = {}) {
 }
 
 function isProxyResolutionKvCacheEnabled(env = {}) {
-	return isEnabledEnvFlag(env.ENABLE_KV_PROXY_CACHE) || isEnabledEnvFlag(env.KV_PROXY_CACHE);
+	// On by default (writes are globally throttled and TTL'd, so they cannot exhaust the KV
+	// quota or drop connections). Explicitly disable with OFF_PROXY_CACHE=1 or ENABLE_KV_PROXY_CACHE=0.
+	if (isEnabledEnvFlag(env.OFF_PROXY_CACHE) || isEnabledEnvFlag(env.DISABLE_KV_PROXY_CACHE)) return false;
+	const explicit = String(env.ENABLE_KV_PROXY_CACHE ?? env.KV_PROXY_CACHE ?? '').trim().toLowerCase();
+	if (['0', 'false', 'no', 'off'].includes(explicit)) return false;
+	return true;
 }
 
 function getDohLookupUrl(env = {}) {
@@ -218,7 +238,7 @@ export default {
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			const referer = request.headers.get('Referer') || '';
-			const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
+			const 命中XHTTP特征 = referer.includes('x_padding');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
 				log(`[gRPC] Matched request: ${url.pathname}${url.search}`);
 				return await 处理gRPC请求(request, userID);
@@ -238,7 +258,6 @@ export default {
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
 					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
-						ctx?.waitUntil?.(fetchEnglishStaticPage('/admin').catch(() => { }));
 						return new Response('Redirecting...', { status: 302, headers: { 'Location': '/admin' } });
 					}
 					if (request.method === 'POST') {
@@ -248,11 +267,9 @@ export default {
 						if (输入密码 === (typeof 管理员密码 === 'string' ? 管理员密码.replace(/[\r\n]/g, '') : 管理员密码)) {
 							const 响应 = new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							响应.headers.set('Set-Cookie', `auth=${await MD5MD5(UA + 加密秘钥 + 管理员密码)}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Strict`);
-							ctx?.waitUntil?.(fetchEnglishStaticPage('/admin').catch(() => { }));
 							return 响应;
 						}
 					}
-					ctx?.waitUntil?.(fetchEnglishStaticPage('/admin').catch(() => { }));
 					return fetchEnglishStaticPage('/login');
 				} else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {
 					const cookies = request.headers.get('Cookie') || '';
@@ -366,7 +383,7 @@ export default {
 					if (访问路径 === 'admin/init') {
 						try {
 							config_JSON = await 读取config_JSON(env, host, userID, UA, true);
-							ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Init_Config', config_JSON));
+							ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Init_Config', config_JSON));
 							config_JSON.init = 'Configuration has been reset to defaults';
 							return new Response(stringifyJSONASCII(config_JSON, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 						} catch (err) {
@@ -382,7 +399,7 @@ export default {
 
 
 								await env.KV.put('config.json', JSON.stringify(newConfig, null, 2));
-								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
+								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								console.error('Failed to save configuration:', error);
@@ -408,7 +425,7 @@ export default {
 
 
 								await env.KV.put('cf.json', JSON.stringify(CF_JSON, null, 2));
-								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
+								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								console.error('Failed to save configuration:', error);
@@ -424,7 +441,7 @@ export default {
 									if (!newConfig.BotToken || !newConfig.ChatID) return new Response(JSON.stringify({ error: 'Configuration is incomplete' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 									await env.KV.put('tg.json', JSON.stringify(newConfig, null, 2));
 								}
-								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
+								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								console.error('Failed to save configuration:', error);
@@ -434,7 +451,7 @@ export default {
 							try {
 								const customIPs = await request.text();
 								await env.KV.put('ADD.txt', customIPs);
-								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
+								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Custom IP list saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								console.error('Failed to save custom IP list:', error);
@@ -451,7 +468,7 @@ export default {
 						return new Response(JSON.stringify(request.cf || {}, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 					}
 
-					ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
+					ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
 					return fetchEnglishStaticPage('/admin' + url.search);
 				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {
 					const 响应 = new Response('Redirecting...', { status: 302, headers: { 'Location': '/login' } });
@@ -470,8 +487,8 @@ export default {
 					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
 					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
 						config_JSON = await 读取config_JSON(env, host, userID, UA);
-						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
-						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
+						if (作为优选订阅生成器) ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
+						else ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
 						const ua = UA.toLowerCase();
 						const responseHeaders = {
 							"content-type": "text/plain; charset=utf-8",
@@ -638,11 +655,13 @@ export default {
 		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 530, statusText: 'Origin Error', headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		try {
 			const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
+			// Never forward our own auth cookie or client-identifying headers to the camouflage origin.
+			for (const h of ['cookie', 'authorization', 'proxy-authorization', 'cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'cf-ray', 'cf-ipcountry', 'cdn-loop']) 新请求头.delete(h);
 			新请求头.set('Host', 反代URL.host);
 			新请求头.set('Referer', 反代URL.origin);
 			新请求头.set('Origin', 反代URL.origin);
 			if (!新请求头.has('User-Agent') && UA && UA !== 'null') 新请求头.set('User-Agent', UA);
-			const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body, cf: request.cf });
+			const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body });
 			const 内容类型 = 反代响应.headers.get('content-type') || '';
 
 			if (/text|javascript|json|xml/.test(内容类型)) {
@@ -653,6 +672,8 @@ export default {
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	}
+	// No scheduled()/cron handler: automated background ProxyIP scanning rapidly probes many
+	// Cloudflare IPs and triggers network-abuse reports. ProxyIP scanning is manual-only.
 };
 
 async function 处理XHTTP请求(request, yourUUID) {
@@ -701,8 +722,18 @@ async function 处理XHTTP请求(request, yourUUID) {
 	};
 
 	let XHTTP上行写入队列 = null;
+	let 下行控制器 = null;
+	let 下行拉取等待者 = [];
+	const 释放下行背压 = () => { if (!下行拉取等待者.length) return; const w = 下行拉取等待者; 下行拉取等待者 = []; for (const r of w) r(); };
+	const 等待下行可写 = () => {
+		const c = 下行控制器;
+		if (!c || typeof c.desiredSize !== 'number' || c.desiredSize > 0) return undefined;
+		return new Promise(resolve => 下行拉取等待者.push(resolve));
+	};
 	return new Response(new ReadableStream({
+		pull() { 释放下行背压(); },
 		async start(controller) {
+			下行控制器 = controller;
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
 			const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -722,11 +753,15 @@ async function 处理XHTTP请求(request, yourUUID) {
 					} catch (e) {
 						已关闭 = true;
 						this.readyState = WebSocket.CLOSED;
+						释放下行背压();
+						return;
 					}
+					return 等待下行可写();
 				},
 				close() {
 					if (已关闭) return;
 					已关闭 = true;
+					释放下行背压();
 					this.readyState = WebSocket.CLOSED;
 					XHTTP上行写入队列?.清空();
 					try {
@@ -792,17 +827,19 @@ async function 处理XHTTP请求(request, yourUUID) {
 			} finally {
 				上行写入队列.清空();
 				释放远端写入器();
+				释放下行背压();
 				try { reader.releaseLock() } catch (e) { }
 			}
 		},
 		async cancel() {
+			释放下行背压();
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			释放远端写入器();
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
-	}), { status: 200, headers: responseHeaders });
+	}, new ByteLengthQueuingStrategy({ highWaterMark: 下行背压高水位字节 })), { status: 200, headers: responseHeaders });
 }
 
 function 有效数据长度(data) {
@@ -992,8 +1029,21 @@ async function 处理gRPC请求(request, yourUUID) {
 	const 下行缓存上限 = 下行Grain包字节;
 	const 下行刷新间隔 = Math.max(下行Grain静默毫秒, 1);
 
+	// Downstream backpressure: pause the remote->client producer when the response stream's
+	// buffer is full (desiredSize<=0), resume when the runtime pulls. Bounds isolate memory.
+	let 下行控制器 = null;
+	let 下行拉取等待者 = [];
+	const 释放下行背压 = () => { if (!下行拉取等待者.length) return; const w = 下行拉取等待者; 下行拉取等待者 = []; for (const r of w) r(); };
+	const 等待下行可写 = () => {
+		const c = 下行控制器;
+		if (!c || typeof c.desiredSize !== 'number' || c.desiredSize > 0) return undefined;
+		return new Promise(resolve => 下行拉取等待者.push(resolve));
+	};
+
 	return new Response(new ReadableStream({
+		pull() { 释放下行背压(); },
 		async start(controller) {
+			下行控制器 = controller;
 			let 已关闭 = false;
 			let 已清理 = false;
 			let 发送队列 = [];
@@ -1009,11 +1059,13 @@ async function 处理gRPC请求(request, yourUUID) {
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
 					安排刷新发送队列();
+					return 等待下行可写();
 				},
 				close() {
 					if (this.readyState === WebSocket.CLOSED) return;
 					刷新发送队列(true);
 					已关闭 = true;
+					释放下行背压();
 					this.readyState = WebSocket.CLOSED;
 					GRPC上行写入队列?.清空();
 					try {
@@ -1044,6 +1096,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				} catch (e) {
 					已关闭 = true;
 					grpcBridge.readyState = WebSocket.CLOSED;
+					释放下行背压();
 				}
 			};
 
@@ -1067,6 +1120,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				GRPC上行写入队列?.清空();
 				if (!已关闭) 刷新发送队列(true);
 				已关闭 = true;
+				释放下行背压();
 				grpcBridge.readyState = WebSocket.CLOSED;
 				if (刷新定时器) clearTimeout(刷新定时器);
 				if (远端写入器) {
@@ -1177,6 +1231,7 @@ async function 处理gRPC请求(request, yourUUID) {
 			}
 		},
 		async cancel() {
+			释放下行背压();
 			GRPC上行写入队列?.清空();
 			if (远端写入器) {
 				try { 远端写入器.releaseLock() } catch (e) { }
@@ -1187,7 +1242,7 @@ async function 处理gRPC请求(request, yourUUID) {
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
-	}), { status: 200, headers: grpcHeaders });
+	}, new ByteLengthQueuingStrategy({ highWaterMark: 下行背压高水位字节 })), { status: 200, headers: grpcHeaders });
 }
 
 function 是有效WS早期数据(bytes, token) {
@@ -1527,6 +1582,9 @@ async function 处理WS请求(request, yourUUID, url) {
 
 	const 处理WS入站数据 = async (chunk) => {
 		let 当前块字节 = null;
+		// Ignore empty frames that arrive before the protocol header is parsed (e.g. a 0-byte
+		// keepalive before the remote socket exists), so they never reach the VLESS/Trojan parser.
+		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
 			return await forwardataudp(chunk, serverSock, null, request);
@@ -2393,27 +2451,83 @@ async function readOneDnsTcpFrame(tcpSocket, timeoutMs) {
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
-	const requestData = 数据转Uint8Array(udpChunk);
-	const requestBytes = requestData.byteLength;
-	let tcpSocket = null;
-	let writer = null;
+// Split a buffer of length-prefixed (DNS-over-TCP) frames into the raw DNS messages.
+function 解析DNS_TCP帧(data) {
+	const frames = [];
+	let cursor = 0;
+	while (cursor + 2 <= data.byteLength) {
+		const len = (data[cursor] << 8) | data[cursor + 1];
+		const start = cursor + 2, end = start + len;
+		if (len <= 0 || end > data.byteLength) break;
+		frames.push(data.subarray(start, end));
+		cursor = end;
+	}
+	return frames;
+}
+
+// Primary tunneled-DNS path: forward each length-prefixed query over DoH (RFC 8484
+// application/dns-message), returning the response(s) in the same length-prefixed wire format
+// the callers expect. Avoids a fresh TCP handshake per DNS query — lower, more consistent latency.
+async function DNS经DoH转发(requestData, env, timeoutMs) {
+	const frames = 解析DNS_TCP帧(requestData);
+	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
+	const dohUrl = getDohLookupUrl(env);
+	let out = new Uint8Array(0);
+	for (const query of frames) {
+		const resp = await fetchWithTimeout(dohUrl, {
+			method: 'POST',
+			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
+			body: query,
+		}, timeoutMs);
+		if (!resp.ok) throw new Error(`DoH HTTP ${resp.status}`);
+		const msg = new Uint8Array(await resp.arrayBuffer());
+		if (!msg.byteLength) throw new Error('empty DoH response');
+		const framed = new Uint8Array(2 + msg.byteLength);
+		framed[0] = (msg.byteLength >>> 8) & 0xff;
+		framed[1] = msg.byteLength & 0xff;
+		framed.set(msg, 2);
+		out = out.byteLength ? 拼接字节数据(out, framed) : framed;
+	}
+	return out;
+}
+
+// Fallback tunneled-DNS path: one DNS-over-TCP round trip (legacy behavior) if DoH is unreachable.
+async function DNS经TCP转发(requestData, request, timeoutMs) {
+	let tcpSocket = null, writer = null;
 	try {
-		const { env } = getWorkerRequestContext(request);
-		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		const TCP连接 = 创建请求TCP连接器(request);
+		const { env } = getWorkerRequestContext(request);
 		const dnsEndpoint = getDnsTcpEndpoint(env);
-		log(`[UDP forwarding] Received DNS request: ${requestBytes}B -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
+		log(`[UDP forwarding] DNS-over-TCP fallback -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
 		tcpSocket = TCP连接(dnsEndpoint);
 		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
 		writer = tcpSocket.writable.getWriter();
 		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
-		log(`[UDP forwarding] DNS request written upstream: ${requestBytes}B`);
 		try { writer.releaseLock() } catch (e) { }
 		writer = null;
+		return await readOneDnsTcpFrame(tcpSocket, timeoutMs);
+	} finally {
+		try { writer?.releaseLock?.() } catch (e) { }
+		try { tcpSocket?.close?.() } catch (e) { }
+	}
+}
 
-		const rawResponse = await readOneDnsTcpFrame(tcpSocket, timeoutMs);
-		log(`[UDP forwarding] Received DNS response: ${rawResponse.byteLength}B`);
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
+	const requestData = 数据转Uint8Array(udpChunk);
+	const requestBytes = requestData.byteLength;
+	try {
+		const { env } = getWorkerRequestContext(request);
+		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
+		log(`[UDP forwarding] Received DNS request: ${requestBytes}B`);
+		let rawResponse;
+		try {
+			rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+		} catch (dohError) {
+			log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
+			rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+		}
+		if (!rawResponse || !rawResponse.byteLength) return;
+		log(`[UDP forwarding] DNS response: ${rawResponse.byteLength}B`);
 		const wrappedResult = 响应封装器 ? await 响应封装器(rawResponse) : rawResponse;
 		const fragments = Array.isArray(wrappedResult) ? wrappedResult : [wrappedResult];
 		if (!fragments.length || webSocket.readyState !== WebSocket.OPEN) return;
@@ -2433,9 +2547,6 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		}
 	} catch (error) {
 		log(`[UDP forwarding] DNS forwarding failed: ${error?.message || error}`);
-	} finally {
-		try { writer?.releaseLock?.() } catch (e) { }
-		try { tcpSocket?.close?.() } catch (e) { }
 	}
 }
 
@@ -2455,6 +2566,16 @@ function formatIdentifier(arr, offset = 0) {
 async function WebSocket发送并等待(webSocket, payload) {
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
+	// Real-WebSocket downstream pacing: gRPC/XHTTP bridges signal backpressure via the awaited
+	// promise above; a native WebSocket has no such signal, so when the runtime exposes
+	// bufferedAmount we pause until its outbound buffer drains. Bounded so it can never hang.
+	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > WS缓冲上限字节) {
+		let 已等待 = 0;
+		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > WS缓冲上限字节 && 已等待 < WS缓冲最大等待毫秒) {
+			await new Promise(r => setTimeout(r, 5));
+			已等待 += 5;
+		}
+	}
 }
 
 function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 名称 = 'Upload queue' }) {
@@ -2892,7 +3013,21 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 		} else throw new Error(`S5 unsupported address type: ${atyp}`);
 
 		if (有效数据长度(initialData) > 0) await writeWithOperationTimeout(writer, initialData, timeoutMs, 'SOCKS5 initial data write timed out');
-		writer.releaseLock(); reader.releaseLock();
+		writer.releaseLock();
+		reader.releaseLock();
+
+		// If the proxy bundled the first bytes of the target's response in the same segment as
+		// the handshake reply, those bytes are sitting in `pending` (already read off the socket).
+		// Stitch them back onto the front of the stream so the inner TLS/HTTP2 doesn't desync.
+		if (有效数据长度(pending) > 0) {
+			const { readable, writable } = new TransformStream();
+			const transformWriter = writable.getWriter();
+			await transformWriter.write(pending);
+			transformWriter.releaseLock();
+			socket.readable.pipeTo(writable).catch(() => { });
+			return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
+		}
+
 		return socket;
 	} catch (error) {
 		try { writer.releaseLock() } catch (e) { }
@@ -3491,7 +3626,7 @@ class TlsClient {
 				const selectedKeyPair = this.keyPairs.get(serverHello.keyShare.group);
 				this.ecdhKeyPair = selectedKeyPair.keyPair
 			}
-			serverHello.isTls13 ? await this.handshakeTls13(reader, writer, serverHello) : await this.handshakeTls12(reader, writer), this.handshakeComplete = !0
+			serverHello.isTls13 ? await this.handshakeTls13(reader, writer, serverHello) : await this.handshakeTls12(reader, writer), this.handshakeComplete = !0, this.timeout = 0
 		} finally {
 			reader.releaseLock(), writer.releaseLock()
 		}
@@ -6352,6 +6487,11 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 		headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 		headers.set('Pragma', 'no-cache');
 		headers.set('Expires', '0');
+		// Drop any upstream Content-Security-Policy so the injected runtime translator and
+		// ProxyIP scanner widget (inline scripts) are allowed to execute in the browser.
+		headers.delete('Content-Security-Policy');
+		headers.delete('Content-Security-Policy-Report-Only');
+		headers.delete('X-Content-Security-Policy');
 
 		const status = statusOverride ?? upstream.status;
 		const statusText = upstream.statusText;
@@ -6359,6 +6499,8 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 		const isHTML = /text\/html|application\/xhtml\+xml/i.test(contentType);
 		let body = await upstream.text();
 		if (isHTML) {
+			// Also strip any inline CSP meta tag for the same reason.
+			body = body.replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, '');
 			body = translateHTMLVisibleText(body);
 			if (path.startsWith('/login')) body = normalizeEnglishLoginPage(body);
 			body = injectEnglishRuntimeTranslator(body);
@@ -6447,7 +6589,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		启用0RTT: false,
 		TLS分片: null,
 		随机路径: false,
-		ECH: false,
+		ECH: true,
 		ECHConfig: {
 			DNS: Ali_DoH,
 			SNI: ECH_SNI,
@@ -7191,6 +7333,8 @@ async function createTunnelContext(request, env = {}) {
 	tunnelContext.socksWhitelist = await getSocksWhitelist(env);
 	tunnelContext.tcpDialConcurrency = 识别运营商(request) === 'cmcc' ? 1 : 2;
 	tunnelContext.preloadRaceDial = ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL || '').toLowerCase());
+	// NOTE: no automatic ProxyIP scan here. Auto-scanning rapidly TCP-probes many Cloudflare IPs,
+	// which is flagged as network abuse. The ProxyIP scan is manual-only (admin "Scan now" button).
 	return tunnelContext;
 }
 
@@ -7530,17 +7674,23 @@ function serializeProxyCacheRecord(record, now = Date.now()) {
 	});
 }
 
+function resetProxyCacheKvThrottle() { 上次代理缓存KV写入 = 0; }
+
 function scheduleProxyCacheWrite(env, ctx, cacheKey, record, now = Date.now(), force = false) {
 	if (!isProxyResolutionKvCacheEnabled(env)) return;
 	if (!env?.KV || typeof env.KV.put !== 'function' || !cacheKey || !record) return;
 	if (!force && record.lastKvWriteAt && now - record.lastKvWriteAt < PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS) return;
+	// Global throttle across all target-aware keys so active browsing cannot exhaust the
+	// free-plan daily KV write quota. Applies even to forced writes (they retry on the next pass).
+	if (now - 上次代理缓存KV写入 < PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS) return;
+	上次代理缓存KV写入 = now;
 	record.lastKvWriteAt = now;
 	let writePromise;
 	try {
 		writePromise = Promise.resolve(env.KV.put(cacheKey, serializeProxyCacheRecord(record, now), { expirationTtl: PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS }))
 			.catch(error => log(`[ProxyIP cache] KV write failed: ${error?.message || error}`));
 		if (ctx?.waitUntil) {
-			try { ctx.waitUntil(writePromise) }
+			try { ctx?.waitUntil?.(writePromise) }
 			catch (error) {
 				log(`[ProxyIP cache] waitUntil failed: ${error?.message || error}`);
 				writePromise.catch(() => { });
@@ -7722,8 +7872,7 @@ async function getProxyResolutionRecord(env, ctx, proxyIP, 目标域名 = 'dash.
 		if (!cache.record.isFresh) {
 			const refreshPromise = startProxyResolutionRefresh(env, ctx, cache.key, proxyIP, 目标域名, UUID, cache.record, liveResolver)
 				.catch(error => log(`[ProxyIP cache] Background refresh failed: ${error?.message || error}`));
-			if (ctx?.waitUntil) ctx.waitUntil(refreshPromise);
-			else refreshPromise.catch(() => { });
+			ctx?.waitUntil?.(refreshPromise);
 		}
 		return { key: cache.key, record: cache.record, source: cache.source };
 	}
@@ -7742,6 +7891,7 @@ async function resolveProxyEndpointsLiveWithEnv(env, proxyIP, 目标域名 = 'da
 export const __testPerformanceHelpers = {
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
+	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS,
 	PROXY_RESOLUTION_L1_CACHE,
 	DNS_RESULT_CACHE,
 	MD5MD5_RESULT_CACHE,
@@ -7766,6 +7916,8 @@ export const __testPerformanceHelpers = {
 	parsePreferredEndpoint,
 	expandPreferredEndpointVariants,
 	scheduleProxyCacheWrite,
+	resetProxyCacheKvThrottle,
+	isProxyResolutionKvCacheEnabled,
 	connectStreams,
 	forwardataudp,
 	socks5Connect,
@@ -7791,6 +7943,7 @@ export const __testPerformanceHelpers = {
 	patchSingboxSubscription: Singbox订阅配置文件热补丁,
 	patchSurgeSubscription: Surge订阅配置文件热补丁,
 	readGrpcFrameLength,
+	parseDnsTcpFrames: 解析DNS_TCP帧,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {
@@ -7889,7 +8042,15 @@ async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare
 		const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
 		let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
 		log(`[ProxyIP resolver] Random seed: ${随机种子}\nTarget site: ${目标根域名}`)
-		const 洗牌后 = [...排序后数组].sort(() => (随机种子 = (随机种子 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+		// Deterministic, uniform Fisher-Yates shuffle seeded per (target, UUID). Using
+		// Array.sort with a mutating-seed comparator produces a non-uniform, engine-dependent order.
+		// Exact 32-bit LCG (Math.imul avoids float-precision loss) mapped to [0, 1).
+		const 下一个随机 = () => (随机种子 = (Math.imul(随机种子, 1103515245) + 12345) & 0x7fffffff) / 0x80000000;
+		const 洗牌后 = 排序后数组.slice();
+		for (let i = 洗牌后.length - 1; i > 0; i--) {
+			const j = Math.min(i, Math.floor(下一个随机() * (i + 1)));
+			const tmp = 洗牌后[i]; 洗牌后[i] = 洗牌后[j]; 洗牌后[j] = tmp;
+		}
 		const liveEndpoints = 洗牌后.slice(0, PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS);
 		log(`[ProxyIP resolver] Resolution complete. Total: ${liveEndpoints.length}\n${liveEndpoints.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
 	return liveEndpoints;

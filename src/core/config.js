@@ -40,13 +40,24 @@ export const ENGINE_DEFAULTS = {
 	DOWNLINK_GRAIN_PACKET_BYTES: 32 * 1024,
 	DOWNLINK_GRAIN_TAIL_THRESHOLD: 512,
 	DOWNLINK_GRAIN_QUIET_MS: 0,
-	GRPC_MAX_FRAME_PAYLOAD_BYTES: 16 * 1024 * 1024,
+	// Downstream backpressure: cap how much un-delivered data buffers in the isolate before the
+	// reader from the remote is paused. Prevents unbounded RAM growth (and isolate OOM / dropped
+	// connections) on large downloads when the client link is slower than the origin.
+	DOWNLINK_BACKPRESSURE_HWM_BYTES: 256 * 1024,
+	// WebSocket downstream pacing: when the runtime exposes bufferedAmount, pause reading the
+	// remote once the socket's outbound buffer exceeds this, so a slow client can't OOM the isolate.
+	WS_BUFFERED_AMOUNT_LIMIT_BYTES: 1 * 1024 * 1024,
+	WS_BUFFERED_AMOUNT_MAX_WAIT_MS: 1000,
+	GRPC_MAX_FRAME_PAYLOAD_BYTES: 4 * 1024 * 1024,
 	PROXY_RESOLUTION_CACHE_VERSION: 1,
 	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 24,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS: 60 * 1000,
+	// Global floor between ANY two proxy-cache KV writes per isolate. Caps total writes so
+	// active browsing can't exhaust the free-plan 1000/day KV write quota (3 min => <=480/day).
+	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS: 3 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_MS: 10 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD: 2,
 	PROXY_ENDPOINT_HEALTH_MAX_AGE_MS: 24 * 60 * 60 * 1000,

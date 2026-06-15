@@ -865,6 +865,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Force the DoH primary path to fail so this exercises the DNS-over-TCP fallback behavior.
+	const 原始fetch = globalThis.fetch;
+	globalThis.fetch = () => Promise.reject(new Error('DoH disabled in test'));
 	let upstreamClosed = false;
 	const writes = [];
 	const sent = [];
@@ -902,11 +905,39 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		},
 	};
 
-	await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DNS TCP response should not wait for upstream close');
+	try {
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DNS TCP response should not wait for upstream close');
 
-	assert.deepEqual(writes, [new Uint8Array([0, 2, 0x12, 0x34])]);
-	assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])]);
-	assert.equal(upstreamClosed, true, 'DNS TCP socket should be closed after one complete response frame');
+		assert.deepEqual(writes, [new Uint8Array([0, 2, 0x12, 0x34])]);
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])]);
+		assert.equal(upstreamClosed, true, 'DNS TCP socket should be closed after one complete response frame');
+	} finally {
+		globalThis.fetch = 原始fetch;
+	}
+}
+
+{
+	// DoH primary path: a length-prefixed query is POSTed as application/dns-message and the raw
+	// response is returned re-framed with a 2-byte length prefix, then delivered with the resp header.
+	const 原始fetch = globalThis.fetch;
+	const calls = [];
+	globalThis.fetch = (url, init) => {
+		calls.push({ url, init });
+		return Promise.resolve({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0xaa, 0xbb, 0xcc]).buffer });
+	};
+	const sent = [];
+	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
+	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
+	try {
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DoH DNS forward');
+		assert.equal(calls.length, 1, 'one DoH request is made for one query');
+		assert.equal(calls[0].init.method, 'POST', 'DoH uses POST');
+		assert.equal(calls[0].init.headers['content-type'], 'application/dns-message', 'DoH sends application/dns-message');
+		assert.deepEqual([...new Uint8Array(calls[0].init.body)], [0x12, 0x34], 'DoH body is the raw query without the TCP length prefix');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])], 'DoH response is re-framed and delivered with the resp header');
+	} finally {
+		globalThis.fetch = 原始fetch;
+	}
 }
 
 {

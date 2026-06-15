@@ -153,6 +153,44 @@ import { join } from 'node:path';
 }
 
 {
+	const source = readFileSync('src/worker.js', 'utf8');
+	assert.doesNotMatch(source, /ctx\.waitUntil\(/, 'worker should tolerate runtimes/tests that do not provide ctx.waitUntil');
+}
+
+{
+	// ProxyIP scanner fully REMOVED: probing Cloudflare IPs from a Worker is flagged as network abuse.
+	const source = readFileSync('src/worker.js', 'utf8');
+	assert.doesNotMatch(source, /admin\/scanproxyip/, 'worker must NOT expose a ProxyIP scan route');
+	assert.doesNotMatch(source, /data-proxyip-scanner/, 'worker must NOT inject a ProxyIP scanner widget');
+	assert.doesNotMatch(source, /probeProxyIPCandidates|gatherProxyIPCandidates|runProxyIPScan/, 'worker must NOT contain ProxyIP probing code');
+	assert.doesNotMatch(source, /CLOUDFLARE_IPV4_RANGES|isCloudflareIPv4/, 'worker must NOT embed a hardcoded Cloudflare-IP list');
+	// No automatic / scheduled scanning either.
+	assert.doesNotMatch(source, /async scheduled\(/, 'worker must NOT run a scheduled() auto-scan (network-abuse risk)');
+	assert.doesNotMatch(source, /maybeScheduleProxyIPScan/, 'worker must NOT auto-trigger ProxyIP scans');
+	const wrangler = readFileSync('wrangler.toml', 'utf8');
+	assert.doesNotMatch(wrangler, /\[triggers\]/, 'wrangler.toml must NOT declare a cron trigger (no auto-scan)');
+	const cfg = readFileSync('src/core/config.js', 'utf8');
+	assert.doesNotMatch(cfg, /PROXYIP_SCAN|CLOUDFLARE_IPV4_RANGES|DEFAULT_NAT64_PREFIX/, 'config must NOT contain scanner/NAT64 defaults');
+}
+
+{
+	// Connection-drop fixes: downstream backpressure (no isolate OOM on large transfers),
+	// SOCKS5 residual stitching, and the TLS client dropping its per-read timeout post-handshake.
+	const source = readFileSync('src/worker.js', 'utf8');
+	assert.ok((source.match(/new ByteLengthQueuingStrategy\(\{ highWaterMark: 下行背压高水位字节 \}\)/g) || []).length >= 2,
+		'gRPC and XHTTP response streams must use a bounded backpressure strategy');
+	assert.match(source, /return 等待下行可写\(\)/, 'downstream bridge must apply pull-based backpressure (wait until the stream drains)');
+	assert.match(source, /webSocket\.bufferedAmount > WS缓冲上限字节/, 'WebSocket downstream must pace against bufferedAmount');
+	assert.match(source, /Stitch them back onto the front of the stream/, 'SOCKS5 must preserve bundled target-response bytes');
+	assert.match(source, /this\.handshakeComplete = !0, this\.timeout = 0/, 'TlsClient must drop its per-read timeout after the handshake');
+	assert.match(source, /判断协议类型 === null && !isDnsQuery && 有效数据长度\(chunk\) === 0/, 'empty pre-handshake WS frames must be ignored before the parser');
+	// Tunneled DNS uses DoH (application/dns-message) primary, DNS-over-TCP fallback.
+	assert.match(source, /application\/dns-message/, 'tunneled DNS must forward via DoH (application/dns-message)');
+	assert.match(source, /DNS经 DoH转发|DNS经DoH转发/, 'DoH DNS forwarder must exist');
+	assert.match(source, /falling back to DNS-over-TCP/, 'DoH must fall back to DNS-over-TCP on failure');
+}
+
+{
 	const dir = mkdtempSync(join(tmpdir(), 'edgetunnel-bench-'));
 	const reportPath = join(dir, 'report.json');
 	writeFileSync(reportPath, JSON.stringify({

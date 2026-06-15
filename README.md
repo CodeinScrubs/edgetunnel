@@ -61,7 +61,8 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 | `OFF_LOG` | No | `1` | Legacy force-disable for KV request log writes. Takes priority over `ENABLE_KV_LOG`. |
 | `LOG_TTL_DAYS` | No | `7` | Number of days to retain append-only KV request log entries. Clamped from 1 to 30 days. |
 | `LOG_READ_LIMIT` | No | `500` | Maximum number of recent request logs returned by `/admin/log.json`. Clamped from 1 to 1000. |
-| `ENABLE_KV_PROXY_CACHE` | No | `1` | Opts in to persistent KV proxy-resolution cache reads and writes. The in-memory cache remains enabled either way. |
+| `ENABLE_KV_PROXY_CACHE` | No | `1` | Persistent KV proxy-resolution cache. On by default; writes are globally throttled and TTL'd so they cannot exhaust the free-plan KV write quota or drop connections. Set to `0` to disable. |
+| `OFF_PROXY_CACHE` | No | `1` | Force-disables the persistent KV proxy-resolution cache (the in-memory cache stays on). |
 | `BEST_SUB` | No | `1` | Enables preferred subscription generator mode when set to `1` or `true`. |
 | `PRELOAD_RACE_DIAL` | No | `1` | Enables preload race dialing when set to `1` or `true`. |
 | `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `1500` ms. |
@@ -69,6 +70,9 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 | `DIAL_STAGGER_MS` | No | `90` | Optional stagger between clean-IP/proxy candidate dials. Defaults to `90` ms and is clamped from `0` to `500` ms. |
 | `DNS_SERVER` | No | `1.1.1.1:53` | Optional TCP DNS upstream for tunneled UDP DNS requests. Defaults to `8.8.4.4:53`. |
 | `DOH_URL` | No | `https://dns.google/dns-query` | Optional DoH endpoint for preload race dialing and proxy-domain resolution. Defaults to Cloudflare DoH. |
+| `NAT64_PREFIX` | No | `2602:fc59:b0:64::` | Optional NAT64 `/96` prefix. When set, destinations that resolve into Cloudflare IP ranges are dialed via a synthesized NAT64 IPv6 address instead of directly. This fixes `Error 1034` (Edge IP Restricted) when reaching Cloudflare-hosted sites through the Worker. Off when empty. Verify which prefix works from your deployment before relying on it. |
+| `CF_VIA_PROXYIP` | No | `1` | Opts in to routing Cloudflare-hosted destinations through the ProxyIP relay instead of dialing them directly. An alternative to `NAT64_PREFIX` for fixing `Error 1034`; requires a working ProxyIP relay. Ignored when `NAT64_PREFIX` is set (NAT64 takes precedence). Off by default. |
+| `PROXYIP_SCAN_SOURCE` | No | `https://example.com/proxyip.txt` | Optional URL returning extra ProxyIP candidates (one per line or comma-separated) for the `/admin/proxyip` scanner. |
 
 ## Admin Panel
 
@@ -86,7 +90,7 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - Use a UUID v4 value when setting `UUID`.
 - Redeploy after changing production environment variables.
 - The generated subscription host defaults to the current deployed hostname unless `HOST` is explicitly configured.
-- Proxy endpoint resolution uses a bounded memory cache by default. Set `ENABLE_KV_PROXY_CACHE=1` only if you want a persistent last-known-good KV cache across isolate resets.
+- Proxy endpoint resolution uses a bounded memory cache plus a persistent last-known-good KV cache (on by default). KV writes are globally throttled (at most one every few minutes per isolate) and expire via TTL, so active browsing cannot exhaust the free-plan KV write quota; a write failure is always swallowed and never drops a connection. Set `OFF_PROXY_CACHE=1` or `ENABLE_KV_PROXY_CACHE=0` to keep it memory-only.
 - Request logging is off by default to avoid exhausting Cloudflare's free-tier KV write quota during subscription traffic. Set `ENABLE_KV_LOG=1` to store append-only KV entries under `log:entry:`; existing legacy `log.json` data is still readable as a fallback when no append-only entries exist.
 - `PRELOAD_RACE_DIAL=1` can improve first-open latency when DoH is fast and nearby, but it adds a DoH lookup before dialing each new hostname. Leave it off on networks where DoH is slow or blocked.
 - TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.

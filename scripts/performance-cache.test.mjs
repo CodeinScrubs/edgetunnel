@@ -15,9 +15,13 @@ const {
 	recordProxyEndpointResult,
 	parsePreferredEndpoint,
 	scheduleProxyCacheWrite,
+	resetProxyCacheKvThrottle,
+	isProxyResolutionKvCacheEnabled,
+	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS,
 	DoH查询,
 	MD5MD5,
 	sha224,
+	parseDnsTcpFrames,
 } = await import('../_worker.js').then(mod => mod.__testPerformanceHelpers);
 
 const now = 1_700_000_000_000;
@@ -309,6 +313,7 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 		health: {},
 	}, now);
 
+	resetProxyCacheKvThrottle();
 	scheduleProxyCacheWrite(env, ctx, 'cache-key', record, now, false);
 	scheduleProxyCacheWrite(env, ctx, 'cache-key', record, now + 1_000, false);
 	assert.equal(puts.length, 1, 'same-record writes should be throttled');
@@ -320,24 +325,36 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 }
 
 {
+	// Persistent proxy KV cache is ON by default now (writes are globally throttled + TTL'd).
+	assert.equal(isProxyResolutionKvCacheEnabled({}), true, 'proxy KV cache is on by default');
+	assert.equal(isProxyResolutionKvCacheEnabled({ OFF_PROXY_CACHE: '1' }), false, 'OFF_PROXY_CACHE disables it');
+	assert.equal(isProxyResolutionKvCacheEnabled({ ENABLE_KV_PROXY_CACHE: '0' }), false, 'explicit 0 disables it');
+
+	resetProxyCacheKvThrottle();
+	const onPuts = [];
+	scheduleProxyCacheWrite({ KV: { put(k, v, o) { onPuts.push({ k }); return Promise.resolve(); } } },
+		null, 'cache-key', normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['on.example.com', 443]], health: {} }, now), now, true);
+	assert.equal(onPuts.length, 1, 'default-on cache writes without an explicit flag');
+
+	resetProxyCacheKvThrottle();
+	const offPuts = [];
+	scheduleProxyCacheWrite({ OFF_PROXY_CACHE: '1', KV: { put(k, v, o) { offPuts.push({ k }); return Promise.resolve(); } } },
+		null, 'cache-key', normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['off.example.com', 443]], health: {} }, now), now, true);
+	assert.equal(offPuts.length, 0, 'OFF_PROXY_CACHE suppresses the write');
+}
+
+{
+	// Global throttle caps total writes across DISTINCT target-aware keys (free-plan KV safety).
+	resetProxyCacheKvThrottle();
 	const puts = [];
-	const record = normalizeProxyCacheRecord({
-		version: 1,
-		updatedAt: now,
-		endpoints: [['default-off.example.com', 443]],
-		health: {},
-	}, now);
-
-	scheduleProxyCacheWrite({
-		KV: {
-			put(key, value, options) {
-				puts.push({ key, value, options });
-				return Promise.resolve();
-			},
-		},
-	}, null, 'cache-key', record, now, true);
-
-	assert.equal(puts.length, 0, 'persistent proxy KV cache should be opt-in by default');
+	const env = { ENABLE_KV_PROXY_CACHE: '1', KV: { put(k, v, o) { puts.push({ k }); return Promise.resolve(); } } };
+	const recA = normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['a.example.com', 443]], health: {} }, now);
+	const recB = normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['b.example.com', 443]], health: {} }, now);
+	scheduleProxyCacheWrite(env, null, 'key-a', recA, now, true);
+	scheduleProxyCacheWrite(env, null, 'key-b', recB, now + 1_000, true);
+	assert.equal(puts.length, 1, 'second distinct-key write within the global interval is throttled');
+	scheduleProxyCacheWrite(env, null, 'key-b', recB, now + PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS + 1, true);
+	assert.equal(puts.length, 2, 'a write past the global interval is allowed');
 }
 
 {
@@ -347,6 +364,7 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 		endpoints: [['throw.example.com', 443]],
 		health: {},
 	}, now);
+	resetProxyCacheKvThrottle();
 	assert.doesNotThrow(() => scheduleProxyCacheWrite({
 		ENABLE_KV_PROXY_CACHE: '1',
 		KV: {
@@ -355,6 +373,18 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 			},
 		},
 	}, null, 'cache-key', record, now, true));
+}
+
+{
+	// DNS-over-TCP frame parser feeds the DoH forwarder: splits [len][msg][len][msg] correctly.
+	const frame = (msg) => { const f = new Uint8Array(2 + msg.length); f[0] = (msg.length >>> 8) & 0xff; f[1] = msg.length & 0xff; f.set(msg, 2); return f; };
+	const q1 = new Uint8Array([1, 2, 3]), q2 = new Uint8Array([9, 9]);
+	const buf = new Uint8Array([...frame(q1), ...frame(q2)]);
+	const parsed = parseDnsTcpFrames(buf);
+	assert.equal(parsed.length, 2, 'two length-prefixed DNS frames are parsed');
+	assert.deepEqual([...parsed[0]], [1, 2, 3], 'first DNS query payload is extracted without the length prefix');
+	assert.deepEqual([...parsed[1]], [9, 9], 'second DNS query payload is extracted');
+	assert.deepEqual(parseDnsTcpFrames(new Uint8Array([0, 5, 1, 2])), [], 'a truncated frame is not emitted');
 }
 
 console.log('performance cache tests passed');

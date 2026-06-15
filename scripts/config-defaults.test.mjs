@@ -39,7 +39,7 @@ function makeFakeKV(initialEntries = {}) {
 {
 	assert.equal(ENGINE_DEFAULTS.PROXY_CONNECT_TIMEOUT_DEFAULT_MS, 850);
 	assert.equal(ENGINE_DEFAULTS.DNS_TCP_RESPONSE_TIMEOUT_MS, 1200);
-	assert.equal(ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES, 16 * 1024 * 1024);
+	assert.equal(ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES, 4 * 1024 * 1024);
 	assert.equal(ENGINE_DEFAULTS.PAGES_STATIC_URL, 'https://edt-pages.github.io');
 	assert.equal(ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES, 32);
 	assert.equal(ENGINE_DEFAULTS.DEFAULT_DOH_LOOKUP_URL, 'https://cloudflare-dns.com/dns-query');
