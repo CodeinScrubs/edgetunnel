@@ -1,84 +1,164 @@
-# Environment variables — full reference
+# Environment variables — complete, beginner-friendly reference
 
-How config is resolved (highest priority wins):
-**Cloudflare env var / Secret** → **KV `config.json`** (admin panel saves here) → **`USER_CONFIG`
-defaults** (`src/core/config.js`) → **`ENGINE_DEFAULTS`**.
-
-Set env vars in the Cloudflare dashboard: *Worker → Settings → Variables and Secrets*. Use a
-**Secret** (encrypted) for `ADMIN`, `KEY`, `UUID`. Flags accept `1`/`true`/`on` (and `0`/`false`/`off`).
+This page explains **every** environment variable the Worker understands: what it does in plain
+language, its default, suggested values, and the pros/cons of changing it. If you only change one
+thing, set `ADMIN`. Everything else is optional.
 
 ---
 
-## 1. Identity & access (set these first)
+## How to add or change a variable (step by step)
 
-| Var | Default | What it does | How to choose |
+1. Open the **Cloudflare dashboard** → **Workers & Pages** → your worker.
+2. Go to **Settings → Variables and Secrets**.
+3. Click **Add variable**. Type the **name** (exactly, UPPERCASE) and the **value**.
+4. For passwords/IDs (`ADMIN`, `KEY`, `UUID`) click **Encrypt** so it becomes a **Secret** (hidden, safer).
+5. Click **Save and deploy**. The change applies in a few seconds — **no code rebuild needed**.
+6. After changing anything that affects the tunnel, **reconnect your client** (v2rayNG: toggle off/on).
+
+**Value formats:**
+- **On/off flags** accept `1`, `true`, `on` for ON and `0`, `false`, `off` (or just leave unset) for OFF.
+- **Numbers** are plain digits (milliseconds or bytes, as noted). Out-of-range numbers are clamped.
+- **Priority:** a dashboard variable overrides the KV `config.json` (admin panel), which overrides the
+  built-in defaults.
+
+**One required binding (not a variable):** bind a **KV namespace** named **`KV`** (Settings → Bindings)
+so the admin panel and config can be saved. Without it the panel can't store settings.
+
+---
+
+## 1. Identity & access — set these first
+
+| Variable | Default | What it does |
+|---|---|---|
+| **`ADMIN`** | *none (required)* | Your **admin-panel password**. Also the seed for `UUID` if you don't set one. Aliases that do the same thing: `PASSWORD`, `password`, `pswd`, `TOKEN`, `admin`. |
+| **`KEY`** | `default-key-change-with-KEY-env-if-needed` | A secret used to derive your subscription token and (if `UUID` is unset) your UUID. |
+| **`UUID`** | derived from `ADMIN`+`KEY` | The VLESS/Trojan user id — **this is a live credential, keep it secret**. |
+
+- **Suggested:** Set `ADMIN` to a long random password. Set `KEY` to another random string. Set `UUID`
+  to a fixed value from any UUID generator (`uuidgen`) so it never changes when you redeploy.
+- **Pros of setting all three explicitly:** your identity/token stay stable across redeploys and aren't
+  guessable from the password alone. **Con of leaving them derived:** if you ever change `ADMIN`, your
+  `UUID` and all node links change too, and every client must re-import.
+- **Always make these Secrets (Encrypt).** Never commit them to a public repo.
+
+---
+
+## 2. Host & path
+
+| Variable | Default | What it does | Suggested / pros & cons |
 |---|---|---|---|
-| `ADMIN` | — (required) | Admin-panel password. Also the fallback for `UUID` if neither `UUID` nor `KEY`-derivation is set. | A long random string. This is the only gate on your panel — make it strong. |
-| `KEY` | `default-key-change-with-KEY-env-if-needed` | Secret used to derive the subscription token and the `UUID` (when `UUID` is unset). | Set a random value so your `UUID`/token aren't guessable from `ADMIN` alone. |
-| `UUID` | derived from `ADMIN`+`KEY` | The VLESS/Trojan user id (this is a live credential — keep it secret). | Set a fixed UUID (e.g. from `uuidgen`) so it never changes across redeploys. |
+| **`HOST`** | the URL the request came in on | The hostname written into your generated node links / subscription. | **Set it to your custom domain** (e.g. `cdn.example.com`) so links are always correct no matter which URL hit the worker. No real downside. |
+| **`PATH`** | `/` | Two jobs: (a) the WS **path** / gRPC **serviceName** used in generated links, and (b) a **tunnel path-gate** (see box below). | Default `/` = gate **off** (anything can reach the tunnel). Set a secret path like `/mypath` for stealth + less scanner load. **Con:** every client config must use the same path. |
+| **`URL`** | `nginx` | What a normal visitor (or a bot) sees at `/`. `nginx` shows a fake nginx page (no outbound request). A real URL reverse-proxies that site as camouflage. | Leave `nginx`, or point at a believable site. Don't point it at a slow site (adds latency for nothing). |
 
-## 2. Host & routing
+> ### 📌 About `PATH` and the tunnel path-gate (important — read if you set a custom path)
+> By default the worker treats **any** WebSocket upgrade or POST as a tunnel attempt, so internet
+> scanners that hit your worker waste a little CPU. If you set `PATH` to something non-root, the worker
+> **only** lets requests under that path into the tunnel; everything else gets the camouflage page.
+>
+> **How to use it:**
+> 1. Set env `PATH=/mypath` (any secret-ish path).
+> 2. In your client, set the gRPC **serviceName** (or WS **path**) to the **same** value.
+> 3. Re-import your subscription / fix the node so it uses that path.
+>
+> **Slash-flexible:** `PATH=mypath` and `PATH=/mypath` both work, and your client may use `mypath` or
+> `/mypath` — they all match. (Earlier this was strict; it's now normalized on both sides.)
+> **Benefit:** scanners hitting `/` or random paths never reach the tunnel parser → less wasted CPU and
+> better stealth. **Cost:** if the client path doesn't match, *your own* connection is rejected — that's
+> the whole point, so keep them in sync.
 
-| Var | Default | What it does | How to choose |
-|---|---|---|---|
-| `HOST` | request hostname | The host written into generated node links / subscription. | Set to your custom domain (e.g. `cdn.example.com`) so links are correct regardless of which URL hit the worker. |
-| `PATH` | `/` | WebSocket/gRPC path (gRPC uses it as the serviceName). | Leave `/` unless you want a non-default path. A unique path is mild obfuscation. |
-| `URL` | `nginx` | What a non-proxy visitor (or crawler) sees at `/`. `nginx` serves a fake nginx page; a real URL reverse-proxies that site as camouflage. | Leave `nginx`, or point at a believable site to look less like a proxy. |
+---
 
-## 3. Connection performance (the main tuning knobs)
+## 3. Connection speed & reliability (the tuning knobs)
 
-| Var | Default | Range | What it does | How to tune |
+| Variable | Default | Range | What it does | How to choose |
 |---|---|---|---|---|
-| `CONNECT_TIMEOUT_MS` | `850` | 400–5000 | How long to wait for a TCP/handshake before giving up and trying the next IP/ProxyIP. | **Lower** = faster failover (snappier when an IP is bad) but may abandon slow-but-working paths. From Iran with a good clean IP, **600–900** is the sweet spot. For high-latency/lossy mobile networks you can now go up to **2000–3000**; raise if you see "connection failed" a lot, lower if recovery feels slow. |
-| `DNS_TIMEOUT_MS` | `1200` (falls back to `CONNECT_TIMEOUT_MS`) | 400–5000 | Timeout for the DNS-over-TCP fallback path. | Usually leave default — DoH is the primary DNS path. Raise only if DNS resolution times out on a very slow link. |
-| `DIAL_STAGGER_MS` | `90` | 0–500 | Delay between firing concurrent dial attempts (happy-eyeballs style). | `0` = fire all candidates at once (fastest connect, more connections opened). `90` balances speed vs. waste. Try `0`–`50` for lower connect latency. |
-| `PRELOAD_RACE_DIAL` | off | flag | Resolves the target to multiple IPs and **races** them, keeping the fastest. | Turn **on** (`1`) to cut connect latency when a hostname has many IPs. Costs a few extra connection attempts. Worth trying for speed. |
-| `DOWNLINK_BACKPRESSURE_HWM_BYTES` | `262144` (256 KB) | 64 KB–8 MB | Downstream buffer high-water mark — how much un-delivered data buffers before the worker pauses reading from the origin. **This is the main download-throughput knob.** | Raise (e.g. `524288` = 512 KB, or `1048576` = 1 MB) on **high-bandwidth × high-latency, low-loss** links to keep the TCP pipe full → higher download speed. No benefit on slow/lossy links; costs isolate memory. **Benchmark before/after** (see below). |
+| **`CONNECT_TIMEOUT_MS`** | `850` | 400–5000 | How long to wait for a TCP/handshake before giving up and trying the next IP/relay. | **Lower** = snappier failover when an IP is bad, but may abandon slow-but-working paths. Good clean IP from Iran: **700–900**. High-latency/lossy mobile: **1500–2500**. |
+| **`DNS_TIMEOUT_MS`** | `1200` (else `CONNECT_TIMEOUT_MS`) | 400–5000 | Timeout for the DNS-over-TCP fallback. | Usually leave default (DoH is primary). Raise on very slow links. |
+| **`DIAL_STAGGER_MS`** | `90` | 0–500 | Delay between firing parallel connection attempts. | `0` = fire candidates at once (fastest connect, one extra socket). `90` balances speed vs. waste. Try `0`–`40`. |
+| **`PRELOAD_RACE_DIAL`** | off | flag | Resolve the target to multiple IPs (A+AAAA via DoH) and **race** them. | **Leave off.** It adds a DNS lookup per connection; only helps hostnames with many IPs. We measured it as net-neutral-to-negative for normal use. |
+| **`FIRST_BYTE_TIMEOUT_MS`** | `0` (off) | 0–10000 | If a direct connection *opens* but sends **no data** within this many ms, cancel it and fall back to the ProxyIP relay. | **Off by default.** Turn on (try `1500`–`2500`) **only if you get "connected but page loads forever"** — it rescues blackholed routes. **Con:** a genuinely slow server (>your value to first byte) gets an unnecessary fallback. |
+
+---
 
 ## 4. DNS
 
-| Var | Default | What it does | How to choose |
+| Variable | Default | What it does | How to choose |
 |---|---|---|---|
-| `DOH_URL` (or `DOH_ENDPOINT`) | `https://cloudflare-dns.com/dns-query` | Primary DNS — DNS-over-HTTPS (RFC 8484). Low, consistent latency. | Default is good. Alternatives: `https://dns.google/dns-query`. Pick whichever resolves fastest/unblocked from Cloudflare's edge. |
-| `DNS_SERVER` (or `DNS_TCP_SERVER`) | `8.8.4.4:53` | DNS-over-TCP fallback if DoH fails. | Any reliable resolver `host:port`. Rarely needs changing. |
-
-## 5. Cloudflare access / ProxyIP
-
-| Var | Default | What it does | How to choose |
-|---|---|---|---|
-| `PROXYIP` | `auto` (per-datacenter community relay) | The relay used to reach **Cloudflare-hosted** destinations (which can't be dialed directly — Error 1034). | `auto` uses a shared community relay (variable quality). For reliability, set a specific working `host:port`. Most of your traffic uses your clean front IP directly, so this only matters for CF-hosted sites. |
-| `GO2SOCKS5` | — | Comma/newline list of domains forced through a SOCKS5 upstream (configured via chain-proxy). | Advanced. Leave unset unless you run a SOCKS5 upstream. |
-
-## 6. Caching, logging & debug
-
-| Var | Default | What it does | How to choose |
-|---|---|---|---|
-| `ENABLE_KV_PROXY_CACHE` / `KV_PROXY_CACHE` | **on** | Persists resolved ProxyIP endpoints in KV (fewer repeat DNS lookups). Writes are globally throttled (≤ ~480/day) so they can't exhaust the free-plan 1000/day KV quota. | Leave on. Disable with `OFF_PROXY_CACHE=1` only if you don't want any KV writes. |
-| `ENABLE_KV_LOG` / `KV_LOG` | off | Logs requests to KV (visible in the admin "operation log"). | Turn on briefly to inspect usage/errors, then off — it consumes KV writes. `OFF_LOG=1` force-disables. |
-| `LOG_TTL_DAYS` / `LOG_TTL_SECONDS` | 7 days | How long log entries live. | Lower to save KV. |
-| `LOG_READ_LIMIT` | 500 (max 1000) | Max log rows the panel reads. | Cosmetic. |
-| `DEBUG` | off | Verbose `[TCP forwarding]`/`[ProxyIP]`/`[UDP forwarding]` logs, visible via `wrangler tail`. | Turn on (`1`) only while debugging with `npx wrangler tail <name>`, then off. |
-
-## 7. Node-generation defaults (usually set in the panel, but available as env)
-
-| Var | Default | What it does |
-|---|---|---|
-| `TRANSPORT` | `ws` | Default transport for generated links (`ws` / `grpc` / `xhttp`). Yours uses gRPC. |
-| `FP` / `FINGERPRINT` | `chrome` | TLS fingerprint advertised by the client config. `chrome` supports ECH. |
-| `GRPC_MODE` | `gun` | gRPC mode (`gun` normal / `multi`). `gun` is the reliable default. |
-| `GRPC_USER_AGENT` | — | Override the gRPC User-Agent string. |
-| `SUBNAME` | `edgetunnel` | Subscription name shown in clients. |
-| `SUB_UPDATE_TIME` | — | Subscription auto-update interval (hours). |
-| `BEST_SUB` | off | Advanced: act as a "best-sub" generator backend. Leave off. |
+| **`DOH_URL`** (alias `DOH_ENDPOINT`) | `https://cloudflare-dns.com/dns-query` | Primary DNS — DNS-over-HTTPS. Avoids a TCP handshake per lookup. | Default is good. If it's slow from your datacenter, try `https://dns.google/dns-query`. |
+| **`DNS_SERVER`** (alias `DNS_TCP_SERVER`) | `8.8.4.4:53` | DNS-over-TCP fallback if DoH fails. | Any reliable resolver `host:port`. Rarely needs changing. |
 
 ---
 
-## Quick recommendations for your setup (Iran, free plan, gRPC, custom domain)
+## 5. Cloudflare-hosted-site access (ProxyIP)
 
-1. **Pin identity:** set `UUID`, `KEY`, `ADMIN` as Secrets so they survive redeploys.
-2. **Set `HOST` to your custom domain** so links are always correct.
-3. **Try `PRELOAD_RACE_DIAL=1`** and **`DIAL_STAGGER_MS=0`** — likely lower connect latency.
-4. **Keep `CONNECT_TIMEOUT_MS` ~700–850.** Lower it if failover feels slow; raise it if connections fail to establish.
-5. **Consider enabling ECH** (panel → Encrypted Client Hello) — hides the SNI, which helps against SNI-based blocking. Your fingerprint already says `chrome (supportECH)`.
-6. **Add a few backup clean IPs** to the preferred-address list so the subscription has fallbacks if your front IP degrades.
-7. **Leave the proxy cache on; turn DEBUG/KV-log on only when investigating.**
+Most sites you visit are reached **directly**. Sites hosted *on Cloudflare* can't be dialed directly
+from a Worker (Error 1034) and use a relay called a **ProxyIP**.
+
+| Variable | Default | What it does | How to choose |
+|---|---|---|---|
+| **`PROXYIP`** | `auto` (per-datacenter community relay) | The relay for Cloudflare-hosted destinations. | `auto` uses a shared community relay (variable quality). Set a specific `host:port` if you have a reliable one. Most of your traffic doesn't use this. |
+| **`PROXYIP_FALLBACK`** | off | flag | When you set a **custom** `PROXYIP`, fallback is normally disabled. `PROXYIP_FALLBACK=1` keeps the community-relay fallback on, so a dead custom ProxyIP doesn't kill the connection. | Turn on if you set a custom `PROXYIP` and want resilience. N/A if you use `auto`. |
+| **`GO2SOCKS5`** | none | Comma/newline list of domains forced through a SOCKS5 upstream. | Advanced; leave unset unless you run a SOCKS5 server. |
+
+---
+
+## 6. Throughput buffer (download-speed knob)
+
+| Variable | Default | Range | What it does | How to choose |
+|---|---|---|---|---|
+| **`DOWNLINK_BACKPRESSURE_HWM_BYTES`** | `262144` (256 KB) | 64 KB – 8 MB | How much downloaded data the worker buffers before pausing the origin. **The main download-throughput dial.** | Raise (e.g. `524288`=512 KB or `1048576`=1 MB) on **fast + high-latency, low-loss** links to keep the pipe full → higher download speed. No benefit on slow/lossy links; uses more memory. **Benchmark single-stream before/after and keep only if it helps.** |
+
+---
+
+## 7. Logging, cache & debug
+
+| Variable | Default | What it does | How to choose |
+|---|---|---|---|
+| **`ENABLE_KV_PROXY_CACHE`** (alias `KV_PROXY_CACHE`) | **on** | Caches resolved ProxyIP endpoints in KV (fewer repeat lookups; writes are throttled so they can't blow the free 1000/day quota). | Leave on. Disable with `OFF_PROXY_CACHE=1` (or `DISABLE_KV_PROXY_CACHE=1`) only if you want zero KV writes. |
+| **`ENABLE_KV_LOG`** (alias `KV_LOG`) | off | Logs requests to KV (visible in the admin "operation log"). | Turn on briefly to inspect usage, then off (it consumes KV writes). `OFF_LOG=1` force-disables. |
+| **`LOG_TTL_DAYS`** / **`LOG_TTL_SECONDS`** | 7 days | How long log entries live. | Lower to save KV. |
+| **`LOG_READ_LIMIT`** | 500 (max 1000) | Max log rows the panel reads at once. | Cosmetic. |
+| **`DEBUG`** | off | Verbose `[TCP forwarding]` / `[ProxyIP]` / `[UDP forwarding]` logs, visible via `npx wrangler tail`. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
+
+---
+
+## 8. Node-generation defaults (usually set in the admin panel, also available as env)
+
+| Variable | Default | What it does |
+|---|---|---|
+| **`TRANSPORT`** | `ws` | Default transport for generated links: `ws` / `grpc` / `xhttp`. (You currently use gRPC.) |
+| **`FP`** / **`FINGERPRINT`** | `chrome` | TLS fingerprint advertised by the client config. `chrome` supports ECH. |
+| **`GRPC_MODE`** | `gun` | gRPC mode: `gun` (normal, reliable) or `multi`. |
+| **`GRPC_USER_AGENT`** | none | Override the gRPC User-Agent string. |
+| **`SUBNAME`** | `edgetunnel` | Subscription name shown in clients. |
+| **`SUB_UPDATE_TIME`** | none | Subscription auto-update interval (hours) advertised to clients. |
+| **`BEST_SUB`** | off | Advanced: act as a "best-sub" generator backend. Leave off. |
+
+---
+
+## Quick starting profiles
+
+**Stable everyday (recommended):**
+```
+ADMIN=<long random>     KEY=<random>     UUID=<fixed uuid>
+HOST=<your domain>      CONNECT_TIMEOUT_MS=850
+```
+**Stealth + less scanner load:** add
+```
+PATH=/your-secret-path   (and set the client gRPC serviceName / WS path to match)
+```
+**High-latency / flaky mobile:** add
+```
+CONNECT_TIMEOUT_MS=2000   FIRST_BYTE_TIMEOUT_MS=2000
+```
+**Chasing download speed (benchmark each value!):** try
+```
+DOWNLINK_BACKPRESSURE_HWM_BYTES=524288   then 1048576 — keep what measurably helps
+```
+
+## Things to leave alone (for your single-user Iran setup)
+- **ECH** → keep off (unreliable / can break in Iran).
+- **`PRELOAD_RACE_DIAL`** → off (adds DNS overhead).
+- Don't try to tunnel **UDP/QUIC** — keep UDP 443 blocked client-side (the worker only carries TCP + DNS).
+- Don't enable any auto-scanning/cron — that's what caused the original abuse flag.

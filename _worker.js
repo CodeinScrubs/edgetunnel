@@ -232,12 +232,15 @@ export default {
 		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
 		workerRequestContext.tunnel = await createTunnelContext(request, env);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || 'unknown-ip';
-		let 期望隧道路径 = String(env.PATH || '/').trim().toLowerCase();
-		if (期望隧道路径 && !期望隧道路径.startsWith('/')) 期望隧道路径 = '/' + 期望隧道路径;
 		// Tunnel path gate: when a non-root PATH is set, only requests under that path may enter the
 		// WS/gRPC/XHTTP tunnel parser; random scanners hitting other paths get the camouflage page
-		// instead (less wasted CPU, better stealth). PATH="/" (the default) disables the gate.
-		const 隧道路径匹配 = !期望隧道路径 || 期望隧道路径 === '/' || ('/' + 访问路径) === 期望隧道路径 || ('/' + 访问路径).startsWith(期望隧道路径 + '/');
+		// instead (less wasted CPU, better stealth). PATH="/" / unset disables the gate.
+		// Slash-insensitive on BOTH sides: PATH="mypath" and PATH="/mypath" both match a client
+		// gRPC serviceName / WS path of "mypath" or "/mypath". (xray can emit a doubled slash like
+		// "//mypath/Tun" for a slash-prefixed gRPC serviceName, so we collapse repeated slashes too.)
+		const 期望隧道路径核心 = String(env.PATH || '').trim().toLowerCase().replace(/^\/+/, '').replace(/\/+$/, '');
+		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
+		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
 			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (管理员密码 && upgradeHeader === 'websocket' && 隧道路径匹配) {
