@@ -29,10 +29,11 @@ Set env vars in the Cloudflare dashboard: *Worker → Settings → Variables and
 
 | Var | Default | Range | What it does | How to tune |
 |---|---|---|---|---|
-| `CONNECT_TIMEOUT_MS` | `850` | 400–1500 | How long to wait for a TCP/handshake before giving up and trying the next IP/ProxyIP. | **Lower** = faster failover (snappier when an IP is bad) but may abandon slow-but-working paths. From Iran with a good clean IP, **600–900** is the sweet spot. If you see "connection failed" a lot, raise it; if recovery feels slow, lower it. |
-| `DNS_TIMEOUT_MS` | `1200` (falls back to `CONNECT_TIMEOUT_MS`) | 400–1500 | Timeout for the DNS-over-TCP fallback path. | Usually leave default — DoH is the primary DNS path. Raise only if DNS resolution times out on a very slow link. |
+| `CONNECT_TIMEOUT_MS` | `850` | 400–5000 | How long to wait for a TCP/handshake before giving up and trying the next IP/ProxyIP. | **Lower** = faster failover (snappier when an IP is bad) but may abandon slow-but-working paths. From Iran with a good clean IP, **600–900** is the sweet spot. For high-latency/lossy mobile networks you can now go up to **2000–3000**; raise if you see "connection failed" a lot, lower if recovery feels slow. |
+| `DNS_TIMEOUT_MS` | `1200` (falls back to `CONNECT_TIMEOUT_MS`) | 400–5000 | Timeout for the DNS-over-TCP fallback path. | Usually leave default — DoH is the primary DNS path. Raise only if DNS resolution times out on a very slow link. |
 | `DIAL_STAGGER_MS` | `90` | 0–500 | Delay between firing concurrent dial attempts (happy-eyeballs style). | `0` = fire all candidates at once (fastest connect, more connections opened). `90` balances speed vs. waste. Try `0`–`50` for lower connect latency. |
 | `PRELOAD_RACE_DIAL` | off | flag | Resolves the target to multiple IPs and **races** them, keeping the fastest. | Turn **on** (`1`) to cut connect latency when a hostname has many IPs. Costs a few extra connection attempts. Worth trying for speed. |
+| `DOWNLINK_BACKPRESSURE_HWM_BYTES` | `262144` (256 KB) | 64 KB–8 MB | Downstream buffer high-water mark — how much un-delivered data buffers before the worker pauses reading from the origin. **This is the main download-throughput knob.** | Raise (e.g. `524288` = 512 KB, or `1048576` = 1 MB) on **high-bandwidth × high-latency, low-loss** links to keep the TCP pipe full → higher download speed. No benefit on slow/lossy links; costs isolate memory. **Benchmark before/after** (see below). |
 
 ## 4. DNS
 

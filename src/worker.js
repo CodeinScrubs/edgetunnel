@@ -746,7 +746,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
-	}, new ByteLengthQueuingStrategy({ highWaterMark: 下行背压高水位字节 })), { status: 200, headers: responseHeaders });
+	}, new ByteLengthQueuingStrategy({ highWaterMark: getDownlinkBackpressureHwm(getWorkerRequestContext(request).env) })), { status: 200, headers: responseHeaders });
 }
 
 function 有效数据长度(data) {
@@ -1149,7 +1149,7 @@ async function 处理gRPC请求(request, yourUUID) {
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
-	}, new ByteLengthQueuingStrategy({ highWaterMark: 下行背压高水位字节 })), { status: 200, headers: grpcHeaders });
+	}, new ByteLengthQueuingStrategy({ highWaterMark: getDownlinkBackpressureHwm(getWorkerRequestContext(request).env) })), { status: 200, headers: grpcHeaders });
 }
 
 function 是有效WS早期数据(bytes, token) {
@@ -7386,6 +7386,15 @@ function getDnsTcpResponseTimeoutMs(env) {
 	const configured = Number(env?.DNS_TIMEOUT_MS || env?.CONNECT_TIMEOUT_MS);
 	if (!Number.isFinite(configured) || configured <= 0) return DNS_TCP_RESPONSE_TIMEOUT_MS;
 	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+// Downstream backpressure high-water mark, env-overridable for per-network benchmarking.
+// Default (ENGINE_DEFAULTS.DOWNLINK_BACKPRESSURE_HWM_BYTES) is unchanged when the env var is unset.
+// Clamped to [64KB, 8MB] so a bad value can't break the stream or exhaust isolate memory.
+function getDownlinkBackpressureHwm(env) {
+	const configured = Number(env?.DOWNLINK_BACKPRESSURE_HWM_BYTES);
+	if (!Number.isFinite(configured) || configured <= 0) return 下行背压高水位字节;
+	return Math.max(64 * 1024, Math.min(8 * 1024 * 1024, Math.round(configured)));
 }
 
 function getDialStaggerMs(env) {

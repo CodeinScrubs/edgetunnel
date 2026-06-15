@@ -222,7 +222,8 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 {
 	assert.equal(getProxyConnectTimeoutMs({}), 850);
 	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '200' }), 400);
-	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '5000' }), 1500);
+	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '5000' }), 5000);
+	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '9000' }), 5000);
 	assert.equal(getProxyConnectTimeoutMs({ CONNECT_TIMEOUT_MS: '950' }), 950);
 }
 

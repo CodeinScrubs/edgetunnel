@@ -177,8 +177,10 @@ import { join } from 'node:path';
 	// Connection-drop fixes: downstream backpressure (no isolate OOM on large transfers),
 	// SOCKS5 residual stitching, and the TLS client dropping its per-read timeout post-handshake.
 	const source = readFileSync('src/worker.js', 'utf8');
-	assert.ok((source.match(/new ByteLengthQueuingStrategy\(\{ highWaterMark: 下行背压高水位字节 \}\)/g) || []).length >= 2,
+	assert.ok((source.match(/new ByteLengthQueuingStrategy\(\{ highWaterMark: getDownlinkBackpressureHwm\(/g) || []).length >= 2,
 		'gRPC and XHTTP response streams must use a bounded backpressure strategy');
+	assert.match(source, /function getDownlinkBackpressureHwm\(env\)[\s\S]*?return 下行背压高水位字节/,
+		'backpressure HWM is env-tunable but falls back to the bounded default');
 	assert.match(source, /return 等待下行可写\(\)/, 'downstream bridge must apply pull-based backpressure (wait until the stream drains)');
 	assert.match(source, /webSocket\.bufferedAmount > WS缓冲上限字节/, 'WebSocket downstream must pace against bufferedAmount');
 	assert.match(source, /Stitch them back onto the front of the stream/, 'SOCKS5 must preserve bundled target-response bytes');
