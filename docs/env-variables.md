@@ -16,8 +16,13 @@ thing, set `ADMIN`. Everything else is optional.
 6. After changing anything that affects the tunnel, **reconnect your client** (v2rayNG: toggle off/on).
 
 **Value formats:**
-- **On/off flags** accept `1`, `true`, `on` for ON and `0`, `false`, `off` (or just leave unset) for OFF.
-- **Numbers** are plain digits (milliseconds or bytes, as noted). Out-of-range numbers are clamped.
+- **On/off flags** (anything labeled "flag" below):
+  - **To turn it ON:** add the variable and set its **value to `1`** (also accepted: `true`, `yes`, `on`).
+  - **To turn it OFF:** set the value to `0` (also `false`/`no`/`off`), **or simply don't add it / delete it** — unset = off.
+  - *Example:* to enable `PROXYIP_FALLBACK`, add a variable named `PROXYIP_FALLBACK` with value `1`.
+- **Numbers** are plain digits (milliseconds or bytes, as noted). Out-of-range numbers are auto-clamped to the listed range.
+- **Text** (`HOST`, `PATH`, `DOH_URL`, …) is the literal value.
+- **Setting a variable to its current default has no effect** (e.g. `DOWNLINK_BACKPRESSURE_HWM_BYTES=262144` is the same as not setting it).
 - **Priority:** a dashboard variable overrides the KV `config.json` (admin panel), which overrides the
   built-in defaults.
 
