@@ -91,7 +91,8 @@ so the admin panel and config can be saved. Without it the panel can't store set
 | Variable | Default | What it does | How to choose |
 |---|---|---|---|
 | **`DOH_URL`** (alias `DOH_ENDPOINT`) | `https://cloudflare-dns.com/dns-query` | Primary DNS — DNS-over-HTTPS. Avoids a TCP handshake per lookup. | Default is good. If it's slow from your datacenter, try `https://dns.google/dns-query`. |
-| **`DNS_SERVER`** (alias `DNS_TCP_SERVER`) | `8.8.4.4:53` | DNS-over-TCP fallback if DoH fails. | Any reliable resolver `host:port`. Rarely needs changing. |
+| **`DOH_URL_FALLBACK`** | `https://dns.google/dns-query` | A **second** DoH endpoint tried for tunneled DNS if the primary fails, **before** dropping to plaintext DNS-over-TCP. | Leave default (Google). Only matters when the primary DoH is unreachable; adds resilience at no normal-path cost. |
+| **`DNS_SERVER`** (alias `DNS_TCP_SERVER`) | `8.8.4.4:53` | DNS-over-TCP fallback if **both** DoH endpoints fail. | Any reliable resolver `host:port`. Rarely needs changing. |
 
 ---
 
@@ -113,6 +114,7 @@ from a Worker (Error 1034) and use a relay called a **ProxyIP**.
 | Variable | Default | Range | What it does | How to choose |
 |---|---|---|---|---|
 | **`DOWNLINK_BACKPRESSURE_HWM_BYTES`** | `262144` (256 KB) | 64 KB – 8 MB | How much downloaded data the worker buffers before pausing the origin. **The main download-throughput dial.** | Raise (e.g. `524288`=512 KB or `1048576`=1 MB) on **fast + high-latency, low-loss** links to keep the pipe full → higher download speed. No benefit on slow/lossy links; uses more memory. **Benchmark single-stream before/after and keep only if it helps.** |
+| **`DOWNLINK_GRAIN_PACKET_BYTES`** | `32768` (32 KB) | 4 KB – 1 MB | How big a chunk the worker accumulates before flushing it downstream (affects your gRPC downstream and the WS sender). | **Bigger** (e.g. `65536`=64 KB) = fewer, larger flushes → smoother sustained **download/video**. **Smaller** = lower latency for tiny responses but more overhead. Pair a big value with a big `DOWNLINK_BACKPRESSURE_HWM_BYTES`. Benchmark 32 KB vs 64 KB. |
 
 ---
 

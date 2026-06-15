@@ -29,8 +29,10 @@ const USER_CONFIG = {
 	SUBNAME: undefined,
 	SUB_UPDATE_TIME: undefined,
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
+	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
+	DOH_URL_FALLBACK: undefined,
 };
 
 // Advanced engine defaults. Keep these behavior-preserving unless benchmark data says otherwise.
@@ -192,6 +194,19 @@ function getDohLookupUrl(env = {}) {
 		if (url.protocol === 'https:' || url.protocol === 'http:') return url.href;
 	} catch (error) { }
 	return DEFAULT_DOH_LOOKUP_URL;
+}
+
+// Ordered DoH endpoints to try for tunneled DNS: primary (DOH_URL) then a secondary
+// (DOH_URL_FALLBACK, default Google) before falling back to plaintext DNS-over-TCP.
+function getDohLookupUrls(env = {}) {
+	const primary = getDohLookupUrl(env);
+	const urls = [primary];
+	const fallbackRaw = String(env?.DOH_URL_FALLBACK || 'https://dns.google/dns-query').trim();
+	try {
+		const u = new URL(fallbackRaw);
+		if ((u.protocol === 'https:' || u.protocol === 'http:') && u.href !== primary) urls.push(u.href);
+	} catch (error) { }
+	return urls;
 }
 
 function getDnsTcpEndpoint(env = {}) {
@@ -677,6 +692,10 @@ export default {
 			const 内容类型 = 反代响应.headers.get('content-type') || '';
 
 			if (/text|javascript|json|xml/.test(内容类型)) {
+				// Only buffer+rewrite reasonably small camouflage pages; stream large ones unchanged so a
+				// huge/hostile decoy response can't spike isolate memory and disrupt active tunnels.
+				const 内容长度 = Number(反代响应.headers.get('content-length') || 0);
+				if (内容长度 > 2 * 1024 * 1024) return 反代响应;
 				const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
 				return new Response(响应内容, { status: 反代响应.status, headers: { ...Object.fromEntries(反代响应.headers), 'Cache-Control': 'no-store' } });
 			}
@@ -1038,7 +1057,7 @@ async function 处理gRPC请求(request, yourUUID) {
 		'Cache-Control': 'no-store'
 	});
 
-	const 下行缓存上限 = 下行Grain包字节;
+	const 下行缓存上限 = getDownlinkGrainBytes(getWorkerRequestContext(request).env);
 	const 下行刷新间隔 = Math.max(下行Grain静默毫秒, 1);
 
 	// Downstream backpressure: pause the remote->client producer when the response stream's
@@ -2484,24 +2503,34 @@ function 解析DNS_TCP帧(data) {
 async function DNS经DoH转发(requestData, env, timeoutMs) {
 	const frames = 解析DNS_TCP帧(requestData);
 	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
-	const dohUrl = getDohLookupUrl(env);
-	let out = new Uint8Array(0);
-	for (const query of frames) {
-		const resp = await fetchWithTimeout(dohUrl, {
-			method: 'POST',
-			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
-			body: query,
-		}, timeoutMs);
-		if (!resp.ok) throw new Error(`DoH HTTP ${resp.status}`);
-		const msg = new Uint8Array(await resp.arrayBuffer());
-		if (!msg.byteLength) throw new Error('empty DoH response');
-		const framed = new Uint8Array(2 + msg.byteLength);
-		framed[0] = (msg.byteLength >>> 8) & 0xff;
-		framed[1] = msg.byteLength & 0xff;
-		framed.set(msg, 2);
-		out = out.byteLength ? 拼接字节数据(out, framed) : framed;
+	const dohUrls = getDohLookupUrls(env);
+	let lastErr = null;
+	for (const dohUrl of dohUrls) {
+		try {
+			let out = new Uint8Array(0);
+			for (const query of frames) {
+				const resp = await fetchWithTimeout(dohUrl, {
+					method: 'POST',
+					headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
+					body: query,
+				}, timeoutMs);
+				if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
+				const msg = new Uint8Array(await resp.arrayBuffer());
+				if (!msg.byteLength) throw new Error('empty DoH response');
+				if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
+				const framed = new Uint8Array(2 + msg.byteLength);
+				framed[0] = (msg.byteLength >>> 8) & 0xff;
+				framed[1] = msg.byteLength & 0xff;
+				framed.set(msg, 2);
+				out = out.byteLength ? 拼接字节数据(out, framed) : framed;
+			}
+			return out;
+		} catch (err) {
+			lastErr = err;
+			log(`[UDP forwarding] DoH via ${dohUrl} failed: ${err?.message || err}`);
+		}
 	}
-	return out;
+	throw lastErr || new Error('all DoH endpoints failed');
 }
 
 // Fallback tunneled-DNS path: one DNS-over-TCP round trip (legacy behavior) if DoH is unreachable.
@@ -5679,12 +5708,14 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 			body: query,
 		}, DOH_LOOKUP_TIMEOUT_MS);
 		if (!response.ok) {
+			try { response.body?.cancel() } catch (e) { }
 			console.warn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
 			return [];
 		}
 
 
 		const buf = new Uint8Array(await response.arrayBuffer());
+		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
@@ -7514,6 +7545,15 @@ function getDownlinkBackpressureHwm(env) {
 	const configured = Number(env?.DOWNLINK_BACKPRESSURE_HWM_BYTES);
 	if (!Number.isFinite(configured) || configured <= 0) return 下行背压高水位字节;
 	return Math.max(64 * 1024, Math.min(8 * 1024 * 1024, Math.round(configured)));
+}
+
+// Downstream "grain" flush size, env-overridable for per-network benchmarking. Bigger = fewer, larger
+// downstream flushes (better sustained download throughput); smaller = lower latency for tiny responses.
+// Default (ENGINE_DEFAULTS.DOWNLINK_GRAIN_PACKET_BYTES) unchanged when unset; clamped [4KB, 1MB].
+function getDownlinkGrainBytes(env) {
+	const configured = Number(env?.DOWNLINK_GRAIN_PACKET_BYTES);
+	if (!Number.isFinite(configured) || configured <= 0) return 下行Grain包字节;
+	return Math.max(4 * 1024, Math.min(1024 * 1024, Math.round(configured)));
 }
 
 function getDialStaggerMs(env) {

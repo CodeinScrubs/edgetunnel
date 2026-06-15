@@ -27,8 +27,10 @@ export const USER_CONFIG = {
 	SUBNAME: undefined,
 	SUB_UPDATE_TIME: undefined,
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
+	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
+	DOH_URL_FALLBACK: undefined,
 };
 
 // Advanced engine defaults. Keep these behavior-preserving unless benchmark data says otherwise.
