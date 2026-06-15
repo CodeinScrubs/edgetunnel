@@ -136,13 +136,19 @@ export default {
 		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
 		workerRequestContext.tunnel = await createTunnelContext(request, env);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || 'unknown-ip';
+		let 期望隧道路径 = String(env.PATH || '/').trim().toLowerCase();
+		if (期望隧道路径 && !期望隧道路径.startsWith('/')) 期望隧道路径 = '/' + 期望隧道路径;
+		// Tunnel path gate: when a non-root PATH is set, only requests under that path may enter the
+		// WS/gRPC/XHTTP tunnel parser; random scanners hitting other paths get the camouflage page
+		// instead (less wasted CPU, better stealth). PATH="/" (the default) disables the gate.
+		const 隧道路径匹配 = !期望隧道路径 || 期望隧道路径 === '/' || ('/' + 访问路径) === 期望隧道路径 || ('/' + 访问路径).startsWith(期望隧道路径 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
 			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-		} else if (管理员密码 && upgradeHeader === 'websocket') {
+		} else if (管理员密码 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url);
-		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {
+		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding');
@@ -2117,6 +2123,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const proxyGlobalEnabled = tunnelContext.globalProxyEnabled;
 	const socksWhitelist = Array.isArray(tunnelContext.socksWhitelist) ? tunnelContext.socksWhitelist : DEFAULT_SOCKS5_WHITELIST;
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
+	const 首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
@@ -2319,7 +2326,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();
-			});
+			}, 首字节超时毫秒);
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -2780,14 +2787,14 @@ function 创建下行Grain发送器(webSocket, headerData = null) {
 	};
 }
 
-function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc) {
-	return connectStreams(remoteSocket, webSocket, headerData, retryFunc).catch(error => {
+function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0) {
+	return connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs).catch(error => {
 		log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
 		closeSocketQuietly(webSocket);
 	});
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
@@ -2796,6 +2803,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 
 	try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
 	catch (e) { reader = remoteSocket.readable.getReader() }
+
+	// Optional first-byte timeout: if the remote connects but sends nothing within the window, cancel
+	// the read so the no-data fallback (retryFunc) can try the ProxyIP relay instead of hanging on a
+	// blackholed direct connection. Disabled unless FIRST_BYTE_TIMEOUT_MS is set.
+	let 首字节计时器 = null;
+	if (firstByteTimeoutMs > 0 && retryFunc) {
+		首字节计时器 = setTimeout(() => { if (!hasData) { try { reader.cancel() } catch (e) { } } }, firstByteTimeoutMs);
+	}
 
 	try {
 		if (!useBYOB) {
@@ -2826,6 +2841,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 		await 下行发送器.flush();
 	} catch (err) { readError = err }
 	finally {
+		if (首字节计时器) { try { clearTimeout(首字节计时器) } catch (e) { } }
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
@@ -6950,7 +6966,9 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 				}
 
 				if (!decodeSuccess) {
-					text = await response.text();
+					// The body was already consumed by arrayBuffer() above, so re-reading via
+					// response.text() would throw. Best-effort decode from the buffer we already have.
+					text = new TextDecoder('utf-8').decode(buffer);
 				}
 
 				if (!text || text.trim().length === 0) {
@@ -7237,7 +7255,9 @@ async function createTunnelContext(request, env = {}) {
 	const proxyIPList = await getProxyIPList(env);
 	if (proxyIPList.length) {
 		tunnelContext.proxyIP = proxyIPList[Math.floor(Math.random() * proxyIPList.length)];
-		tunnelContext.proxyFallbackEnabled = false;
+		// A custom PROXYIP normally disables auto-fallback (deliberate). PROXYIP_FALLBACK=1 keeps it on
+		// so a dead custom ProxyIP can still fall back to the per-colo community relay.
+		tunnelContext.proxyFallbackEnabled = isEnabledEnvFlag(env?.PROXYIP_FALLBACK);
 	} else {
 		const colo = String(request?.cf?.colo || 'www').toLowerCase();
 		tunnelContext.proxyIP = `${colo}.PrOxYIp.CmLiUsSsS.nEt`.toLowerCase();
