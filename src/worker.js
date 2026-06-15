@@ -2494,6 +2494,11 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	let bundleBuffer = null;
 	let idleResolvers = [];
 	let activeCompletions = null;
+	// True once any chunk has been successfully written to the remote. After that a reconnect
+	// retry is unsafe: 重试连接 reconnects and replays only the original first packet, so retrying
+	// once data has already flowed would desync the upstream stream. Mirrors the download path's
+	// `!hasData` retry gate (see pipeRemoteToClient).
+	let 已交付远端字节 = false;
 
 	const settleCompletions = (completions, err = null) => {
 		if (!completions) return;
@@ -2597,12 +2602,13 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						await writer.write(item.chunk);
 					} catch (err) {
 						释放写入器?.();
-						if (!item.allowRetry || typeof 重试连接 !== 'function') throw err;
+						if (!item.allowRetry || 已交付远端字节 || typeof 重试连接 !== 'function') throw err;
 						await 重试连接();
 						writer = 获取写入器();
 						if (!writer) throw err;
 						await writer.write(item.chunk);
 					}
+					已交付远端字节 = true;
 					settleCompletions(completions);
 				} catch (err) {
 					settleCompletions(completions, err);
