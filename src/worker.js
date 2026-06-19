@@ -1,5 +1,4 @@
 import { ENGINE_DEFAULTS, applyUserConfigDefaults } from './core/config.js';
-
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
@@ -176,8 +175,7 @@ function decoyResponse(upstream, decoyOrigin = '', workerOrigin = '') {
 export default {
 	async fetch(request, env, ctx) {
 		// Top-level guard: never let an uncaught exception become a Cloudflare 1101 ("Worker threw an
-		// exception"). A malformed URL from a scanner, a parser edge case, etc. now return a benign
-		// page instead of 1101. Enable DEBUG=1 + `wrangler tail` to see the actual error.
+		// exception"). On any unexpected error we serve the nginx camouflage page instead of throwing.
 		try {
 		env = applyUserConfigDefaults(env);
 		const workerRequestContext = { env, ctx, tunnel: null };
@@ -669,8 +667,11 @@ export default {
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		} catch (顶层错误) {
 			try { log(`[fetch] Uncaught error: ${顶层错误?.message || 顶层错误}`); } catch (e) { }
-			try { return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } }); } catch (e) { }
-			return new Response('Bad Gateway', { status: 502, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+			try {
+				return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+			} catch (e) {
+				return new Response('<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n<style>html { color-scheme: light dark; } body { width: 35em; margin: 0 auto;\nfont-family: Tahoma, Verdana, Arial, sans-serif; }</style>\n</head>\n<body>\n<h1>Welcome to nginx!</h1>\n<p>If you see this page, the nginx web server is successfully installed and\nworking. Further configuration is required.</p>\n\n<p>For online documentation and support please refer to\n<a href="http://nginx.org/">nginx.org</a>.<br/>\nCommercial support is available at\n<a href="http://nginx.com/">nginx.com</a>.</p>\n\n<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>', { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+			}
 		}
 	}
 	// No scheduled()/cron handler: automated background ProxyIP scanning rapidly probes many
@@ -850,141 +851,6 @@ function 有效数据长度(data) {
 	return 0;
 }
 
-function 追加首包缓冲(buffer, chunk) {
-	const 当前 = 数据转Uint8Array(buffer);
-	const 新块 = 数据转Uint8Array(chunk);
-	if (!当前.byteLength) {
-		if (新块.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES) throw new Error('first packet is too large');
-		return 新块;
-	}
-	if (当前.byteLength + 新块.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES) throw new Error('first packet is too large');
-	return 拼接字节数据(当前, 新块);
-}
-
-// Shared module-level state for the incremental first-packet parsers, the UUID matcher, and the
-// Shadowsocks key/codec helpers. These were originally grouped with the legacy 解析魏烈思请求/解析木马请求
-// parsers; they are kept here after those dead parsers were removed, since 获取UUID字节, the increment
-// parsers, and the SS AEAD path still depend on them.
-const UUID字节缓存 = new Map();
-const VLESS文本解码器 = new TextDecoder();
-const SS主密钥缓存 = new Map();
-const SS文本解码器 = new TextDecoder();
-const SS文本编码器 = new TextEncoder();
-
-function 尝试解析魏烈思首包增量(data, token) {
-	const length = data.byteLength;
-	if (length < 18) return { 状态: 'need_more' };
-	if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
-
-	const optLen = data[17];
-	const cmdIndex = 18 + optLen;
-	if (length < cmdIndex + 1) return { 状态: 'need_more' };
-
-	const cmd = data[cmdIndex];
-	if (cmd !== 1 && cmd !== 2) return { 状态: 'invalid' };
-
-	const portIndex = cmdIndex + 1;
-	if (length < portIndex + 3) return { 状态: 'need_more' };
-
-	const port = (data[portIndex] << 8) | data[portIndex + 1];
-	const addressType = data[portIndex + 2];
-	const addressIndex = portIndex + 3;
-	let headerLen = -1, hostname = '';
-	if (addressType === 1) {
-		if (length < addressIndex + 4) return { 状态: 'need_more' };
-		hostname = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
-		headerLen = addressIndex + 4;
-	} else if (addressType === 2) {
-		if (length < addressIndex + 1) return { 状态: 'need_more' };
-		const domainLen = data[addressIndex];
-		if (length < addressIndex + 1 + domainLen) return { 状态: 'need_more' };
-		hostname = VLESS文本解码器.decode(data.subarray(addressIndex + 1, addressIndex + 1 + domainLen));
-		headerLen = addressIndex + 1 + domainLen;
-	} else if (addressType === 3) {
-		if (length < addressIndex + 16) return { 状态: 'need_more' };
-		const ipv6 = [];
-		for (let i = 0; i < 8; i++) {
-			const base = addressIndex + i * 2;
-			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-		}
-		hostname = ipv6.join(':');
-		headerLen = addressIndex + 16;
-	} else return { 状态: 'invalid' };
-
-	if (!hostname) return { 状态: 'invalid' };
-	return {
-		状态: 'ok',
-		结果: {
-			协议: 'vless',
-			hostname,
-			port,
-			isUDP: cmd === 2,
-			rawData: data.subarray(headerLen),
-			respHeader: new Uint8Array([data[0], 0]),
-		}
-	};
-}
-
-function 尝试解析木马首包增量(data, token) {
-	const length = data.byteLength;
-	if (length < 58) return { 状态: 'need_more' };
-	if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
-	const 密码哈希字节 = new TextEncoder().encode(sha224(token));
-	for (let i = 0; i < 56; i++) if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
-
-	const socksStart = 58;
-	if (length < socksStart + 2) return { 状态: 'need_more' };
-	const cmd = data[socksStart];
-	if (cmd !== 1 && cmd !== 3) return { 状态: 'invalid' };
-	const atype = data[socksStart + 1];
-	let cursor = socksStart + 2, hostname = '';
-	if (atype === 1) {
-		if (length < cursor + 4) return { 状态: 'need_more' };
-		hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
-		cursor += 4;
-	} else if (atype === 3) {
-		if (length < cursor + 1) return { 状态: 'need_more' };
-		const domainLen = data[cursor];
-		if (length < cursor + 1 + domainLen) return { 状态: 'need_more' };
-		hostname = VLESS文本解码器.decode(data.subarray(cursor + 1, cursor + 1 + domainLen));
-		cursor += 1 + domainLen;
-	} else if (atype === 4) {
-		if (length < cursor + 16) return { 状态: 'need_more' };
-		const ipv6 = [];
-		for (let i = 0; i < 8; i++) {
-			const base = cursor + i * 2;
-			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-		}
-		hostname = ipv6.join(':');
-		cursor += 16;
-	} else return { 状态: 'invalid' };
-
-	if (!hostname) return { 状态: 'invalid' };
-	if (length < cursor + 4) return { 状态: 'need_more' };
-	const port = (data[cursor] << 8) | data[cursor + 1];
-	if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { 状态: 'invalid' };
-	return {
-		状态: 'ok',
-		结果: {
-			协议: 'trojan',
-			hostname,
-			port,
-			isUDP: cmd === 3,
-			rawData: data.subarray(cursor + 4),
-			respHeader: null,
-		}
-	};
-}
-
-function 尝试解析入站首包(data, token) {
-	const 木马结果 = 尝试解析木马首包增量(data, token);
-	if (木马结果.状态 === 'ok') return 木马结果;
-	const 魏烈思结果 = 尝试解析魏烈思首包增量(data, token);
-	if (魏烈思结果.状态 === 'ok') return 魏烈思结果;
-	if (木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid') return { 状态: 'invalid' };
-	return { 状态: 'need_more' };
-}
-
 async function 读取XHTTP首包(reader, token) {
 	const decoder = VLESS文本解码器;
 
@@ -1152,8 +1018,6 @@ async function 处理gRPC请求(request, yourUUID) {
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
-	let 首包缓冲 = new Uint8Array(0);
-	let VLESS_DNS缓存 = new Uint8Array(0);
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
@@ -1304,16 +1168,6 @@ async function 处理gRPC请求(request, yourUUID) {
 				return 上行写入队列.写入并等待(payload, allowRetry);
 			};
 
-			const 转发VLESS_DNS数据 = async (payload) => {
-				const chunk = 数据转Uint8Array(payload);
-				if (!chunk.byteLength && !VLESS_DNS缓存.byteLength) return;
-				const combined = VLESS_DNS缓存.byteLength ? 拼接字节数据(VLESS_DNS缓存, chunk) : chunk;
-				const parsed = 分离完整DNS_TCP帧(combined);
-				VLESS_DNS缓存 = parsed.pending;
-				if (!parsed.complete.byteLength) return;
-				await forwardataudp(parsed.complete, grpcBridge, null, request);
-			};
-
 			try {
 				let pending = new Uint8Array(0);
 				while (true) {
@@ -1326,38 +1180,43 @@ async function 处理gRPC请求(request, yourUUID) {
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await 转发VLESS_DNS数据(payload);
+							else await forwardataudp(payload, grpcBridge, null, request);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
-							首包缓冲 = 追加首包缓冲(首包缓冲, payload);
-							const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
-							if (首包结果.状态 === 'need_more') continue;
-							if (首包结果.状态 !== 'ok') throw new Error('Invalid first packet');
-							首包缓冲 = new Uint8Array(0);
-							const { 协议, port, hostname, rawData, respHeader, isUDP } = 首包结果.结果;
-							判断是否是木马 = 协议 === 'trojan';
+							const 首包bytes = 数据转Uint8Array(payload);
+							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
 							if (判断是否是木马) {
+								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
+								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
+								const { port, hostname, rawClientData, isUDP } = 解析结果;
 								log(`[gRPC] Trojan first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
 								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
 									isDnsQuery = true;
-									if (有效数据长度(rawData) > 0) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
+									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
 								} else {
-									await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
+									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 								}
 							} else {
+								判断是否是木马 = false;
+								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
+								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid VLESS request');
+								const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 								log(`[gRPC] VLESS first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
 								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
 									if (port !== 53) throw new Error('UDP is not supported');
 									isDnsQuery = true;
 								}
+								const respHeader = new Uint8Array([version, 0]);
 								grpcBridge.send(respHeader);
+								const rawData = rawClientData;
 								if (isDnsQuery) {
-									if (有效数据长度(rawData) > 0) await 转发VLESS_DNS数据(rawData);
+									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
+									else await forwardataudp(rawData, grpcBridge, null, request);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
@@ -1448,8 +1307,6 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
-	let 首包缓冲 = new Uint8Array(0);
-	let VLESS_DNS缓存 = new Uint8Array(0), VLESS_DNS响应头 = null;
 	let ss上下文 = null, ss初始化任务 = null;
 
 	const 释放远端写入器 = () => {
@@ -1485,19 +1342,6 @@ async function 处理WS请求(request, yourUUID, url) {
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
 		return 上行写入队列.写入并等待(chunk, allowRetry);
-	};
-
-	const 转发VLESS_DNS数据 = async (payload, respHeader = null) => {
-		if (respHeader && !VLESS_DNS响应头) VLESS_DNS响应头 = respHeader;
-		const chunk = 数据转Uint8Array(payload);
-		if (!chunk.byteLength && !VLESS_DNS缓存.byteLength) return;
-		const combined = VLESS_DNS缓存.byteLength ? 拼接字节数据(VLESS_DNS缓存, chunk) : chunk;
-		const parsed = 分离完整DNS_TCP帧(combined);
-		VLESS_DNS缓存 = parsed.pending;
-		if (!parsed.complete.byteLength) return;
-		const header = VLESS_DNS响应头;
-		VLESS_DNS响应头 = null;
-		await forwardataudp(parsed.complete, serverSock, header, request);
 	};
 
 	const 获取SS上下文 = async () => {
@@ -1665,7 +1509,6 @@ async function 处理WS请求(request, yourUUID, url) {
 					入站解密器,
 					回包Socket,
 					首包已建立: false,
-					首包缓冲: new Uint8Array(0),
 					目标主机: '',
 					目标端口: 0,
 				};
@@ -1702,25 +1545,24 @@ async function 处理WS请求(request, yourUUID, url) {
 				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
 				continue;
 			}
-			上下文.首包缓冲 = 追加首包缓冲(上下文.首包缓冲, 明文块);
-			const 明文数据 = 上下文.首包缓冲;
-			if (明文数据.byteLength < 3) continue;
+			const 明文数据 = 数据转Uint8Array(明文块);
+			if (明文数据.byteLength < 3) throw new Error('invalid ss data');
 			const addressType = 明文数据[0];
 			let cursor = 1;
 			let hostname = '';
 			if (addressType === 1) {
-				if (明文数据.byteLength < cursor + 4 + 2) continue;
+				if (明文数据.byteLength < cursor + 4 + 2) throw new Error('invalid ss ipv4 length');
 				hostname = `${明文数据[cursor]}.${明文数据[cursor + 1]}.${明文数据[cursor + 2]}.${明文数据[cursor + 3]}`;
 				cursor += 4;
 			} else if (addressType === 3) {
-				if (明文数据.byteLength < cursor + 1) continue;
+				if (明文数据.byteLength < cursor + 1) throw new Error('invalid ss domain length');
 				const domainLength = 明文数据[cursor];
 				cursor += 1;
-				if (明文数据.byteLength < cursor + domainLength + 2) continue;
+				if (明文数据.byteLength < cursor + domainLength + 2) throw new Error('invalid ss domain data');
 				hostname = SS文本解码器.decode(明文数据.subarray(cursor, cursor + domainLength));
 				cursor += domainLength;
 			} else if (addressType === 4) {
-				if (明文数据.byteLength < cursor + 16 + 2) continue;
+				if (明文数据.byteLength < cursor + 16 + 2) throw new Error('invalid ss ipv6 length');
 				const ipv6 = [];
 				const ipv6View = new DataView(明文数据.buffer, 明文数据.byteOffset + cursor, 16);
 				for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
@@ -1737,7 +1579,6 @@ async function 处理WS请求(request, yourUUID, url) {
 			上下文.首包已建立 = true;
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
-			上下文.首包缓冲 = new Uint8Array(0);
 			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
 		}
 	};
@@ -1749,7 +1590,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await 转发VLESS_DNS数据(chunk);
+			return await forwardataudp(chunk, serverSock, null, request);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -1760,11 +1601,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null) {
 			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
 			else {
-				首包缓冲 = 追加首包缓冲(首包缓冲, chunk);
-				const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
-				if (首包结果.状态 === 'need_more') return;
-				if (首包结果.状态 !== 'ok') throw new Error('Invalid first packet');
-				判断协议类型 = 首包结果.结果.协议;
+				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
+				const bytes = 当前块字节;
+				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? 'trojan' : 'vless';
 			}
 			判断是否是木马 = 判断协议类型 === 'trojan';
 			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
@@ -1776,31 +1615,33 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		if (await 写入远端(chunk)) return;
 		if (判断协议类型 === 'trojan') {
-			const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
-			if (首包结果.状态 !== 'ok') throw new Error('Invalid Trojan request');
-			首包缓冲 = new Uint8Array(0);
-			const { port, hostname, rawData, isUDP } = 首包结果.结果;
+			const 解析结果 = 解析木马请求(chunk, yourUUID);
+			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
+			const { port, hostname, rawClientData, isUDP } = 解析结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			if (isUDP) {
 				isDnsQuery = true;
-				if (有效数据长度(rawData) > 0) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
+				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, yourUUID, request);
+			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request);
 		} else {
 			判断是否是木马 = false;
-			const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
-			if (首包结果.状态 !== 'ok') throw new Error('Invalid VLESS request');
-			首包缓冲 = new Uint8Array(0);
-			const { port, hostname, isUDP, rawData, respHeader } = 首包结果.结果;
+			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
+			const bytes = 当前块字节;
+			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
+			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid VLESS request');
+			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			if (isUDP) {
 				if (port === 53) isDnsQuery = true;
 				else throw new Error('UDP is not supported');
 			}
+			const respHeader = new Uint8Array([version, 0]);
+			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return 转发VLESS_DNS数据(rawData, respHeader);
+				return forwardataudp(rawData, serverSock, respHeader, request);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request);
 		}
@@ -1888,6 +1729,75 @@ async function 处理WS请求(request, yourUUID, url) {
 
 const 木马文本解码器 = new TextDecoder();
 
+function 解析木马请求(buffer, passwordPlainText) {
+	const data = 数据转Uint8Array(buffer);
+	if (data.byteLength < 58) return { hasError: true, message: "invalid data" };
+	let crLfIndex = 56;
+	if (data[crLfIndex] !== 0x0d || data[crLfIndex + 1] !== 0x0a) return { hasError: true, message: "invalid header format" };
+	const sha224Password = sha224(passwordPlainText);
+	for (let i = 0; i < crLfIndex; i++) {
+		if (data[i] !== sha224Password.charCodeAt(i)) return { hasError: true, message: "invalid password" };
+	}
+
+	const socks5Index = crLfIndex + 2;
+	if (data.byteLength < socks5Index + 6) return { hasError: true, message: "invalid S5 request data" };
+
+	const cmd = data[socks5Index];
+	if (cmd !== 1 && cmd !== 3) return { hasError: true, message: "unsupported command, only TCP/UDP is allowed" };
+	const isUDP = cmd === 3;
+
+	const atype = data[socks5Index + 1];
+	let addressLength = 0;
+	let addressIndex = socks5Index + 2;
+	let address = "";
+	switch (atype) {
+		case 1: // IPv4
+			addressLength = 4;
+			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
+			address = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
+			break;
+		case 3: // Domain
+			if (data.byteLength < addressIndex + 1) return { hasError: true, message: "invalid S5 request data" };
+			addressLength = data[addressIndex];
+			addressIndex += 1;
+			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
+			address = 木马文本解码器.decode(data.subarray(addressIndex, addressIndex + addressLength));
+			break;
+		case 4: // IPv6
+			addressLength = 16;
+			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
+			const ipv6 = [];
+			for (let i = 0; i < 8; i++) {
+				const partIndex = addressIndex + i * 2;
+				ipv6.push(((data[partIndex] << 8) | data[partIndex + 1]).toString(16));
+			}
+			address = ipv6.join(":");
+			break;
+		default:
+			return { hasError: true, message: `invalid addressType is ${atype}` };
+	}
+
+	if (!address) {
+		return { hasError: true, message: `address is empty, addressType is ${atype}` };
+	}
+
+	const portIndex = addressIndex + addressLength;
+	if (data.byteLength < portIndex + 4) return { hasError: true, message: "invalid S5 request data" };
+	const portRemote = (data[portIndex] << 8) | data[portIndex + 1];
+
+	return {
+		hasError: false,
+		addressType: atype,
+		port: portRemote,
+		hostname: address,
+		isUDP,
+		rawClientData: data.subarray(portIndex + 4)
+	};
+}
+
+const UUID字节缓存 = new Map();
+const VLESS文本解码器 = new TextDecoder();
+
 function 读取十六进制半字节(code) {
 	if (code >= 48 && code <= 57) return code - 48;
 	code |= 32;
@@ -1924,6 +1834,65 @@ function UUID字节匹配(data, offset, uuid) {
 	}
 	return true;
 }
+
+function 解析魏烈思请求(chunk, token) {
+	const data = 数据转Uint8Array(chunk);
+	const length = data.byteLength;
+	if (length < 24) return { hasError: true, message: 'Invalid data' };
+	const version = data[0];
+	if (!UUID字节匹配(data, 1, token)) return { hasError: true, message: 'Invalid uuid' };
+
+	const optLen = data[17];
+	const cmdIndex = 18 + optLen;
+	if (length < cmdIndex + 4) return { hasError: true, message: 'Invalid data' };
+
+	const cmd = data[cmdIndex];
+	let isUDP = false;
+	if (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: 'Invalid command' } }
+
+	const portIdx = cmdIndex + 1;
+	const port = (data[portIdx] << 8) | data[portIdx + 1];
+	let addrValIdx = portIdx + 3, addrLen = 0, hostname = '';
+	const addressType = data[portIdx + 2];
+	switch (addressType) {
+		case 1:
+			addrLen = 4;
+			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv4 address length' };
+			hostname = `${data[addrValIdx]}.${data[addrValIdx + 1]}.${data[addrValIdx + 2]}.${data[addrValIdx + 3]}`;
+			break;
+		case 2:
+			if (length < addrValIdx + 1) return { hasError: true, message: 'Invalid domain length' };
+			addrLen = data[addrValIdx];
+			addrValIdx += 1;
+			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid domain data' };
+			hostname = VLESS文本解码器.decode(data.subarray(addrValIdx, addrValIdx + addrLen));
+			break;
+		case 3:
+			addrLen = 16;
+			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv6 address length' };
+			const ipv6 = [];
+			for (let i = 0; i < 8; i++) {
+				const base = addrValIdx + i * 2;
+				ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+			}
+			hostname = ipv6.join(':');
+			break;
+		default:
+			return { hasError: true, message: `Invalid address type: ${addressType}` };
+	}
+	if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+	const rawIndex = addrValIdx + addrLen;
+	return { hasError: false, addressType, port, hostname, isUDP, rawClientData: data.subarray(rawIndex), version };
+}
+
+const SS支持加密配置 = {
+	'aes-128-gcm': { method: 'aes-128-gcm', keyLen: 16, saltLen: 16, maxChunk: 0x3fff, aesLength: 128 },
+	'aes-256-gcm': { method: 'aes-256-gcm', keyLen: 32, saltLen: 32, maxChunk: 0x3fff, aesLength: 256 },
+};
+
+const SSAEAD标签长度 = 16, SSNonce长度 = 12;
+const SS子密钥信息 = new TextEncoder().encode('ss-subkey');
+const SS文本编码器 = new TextEncoder(), SS文本解码器 = new TextDecoder(), SS主密钥缓存 = new Map();
 
 function 数据转Uint8Array(data) {
 	if (data instanceof Uint8Array) return data;
@@ -2275,7 +2244,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	async function 写入首包(remoteSock, data) {
 		if (有效数据长度(data) <= 0) return;
 		const writer = remoteSock.writable.getWriter();
-		try { await writeWithOperationTimeout(writer, 数据转Uint8Array(data), 连接超时毫秒, 'Initial data write timed out') }
+		try { await writer.write(数据转Uint8Array(data)) }
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
@@ -2402,7 +2371,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await turnConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
-					try { await writeWithOperationTimeout(writer, 数据转Uint8Array(本次首包数据), 连接超时毫秒, 'TURN initial data write timed out') }
+					try { await writer.write(数据转Uint8Array(本次首包数据)) }
 					finally { try { writer.releaseLock() } catch (e) { } }
 				}
 			} else if (proxyType === 'sstp') {
@@ -2410,7 +2379,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await sstpConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
-					try { await writeWithOperationTimeout(writer, 数据转Uint8Array(本次首包数据), 连接超时毫秒, 'SSTP initial data write timed out') }
+					try { await writer.write(数据转Uint8Array(本次首包数据)) }
 					finally { try { writer.releaseLock() } catch (e) { } }
 				}
 			} else {
@@ -2530,27 +2499,17 @@ async function readMultipleDnsTcpFrames(tcpSocket, count, timeoutMs) {
 }
 
 // Split a buffer of length-prefixed (DNS-over-TCP) frames into the raw DNS messages.
-function 分离完整DNS_TCP帧(data) {
-	const bytes = 数据转Uint8Array(data);
+function 解析DNS_TCP帧(data) {
 	const frames = [];
 	let cursor = 0;
-	while (cursor + 2 <= bytes.byteLength) {
-		const len = (bytes[cursor] << 8) | bytes[cursor + 1];
+	while (cursor + 2 <= data.byteLength) {
+		const len = (data[cursor] << 8) | data[cursor + 1];
 		const start = cursor + 2, end = start + len;
-		if (len <= 0) throw new Error('DNS TCP query frame has invalid length');
-		if (end > bytes.byteLength) break;
-		frames.push(bytes.subarray(cursor, end));
+		if (len <= 0 || end > data.byteLength) break;
+		frames.push(data.subarray(start, end));
 		cursor = end;
 	}
-	return {
-		frames,
-		complete: frames.length ? 拼接字节数据(...frames) : new Uint8Array(0),
-		pending: bytes.subarray(cursor),
-	};
-}
-
-function 解析DNS_TCP帧(data) {
-	return 分离完整DNS_TCP帧(data).frames.map(frame => frame.subarray(2));
+	return frames;
 }
 
 // Primary tunneled-DNS path: forward each length-prefixed query over DoH (RFC 8484
@@ -6945,10 +6904,6 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 
 	if (env.PATH) config_JSON.PATH = env.PATH.startsWith('/') ? env.PATH : '/' + env.PATH;
 	else if (!config_JSON.PATH) config_JSON.PATH = '/';
-	// A custom PATH turns on the tunnel path-gate (which requires a fixed path prefix). Random path
-	// would prepend random segments (/rand/.../mypath) that the gate rejects, breaking connections.
-	// So when a non-root PATH is set, force random path off — the two features are mutually exclusive.
-	if (config_JSON.随机路径 && config_JSON.PATH && config_JSON.PATH !== '/') config_JSON.随机路径 = false;
 
 	if (!config_JSON.gRPC模式) config_JSON.gRPC模式 = 'gun';
 	if (!config_JSON.SS) config_JSON.SS = { 加密方式: "aes-128-gcm", TLS: false };
