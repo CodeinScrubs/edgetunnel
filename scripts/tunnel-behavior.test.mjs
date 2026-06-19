@@ -50,6 +50,7 @@ const {
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
 	getTransportConfig,
+	getTransportPathParamValue,
 	readConfigJson,
 	getDohLookupUrl,
 	getDnsTcpEndpoint,
@@ -63,9 +64,15 @@ const {
 	isSpeedTestSite,
 	matchesHostPattern,
 	patchSingboxSubscription,
+	patchClashSubscription,
 	patchSurgeSubscription,
 	readGrpcFrameLength,
 	expandPreferredEndpointVariants,
+	createUploadQueue,
+	normalizeConfigHost,
+	splitConfigArray,
+	base64SecretEncode,
+	base64SecretDecode,
 } = helpers;
 
 function fakeRequest({ colo = 'SJC', asn = 13335, asOrganization = 'Cloudflare' } = {}) {
@@ -141,6 +148,26 @@ function makeVlessTcpRequest(uuid, hostname = 'target.example', port = 443, rawD
 	out[offset++] = 1;
 	out[offset++] = (port >> 8) & 0xff;
 	out[offset++] = port & 0xff;
+	out[offset++] = 2;
+	out[offset++] = hostBytes.byteLength;
+	out.set(hostBytes, offset);
+	offset += hostBytes.byteLength;
+	out.set(rawData, offset);
+	return out;
+}
+
+function makeVlessUdpDnsRequest(uuid, rawData = new Uint8Array(0)) {
+	const hostname = 'dns.example';
+	const hostBytes = new TextEncoder().encode(hostname);
+	const out = new Uint8Array(1 + 16 + 1 + 1 + 2 + 1 + 1 + hostBytes.byteLength + rawData.byteLength);
+	let offset = 0;
+	out[offset++] = 0;
+	out.set(uuidBytes(uuid), offset);
+	offset += 16;
+	out[offset++] = 0;
+	out[offset++] = 2;
+	out[offset++] = 0;
+	out[offset++] = 53;
 	out[offset++] = 2;
 	out[offset++] = hostBytes.byteLength;
 	out.set(hostBytes, offset);
@@ -260,6 +287,11 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 }
 
 {
+	const serviceName = getTransportPathParamValue({ 传输协议: 'grpc', 随机路径: true, PATH: '/secret' }, '/secret?ed=2560');
+	assert.equal(serviceName, '/secret', 'gRPC serviceName must stay compatible with a configured PATH gate');
+}
+
+{
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	const baseConfig = {
 		UUID: uuid,
@@ -306,9 +338,11 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 
 	assert.equal(config.HOST, 'worker.example');
 	assert.equal(config.传输协议, 'ws');
+	assert.equal(config.ECH, false, 'fresh generated configs should keep ECH off unless explicitly enabled');
 	assert.equal(config.反代.PROXYIP, 'auto');
 	assert.equal(config.优选订阅生成.SUBNAME, 'edgetunnel');
 	assert.equal(config.LINK.includes(`vless://${uuid}@worker.example:443`), true);
+	assert.equal(config.LINK.includes('ech='), false, 'fresh generated node links should not include ECH by default');
 }
 
 {
@@ -323,6 +357,21 @@ function makeFakeKV(initialEntries = {}, options = {}) {
 	assert.equal(beta.HOST, 'beta.example');
 	assert.deepEqual(beta.HOSTS, ['beta.example']);
 	assert.equal(beta.gRPCUserAgent, 'UA-B');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const config = await readConfigJson({ KV: makeFakeKV({}), HOST: '[2606:4700::1]:443' }, 'worker.example', uuid, 'UnitTest/1.0');
+	assert.deepEqual(config.HOSTS, ['2606:4700::1'], 'HOST normalization must preserve IPv6 literals');
+	assert.equal(normalizeConfigHost('https://[2606:4700::2]:8443/path'), '2606:4700::2');
+	assert.equal(normalizeConfigHost('https://Example.COM:443/path'), 'example.com');
+}
+
+{
+	assert.deepEqual(await splitConfigArray(null), []);
+	assert.deepEqual(await splitConfigArray([' a ', 'b\nc', undefined]), ['a', 'b', 'c']);
+	assert.throws(() => base64SecretEncode('payload', ''), /Secret is empty/);
+	assert.throws(() => base64SecretDecode(btoa('payload'), ''), /Secret is empty/);
 }
 
 {
@@ -407,6 +456,36 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	let getCalls = 0, inFlightGets = 0, maxInFlightGets = 0, listCalls = 0;
+	const store = new Map();
+	for (let i = 0; i < 80; i++) {
+		const key = `log:entry:${String(9999999999999 - i).padStart(13, '0')}:id-${i}`;
+		store.set(key, JSON.stringify({ TYPE: 'Get_SUB', TIME: i, URL: `https://worker.example/${i}` }));
+	}
+	store.set('log.json', JSON.stringify([{ TYPE: 'Legacy', TIME: 1, URL: 'https://worker.example/legacy' }]));
+	const kv = {
+		async list({ prefix = '', limit = 1000 } = {}) {
+			listCalls++;
+			const names = [...store.keys()].filter(key => key.startsWith(prefix)).sort().slice(0, limit);
+			return { keys: names.map(name => ({ name })), list_complete: true };
+		},
+		async get(key) {
+			getCalls++;
+			inFlightGets++;
+			maxInFlightGets = Math.max(maxInFlightGets, inFlightGets);
+			await new Promise(resolve => setTimeout(resolve, 2));
+			inFlightGets--;
+			return store.get(key) || null;
+		},
+	};
+	const logs = await readRequestLogs({ KV: kv }, { limit: 100 });
+	assert.equal(listCalls, 1);
+	assert.equal(getCalls <= 34, true, 'admin log reads should leave room for list/subrequests under the Worker free-plan cap');
+	assert.equal(maxInFlightGets <= 4, true, 'admin log reads should not fan out all KV gets concurrently');
+	assert.equal(logs.some(log => log.TYPE === 'Legacy'), false, 'append-log reads should not fall back to stale legacy log.json after reading entry keys');
+}
+
+{
 	const kv = makeFakeKV();
 	await recordRequestLog({ KV: kv, ENABLE_KV_LOG: '1' }, { url: 'https://worker.example/sub', headers: { get: () => null } }, '203.0.113.55', 'Get_SUB', { TG: { 启用: false } }, true);
 	const logs = await readRequestLogs({ KV: kv }, { limit: 10 });
@@ -450,6 +529,62 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const body = await response.text();
 	assert.equal(body.includes('1101'), true);
 	assert.equal(body.includes('Worker threw exception'), true);
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response('origin.example', {
+		status: 200,
+		headers: {
+			'content-type': 'text/html; charset=utf-8',
+			'content-encoding': 'gzip',
+			'set-cookie': 'origin-session=leak',
+			'content-security-policy': "default-src 'self'",
+		},
+	});
+	try {
+		const response = await workerModule.default.fetch(
+			new Request('https://worker.example/camouflage', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+			{ ADMIN: 'admin-password', UUID: '11111111-1111-4111-8111-111111111111', URL: 'https://origin.example' },
+			{ waitUntil() {} }
+		);
+		assert.equal(await response.text(), 'origin.example', 'compressed camouflage responses should stream through without host rewriting');
+		assert.equal(response.headers.get('content-encoding'), 'gzip');
+		assert.equal(response.headers.has('set-cookie'), false, 'camouflage pass-through must not leak upstream cookies');
+		assert.equal(response.headers.has('content-security-policy'), false, 'camouflage pass-through must not leak upstream CSP');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response('hello origin.example', {
+		status: 200,
+		headers: {
+			'content-type': 'text/html; charset=utf-8',
+			'content-length': '20',
+			'etag': '"old-origin"',
+			'set-cookie': 'origin-session=leak',
+			'content-security-policy': "default-src 'self'",
+		},
+	});
+	try {
+		const response = await workerModule.default.fetch(
+			new Request('https://worker.example/camouflage', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+			{ ADMIN: 'admin-password', UUID: '11111111-1111-4111-8111-111111111111', URL: 'https://origin.example' },
+			{ waitUntil() {} }
+		);
+		assert.equal(await response.text(), 'hello worker.example');
+		assert.equal(response.headers.has('content-length'), false, 'rewritten camouflage body must not keep stale content-length');
+		assert.equal(response.headers.has('etag'), false, 'rewritten camouflage body must not keep stale etag');
+		assert.equal(response.headers.has('content-encoding'), false, 'rewritten camouflage body must not keep stale content-encoding');
+		assert.equal(response.headers.has('set-cookie'), false, 'rewritten camouflage body must not leak upstream cookies');
+		assert.equal(response.headers.has('content-security-policy'), false, 'rewritten camouflage body must not leak upstream CSP');
+		assert.equal(response.headers.get('cache-control'), 'no-store');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 }
 
 {
@@ -509,10 +644,34 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(expandPreferredEndpointVariants('speedtest.net'), ['speedtest.net', 'www.speedtest.net']);
 	assert.deepEqual(expandPreferredEndpointVariants('www.speedtest.net'), ['www.speedtest.net', 'speedtest.net']);
 	assert.deepEqual(expandPreferredEndpointVariants('example.com:8443#edge'), ['example.com:8443#edge', 'www.example.com:8443#edge']);
+	assert.deepEqual(expandPreferredEndpointVariants('Example.COM:8443#edge'), ['example.com:8443#edge', 'www.example.com:8443#edge']);
+	assert.deepEqual(expandPreferredEndpointVariants('WWW.Example.COM:8443#edge'), ['www.example.com:8443#edge', 'example.com:8443#edge']);
 	assert.deepEqual(expandPreferredEndpointVariants('cdn.example.com:8443#sub'), ['cdn.example.com:8443#sub']);
 	assert.deepEqual(expandPreferredEndpointVariants('104.21.105.47:443#ip'), ['104.21.105.47:443#ip']);
 	assert.deepEqual(expandPreferredEndpointVariants('[2606:4700::6811:9316]:443#ipv6'), ['[2606:4700::6811:9316]:443#ipv6']);
 	assert.deepEqual(expandPreferredEndpointVariants('*.example.com:443#wildcard'), ['*.example.com:443#wildcard']);
+}
+
+{
+	let writerCalls = 0;
+	const writes = [];
+	const queue = createUploadQueue({
+		获取写入器: () => {
+			writerCalls++;
+			return {
+				async write(chunk) {
+					writes.push(new Uint8Array(chunk));
+				},
+			};
+		},
+		释放写入器() {},
+		关闭连接() {},
+		名称: 'unit upload',
+	});
+	assert.equal(queue.写入(new Uint8Array([1, 2, 3])), true);
+	await queue.等待空();
+	assert.equal(writerCalls, 1, 'upload queue should acquire the writer only when drain writes');
+	assert.deepEqual(writes, [new Uint8Array([1, 2, 3])]);
 }
 
 {
@@ -711,6 +870,8 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 {
 	const first = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { PROXYIP: 'first.example.com' });
 	const second = await createTunnelContext(fakeRequest({ colo: 'AMS' }), { PROXYIP: 'second.example.com' });
+	const auto = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { PROXYIP: 'auto' });
+	const forced = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { FORCE_PROXY_HOSTS: 'xpanel.a6w.ir,*.panel.a6w.ir' });
 
 	await applyProxyParamsToTunnelContext(new URL('https://worker.example.com/proxyip=clean.example.com/ws'), '00000000-0000-4000-8000-000000000000', first);
 	await applyProxyParamsToTunnelContext(new URL('https://worker.example.com/socks5=user:pass@socks.example.com:1080/ws?globalproxy=1'), '00000000-0000-4000-8000-000000000000', second);
@@ -722,6 +883,210 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.equal(second.proxyType, 'socks5');
 	assert.equal(second.globalProxyEnabled, true);
 	assert.equal(second.parsedProxyAddress.hostname, 'socks.example.com');
+	assert.equal(auto.proxyIP, 'sjc.proxyip.cmliussss.net', 'PROXYIP=auto should use the colo auto ProxyIP, not a literal hostname');
+	assert.equal(auto.proxyFallbackEnabled, true);
+	assert.deepEqual(forced.forceProxyHosts, ['xpanel.a6w.ir', '*.panel.a6w.ir']);
+	assert.equal(matchesHostPattern('xpanel.a6w.ir', forced.forceProxyHosts[0]), true);
+	assert.equal(matchesHostPattern('api.panel.a6w.ir', forced.forceProxyHosts[1]), true);
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const tunnel = await createTunnelContext(fakeRequest({ colo: 'SJC' }), {
+		PROXYIP: '198.51.100.10:443',
+		FORCE_PROXY_HOSTS: 'xpanel.a6w.ir,*.a6w.ir',
+	});
+	const connectCalls = [];
+	const upstreamWrites = [];
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50]));
+				controller.close();
+			},
+		}),
+		writable: new WritableStream({
+			write(chunk) {
+				upstreamWrites.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {},
+	};
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'xpanel.a6w.ir', 2087, new Uint8Array([0xaa]))));
+			controller.close();
+		},
+	});
+	const response = await handleGrpcRequest({
+		body,
+		env: {},
+		tunnel,
+		cf: {},
+		headers: { get: () => null },
+		fetcher: {
+			connect(address) {
+				connectCalls.push(address);
+				return socket;
+			},
+		},
+	}, uuid);
+	const bytes = await collectReadableStream(response.body);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+
+	assert.deepEqual(connectCalls, [{ hostname: '198.51.100.10', port: 443 }], 'forced host should dial ProxyIP instead of the target hostname');
+	assert.equal(connectCalls.some(call => call.hostname === 'xpanel.a6w.ir'), false, 'forced host must not be direct-dialed');
+	assert.deepEqual(upstreamWrites, [new Uint8Array([0xaa])]);
+	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const connectCalls = [];
+	const upstreamWrites = [];
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50]));
+				controller.close();
+			},
+		}),
+		writable: new WritableStream({
+			write(chunk) {
+				upstreamWrites.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {},
+	};
+	const firstPacket = makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]));
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(firstPacket.subarray(0, 10)));
+			controller.enqueue(encodeGrpcDataFrame(firstPacket.subarray(10)));
+			controller.close();
+		},
+	});
+	const response = await handleGrpcRequest({
+		body,
+		env: {},
+		tunnel: await createTunnelContext(fakeRequest(), { PRELOAD_RACE_DIAL: '0' }),
+		cf: {},
+		headers: { get: () => null },
+		fetcher: {
+			connect(address) {
+				connectCalls.push(address);
+				return socket;
+			},
+		},
+	}, uuid);
+	const bytes = await collectReadableStream(response.body);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+
+	assert.deepEqual(connectCalls, [{ hostname: 'target.example', port: 443 }], 'split gRPC first packet should still dial the parsed target');
+	assert.deepEqual(upstreamWrites, [new Uint8Array([0xaa])]);
+	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const originalFetch = globalThis.fetch;
+	const dohBodies = [];
+	globalThis.fetch = async (_url, init) => {
+		dohBodies.push(new Uint8Array(init.body));
+		return new Response(new Uint8Array([0xde, 0xad]), {
+			status: 200,
+			headers: { 'content-type': 'application/dns-message' },
+		});
+	};
+	try {
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(encodeGrpcDataFrame(makeVlessUdpDnsRequest(uuid)));
+				controller.enqueue(encodeGrpcDataFrame(new Uint8Array([0, 2])));
+				controller.enqueue(encodeGrpcDataFrame(new Uint8Array([0x12, 0x34])));
+				controller.close();
+			},
+		});
+		const response = await handleGrpcRequest({
+			body,
+			env: {},
+			tunnel: await createTunnelContext(fakeRequest(), {}),
+			cf: {},
+			headers: { get: () => null },
+			fetcher: { connect() { throw new Error('DNS over DoH should not open TCP'); } },
+		}, uuid);
+		const bytes = await collectReadableStream(response.body);
+		const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+
+		assert.deepEqual(dohBodies.map(body => [...body]), [[0x12, 0x34]], 'split VLESS DNS frame should be reassembled before DoH');
+		assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0, 2, 0xde, 0xad]]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const tunnel = await createTunnelContext(fakeRequest(), {
+		PROXYIP: '198.51.100.10:443',
+		PRELOAD_RACE_DIAL: '0',
+	});
+	const connectCalls = [];
+	let directClosed = false;
+	const directSocket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream(),
+		writable: new WritableStream({
+			write() {
+				return new Promise(() => {});
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			directClosed = true;
+		},
+	};
+	const proxySocket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50]));
+				controller.close();
+			},
+		}),
+		writable: new WritableStream({ write() {} }),
+		closed: new Promise(() => {}),
+		close() {},
+	};
+	const body = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]))));
+			controller.close();
+		},
+	});
+	const response = await handleGrpcRequest({
+		body,
+		env: { CONNECT_TIMEOUT_MS: '400' },
+		tunnel,
+		cf: {},
+		headers: { get: () => null },
+		fetcher: {
+			connect(address) {
+				connectCalls.push(address);
+				return connectCalls.length === 1 ? directSocket : proxySocket;
+			},
+		},
+	}, uuid);
+	const bytes = await collectReadableStream(response.body, 2_000);
+	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+
+	assert.equal(directClosed, true, 'stalled direct first-packet write should close the direct socket');
+	assert.deepEqual(connectCalls, [{ hostname: 'target.example', port: 443 }, { hostname: '198.51.100.10', port: 443 }]);
+	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
 }
 
 {
@@ -736,7 +1101,23 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	} finally {
 		console.error = originalConsoleError;
 	}
-	assert.equal(capturedErrors.length, 1, 'invalid Singbox JSON should be logged once without throwing');
+	assert.equal(capturedErrors.length, 0, 'invalid Singbox JSON should not emit ungated console.error output');
+}
+
+{
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const content = JSON.stringify({
+		outbounds: [
+			{
+				type: 'vless',
+				uuid,
+				tls: { enabled: false },
+			},
+		],
+	});
+	const result = await patchSingboxSubscription(content, { UUID: uuid, Fingerprint: 'chrome', ECH: false });
+	const parsed = JSON.parse(result);
+	assert.equal(parsed.outbounds[0].tls.enabled, true, 'Singbox hotpatch must force TLS enabled for generated nodes');
 }
 
 {
@@ -749,6 +1130,12 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		});
 		assert.equal(result.includes('#!MANAGED-CONFIG https://worker.example/sub'), true);
 	});
+}
+
+{
+	const patched = patchClashSubscription('mode: Rule\r\nproxies:\r\n  - name: node\r\n', {});
+	assert.equal(patched.includes('\r'), false, 'Clash hotpatch should normalize CRLF input to LF');
+	assert.equal(patched.includes('mode: rule\n'), true);
 }
 
 {
@@ -846,6 +1233,37 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		readyState: WebSocket.OPEN,
 		send() { events.push('send'); },
 		close() {
+			events.push('client-close');
+			this.readyState = WebSocket.CLOSED;
+		},
+	};
+	const remoteSocket = {
+		readable: new ReadableStream({
+			cancel() {
+				events.push('remote-readable-cancel');
+			},
+		}),
+		close() {
+			events.push('remote-close');
+		},
+	};
+
+	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, async () => {
+		events.push('retry-start');
+	}, 10), 250, 'first-byte fallback closes stale remote socket');
+
+	assert.equal(events.includes('remote-close'), true, 'first-byte fallback should close the stale direct socket');
+	assert.equal(events.includes('retry-start'), true, 'first-byte fallback should still run the retry callback');
+	assert.equal(events.indexOf('remote-close') < events.indexOf('retry-start'), true, 'stale direct socket should close before fallback opens a replacement');
+	assert.equal(events.includes('client-close'), false, 'first-byte fallback should not close the client bridge');
+}
+
+{
+	const events = [];
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send() { events.push('send'); },
+		close() {
 			events.push('close');
 			this.readyState = WebSocket.CLOSED;
 		},
@@ -862,6 +1280,25 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	await connectStreams(remoteSocket, webSocket, null, null);
 
 	assert.deepEqual(events, ['send', 'close'], 'normal upstream EOF after data should close the client bridge');
+}
+
+{
+	const sentLengths = [];
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send(payload) { sentLengths.push(payload.byteLength); },
+		close() { this.readyState = WebSocket.CLOSED; },
+	};
+	const remoteSocket = {
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array(4097).fill(7));
+				controller.close();
+			},
+		}),
+	};
+	await connectStreams(remoteSocket, webSocket, null, null, 0, { env: { DOWNLINK_GRAIN_PACKET_BYTES: '4096' } });
+	assert.deepEqual(sentLengths, [4096, 1], 'connectStreams should use env-tuned downlink grain size on the WS/TCP path');
 }
 
 {
@@ -917,6 +1354,51 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = () => Promise.reject(new Error('DoH disabled in test'));
+	let upstreamClosed = false;
+	const writes = [];
+	const sent = [];
+	const responseFrames = new Uint8Array([0, 1, 0xaa, 0, 2, 0xbb, 0xcc]);
+	const tcpSocket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(responseFrames.subarray(0, 4));
+				controller.enqueue(responseFrames.subarray(4));
+			},
+		}),
+		writable: new WritableStream({
+			write(chunk) {
+				writes.push(new Uint8Array(chunk));
+			},
+		}),
+		closed: new Promise(() => {}),
+		close() {
+			upstreamClosed = true;
+		},
+	};
+	const request = {
+		env: { DNS_SERVER: '1.1.1.1' },
+		fetcher: { connect: () => tcpSocket },
+	};
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send(payload) {
+			sent.push(new Uint8Array(payload));
+		},
+	};
+	try {
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 2, 0x34, 0x56]), webSocket, new Uint8Array([0, 0]), request), 100, 'DNS TCP multi-frame response');
+		assert.deepEqual(writes, [new Uint8Array([0, 1, 0x12, 0, 2, 0x34, 0x56])]);
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 1, 0xaa, 0, 2, 0xbb, 0xcc])], 'DNS TCP fallback should return one response frame per query frame');
+		assert.equal(upstreamClosed, true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
 	// DoH primary path: a length-prefixed query is POSTed as application/dns-message and the raw
 	// response is returned re-framed with a 2-byte length prefix, then delivered with the resp header.
 	const 原始fetch = globalThis.fetch;
@@ -937,6 +1419,35 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])], 'DoH response is re-framed and delivered with the resp header');
 	} finally {
 		globalThis.fetch = 原始fetch;
+	}
+}
+
+{
+	const originalFetch = globalThis.fetch;
+	let inFlight = 0, maxInFlight = 0;
+	const calls = [];
+	globalThis.fetch = async (url, init) => {
+		inFlight++;
+		maxInFlight = Math.max(maxInFlight, inFlight);
+		const body = new Uint8Array(init.body);
+		calls.push([...body]);
+		await new Promise(resolve => setTimeout(resolve, body[0] === 0x12 ? 25 : 5));
+		inFlight--;
+		return new Response(new Uint8Array([body[0], 0xee]), {
+			status: 200,
+			headers: { 'Content-Type': 'application/dns-message' },
+		});
+	};
+	const sent = [];
+	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
+	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
+	try {
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 1, 0x34]), webSocket, new Uint8Array([0, 0]), request), 200, 'DoH DNS batch forward');
+		assert.equal(maxInFlight > 1, true, 'multiple DNS query frames should be sent to DoH concurrently');
+		assert.deepEqual(calls, [[0x12], [0x34]]);
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 2, 0x12, 0xee, 0, 2, 0x34, 0xee])], 'batched DoH responses should preserve query order');
+	} finally {
+		globalThis.fetch = originalFetch;
 	}
 }
 

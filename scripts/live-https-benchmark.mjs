@@ -300,6 +300,7 @@ async function runHttpsGrpc(options) {
 		tlsSocket.on('end', () => {
 			const bytes = concatBytes(chunks);
 			const text = new TextDecoder().decode(bytes.subarray(0, 160));
+			const inner = parseInnerHttpStatus(text);
 			const totalMs = performance.now() - startedAt;
 			finish(resolve, {
 				transport: 'grpc',
@@ -309,11 +310,23 @@ async function runHttpsGrpc(options) {
 				totalMs,
 				bytes: bytes.byteLength,
 				tunnelAccepted: tunnelSocket.accepted,
-				ok: tunnelSocket.accepted && /HTTP\/1\.[01]\s+\d+/.test(text),
+				innerStatus: inner.status,
+				innerStatusText: inner.statusText,
+				ok: Boolean(tunnelSocket.accepted && isInnerHttpOk(inner.status)),
 			});
 		});
 		tlsSocket.on('error', error => finish(reject, error));
 	});
+}
+
+function parseInnerHttpStatus(text) {
+	const match = /^HTTP\/1\.[01]\s+(\d{3})(?:\s+([^\r\n]*))?/m.exec(text || '');
+	if (!match) return { status: null, statusText: '' };
+	return { status: Number(match[1]), statusText: match[2] || '' };
+}
+
+function isInnerHttpOk(status) {
+	return Number.isFinite(status) && status >= 200 && status < 500;
 }
 
 function percentile(values, p) {
@@ -321,6 +334,13 @@ function percentile(values, p) {
 	const sorted = [...values].sort((a, b) => a - b);
 	const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
 	return sorted[index];
+}
+
+function roundedSpread(values) {
+	if (values.length < 2) return null;
+	const p50 = percentile(values, 50);
+	const p95 = percentile(values, 95);
+	return Number.isFinite(p50) && Number.isFinite(p95) ? Math.max(0, Math.round(p95 - p50)) : null;
 }
 
 function summarize(results) {
@@ -338,10 +358,13 @@ function summarize(results) {
 		successRate: results.length ? successful.length / results.length : 0,
 		tlsP50Ms: tlsValues.length ? Math.round(percentile(tlsValues, 50)) : null,
 		tlsP95Ms: tlsValues.length ? Math.round(percentile(tlsValues, 95)) : null,
+		tlsJitterMs: roundedSpread(tlsValues),
 		firstByteP50Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 50)) : null,
 		firstByteP95Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 95)) : null,
+		firstByteJitterMs: roundedSpread(firstByteValues),
 		totalP50Ms: totalValues.length ? Math.round(percentile(totalValues, 50)) : null,
 		totalP95Ms: totalValues.length ? Math.round(percentile(totalValues, 95)) : null,
+		totalJitterMs: roundedSpread(totalValues),
 		bytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + result.bytes, 0) / successful.length) : 0,
 	};
 }

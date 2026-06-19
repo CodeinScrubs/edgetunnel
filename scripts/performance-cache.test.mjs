@@ -20,6 +20,8 @@ const {
 	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS,
 	DoH查询,
 	MD5MD5,
+	md5Bytes,
+	deriveShadowsocksMasterKey,
 	sha224,
 	parseDnsTcpFrames,
 } = await import('../_worker.js').then(mod => mod.__testPerformanceHelpers);
@@ -64,6 +66,23 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 	return response;
 }
 
+function decodeDnsQuestion(packet) {
+	const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+	const labels = [];
+	let offset = 12;
+	while (offset < packet.byteLength) {
+		const length = packet[offset++];
+		if (length === 0) break;
+		labels.push(new TextDecoder().decode(packet.subarray(offset, offset + length)));
+		offset += length;
+	}
+	return {
+		name: labels.join('.'),
+		qtype: view.getUint16(offset),
+		qclass: view.getUint16(offset + 2),
+	};
+}
+
 {
 	MD5MD5_RESULT_CACHE.clear();
 	SHA224_RESULT_CACHE.clear();
@@ -78,6 +97,14 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 	assert.equal(SHA224_RESULT_CACHE.size, 1, 'repeated Trojan sha224 inputs should use the bounded hash cache');
 	MD5MD5_RESULT_CACHE.clear();
 	SHA224_RESULT_CACHE.clear();
+}
+
+{
+	assert.equal(Buffer.from(await md5Bytes('')).toString('hex'), 'd41d8cd98f00b204e9800998ecf8427e');
+	assert.equal(Buffer.from(await md5Bytes('abc')).toString('hex'), '900150983cd24fb0d6963f7d28e17f72');
+	assert.equal(Buffer.from(await md5Bytes('message digest')).toString('hex'), 'f96b697d7cb7938d525a2f31aaf161d0');
+	assert.equal(Buffer.from(await deriveShadowsocksMasterKey('secret-password', 16)).toString('hex'), '2304d4770a72d09106045fea654c4188');
+	assert.equal(Buffer.from(await deriveShadowsocksMasterKey('secret-password', 32)).toString('hex'), '2304d4770a72d09106045fea654c4188dce7bcf613204b9c078577382dc258cb');
 }
 
 {
@@ -102,6 +129,57 @@ function makeDnsAResponse(name, ttl, ipBytes) {
 		assert.equal(third[0].rdata[0], 203, 'cached DoH answers should be cloned before returning');
 	} finally {
 		globalThis.fetch = originalFetch;
+		DNS_RESULT_CACHE.clear();
+	}
+}
+
+{
+	DNS_RESULT_CACHE.clear();
+	const originalFetch = globalThis.fetch;
+	let fetchCalls = 0;
+	globalThis.fetch = async (url, init) => {
+		fetchCalls++;
+		const body = new Uint8Array(init.body);
+		const question = decodeDnsQuestion(body);
+		assert.equal(question.name, 'default-type.example', 'DoH query should use the normalized domain name');
+		assert.equal(question.qtype, 1, 'missing DoH record type should default to A');
+		assert.equal(question.qclass, 1);
+		return new Response(makeDnsAResponse('default-type.example', 60, new Uint8Array([203, 0, 113, 8])), {
+			status: 200,
+			headers: { 'Content-Type': 'application/dns-message' },
+		});
+	};
+	try {
+		const answers = await DoH查询(' DEFAULT-TYPE.example ', null, 'https://resolver.test/dns-query');
+		assert.equal(fetchCalls, 1, 'defaulted DoH record type should still reach the resolver');
+		assert.equal(answers[0].data, '203.0.113.8');
+	} finally {
+		globalThis.fetch = originalFetch;
+		DNS_RESULT_CACHE.clear();
+	}
+}
+
+{
+	DNS_RESULT_CACHE.clear();
+	const originalFetch = globalThis.fetch;
+	const originalWarn = console.warn;
+	let fetchCalls = 0;
+	const warnings = [];
+	globalThis.fetch = async () => {
+		fetchCalls++;
+		return new Response('', { status: 503 });
+	};
+	console.warn = (...args) => warnings.push(args);
+	try {
+		const first = await DoH查询('negative-cache.example', 'A', 'https://resolver.test/dns-query');
+		const second = await DoH查询('negative-cache.example', 'A', 'https://resolver.test/dns-query');
+		assert.deepEqual(first, []);
+		assert.deepEqual(second, []);
+		assert.equal(fetchCalls, 1, 'failed DoH lookups should be briefly negative-cached');
+		assert.equal(warnings.length, 0, 'failed DoH lookups should not emit ungated console.warn output');
+	} finally {
+		globalThis.fetch = originalFetch;
+		console.warn = originalWarn;
 		DNS_RESULT_CACHE.clear();
 	}
 }

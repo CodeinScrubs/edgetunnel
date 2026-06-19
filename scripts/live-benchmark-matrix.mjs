@@ -25,6 +25,7 @@ function usage() {
 		'  --runs 10               Runs per scenario',
 		'  --out report.json       Optional JSON report path',
 		'  --dry-run               Print commands without running them',
+		'  --summary-line          Also emit compact JSON summary for wrapper scripts',
 		'',
 		'All other common live benchmark flags are forwarded: --sni, --authority, --service-name, --target, --port, --timeout, --path, --http-path, --http-method, --body-bytes, --concurrency.',
 	].join('\n'));
@@ -152,11 +153,29 @@ const ranked = [...results]
 const report = {
 	generatedAt: new Date().toISOString(),
 	dryRun,
+	profiles,
+	frontHosts: scenarioFrontHosts,
+	transports: baseArgs.transports,
+	target: baseArgs.target || null,
+	port: baseArgs.port || null,
 	scenarios: results,
 	ranked,
 };
 
 if (args.out) writeFileSync(args.out, JSON.stringify(report, null, 2));
-console.log(JSON.stringify({ type: 'matrix-summary', generatedAt: report.generatedAt, dryRun, scenarios: results.length, ranked }, null, 2));
+const summaryPayload = {
+	type: 'matrix-summary',
+	generatedAt: report.generatedAt,
+	dryRun,
+	profiles,
+	frontHosts: scenarioFrontHosts,
+	transports: baseArgs.transports,
+	target: baseArgs.target || null,
+	port: baseArgs.port || null,
+	scenarios: results.length,
+	ranked,
+};
+console.log(JSON.stringify(summaryPayload, null, 2));
+if (args['summary-line']) console.log(JSON.stringify(summaryPayload));
 
 if (results.some(result => !result.dryRun && (result.exitCode !== 0 || !result.summary))) process.exit(1);

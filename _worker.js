@@ -33,6 +33,7 @@ const USER_CONFIG = {
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
 	DOH_URL_FALLBACK: undefined,
+	FORCE_PROXY_HOSTS: undefined,
 };
 
 // Advanced engine defaults. Keep these behavior-preserving unless benchmark data says otherwise.
@@ -56,6 +57,7 @@ const ENGINE_DEFAULTS = {
 	WS_BUFFERED_AMOUNT_LIMIT_BYTES: 1 * 1024 * 1024,
 	WS_BUFFERED_AMOUNT_MAX_WAIT_MS: 1000,
 	GRPC_MAX_FRAME_PAYLOAD_BYTES: 4 * 1024 * 1024,
+	XHTTP_FIRST_PACKET_MAX_BYTES: 64 * 1024,
 	PROXY_RESOLUTION_CACHE_VERSION: 1,
 	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 24,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
@@ -81,6 +83,7 @@ const ENGINE_DEFAULTS = {
 	DNS_RESULT_CACHE_MAX_ENTRIES: 256,
 	DNS_RESULT_CACHE_MIN_TTL_MS: 30 * 1000,
 	DNS_RESULT_CACHE_MAX_TTL_MS: 5 * 60 * 1000,
+	DNS_RESULT_NEGATIVE_TTL_MS: 30 * 1000,
 	HASH_CACHE_MAX_ENTRIES: 256,
 	DNS_TCP_RESPONSE_TIMEOUT_MS: 1200,
 	DIAL_STAGGER_MS: 90,
@@ -101,7 +104,7 @@ function applyUserConfigDefaults(env = {}) {
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
-let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
 const Pages静态页面 = ENGINE_DEFAULTS.PAGES_STATIC_URL;
 
 const WS早期数据最大字节 = ENGINE_DEFAULTS.WS_EARLY_DATA_MAX_BYTES, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -110,6 +113,7 @@ const 下行Grain包字节 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_PACKET_BYTES, 下行
 const 下行背压高水位字节 = ENGINE_DEFAULTS.DOWNLINK_BACKPRESSURE_HWM_BYTES;
 const WS缓冲上限字节 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_LIMIT_BYTES, WS缓冲最大等待毫秒 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_MAX_WAIT_MS;
 const GRPC_MAX_FRAME_PAYLOAD_BYTES = ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES;
+const XHTTP_FIRST_PACKET_MAX_BYTES = ENGINE_DEFAULTS.XHTTP_FIRST_PACKET_MAX_BYTES;
 const PROXY_RESOLUTION_CACHE_VERSION = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_VERSION;
 const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES;
 const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS;
@@ -139,8 +143,12 @@ const DOH_LOOKUP_TIMEOUT_MS = ENGINE_DEFAULTS.DOH_LOOKUP_TIMEOUT_MS;
 const DNS_RESULT_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MAX_ENTRIES;
 const DNS_RESULT_CACHE_MIN_TTL_MS = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MIN_TTL_MS;
 const DNS_RESULT_CACHE_MAX_TTL_MS = ENGINE_DEFAULTS.DNS_RESULT_CACHE_MAX_TTL_MS;
+const DNS_RESULT_NEGATIVE_TTL_MS = ENGINE_DEFAULTS.DNS_RESULT_NEGATIVE_TTL_MS;
 const HASH_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.HASH_CACHE_MAX_ENTRIES;
 const DNS_TCP_RESPONSE_TIMEOUT_MS = ENGINE_DEFAULTS.DNS_TCP_RESPONSE_TIMEOUT_MS;
+const DNS_MAX_FRAMES_PER_REQUEST = 16;
+const REQUEST_LOG_KV_OPS_LIMIT = 35;
+const REQUEST_LOG_KV_GET_BATCH_SIZE = 4;
 const DIAL_STAGGER_MS = ENGINE_DEFAULTS.DIAL_STAGGER_MS;
 const DEFAULT_DOH_LOOKUP_URL = ENGINE_DEFAULTS.DEFAULT_DOH_LOOKUP_URL;
 const DEFAULT_DNS_TCP_SERVER = ENGINE_DEFAULTS.DEFAULT_DNS_TCP_SERVER;
@@ -219,8 +227,59 @@ function getDnsTcpEndpoint(env = {}) {
 	return { hostname, port };
 }
 
+function normalizeConfigHost(host) {
+	let value = String(host || '').trim();
+	if (!value) return '';
+	try {
+		const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`);
+		value = parsed.hostname || parsed.host || value;
+	} catch (_) {
+		value = value.replace(/^https?:\/\//i, '').split('/')[0];
+	}
+	if (value.startsWith('[') && value.includes(']')) value = value.slice(1, value.indexOf(']'));
+	else if ((value.match(/:/g) || []).length === 1) value = value.slice(0, value.lastIndexOf(':'));
+	return value.toLowerCase().trim();
+}
+
+function sanitizeDecoyHeaders(headers, decoyOrigin = '', workerOrigin = '') {
+	const safe = new Headers(headers);
+	for (const header of [
+		'set-cookie',
+		'set-cookie2',
+		'content-security-policy',
+		'content-security-policy-report-only',
+		'x-content-security-policy',
+	]) safe.delete(header);
+	const location = safe.get('location');
+	if (location) {
+		try {
+			const redirected = new URL(location, decoyOrigin || undefined);
+			if (decoyOrigin && workerOrigin && redirected.origin === decoyOrigin) {
+				safe.set('location', `${workerOrigin}${redirected.pathname}${redirected.search}${redirected.hash}`);
+			} else {
+				safe.delete('location');
+			}
+		} catch (_) {
+			safe.delete('location');
+		}
+	}
+	return safe;
+}
+
+function decoyResponse(upstream, decoyOrigin = '', workerOrigin = '') {
+	return new Response(upstream.body, {
+		status: upstream.status,
+		statusText: upstream.statusText,
+		headers: sanitizeDecoyHeaders(upstream.headers, decoyOrigin, workerOrigin),
+	});
+}
+
 export default {
 	async fetch(request, env, ctx) {
+		// Top-level guard: never let an uncaught exception become a Cloudflare 1101 ("Worker threw an
+		// exception"). A malformed URL from a scanner, a parser edge case, etc. now return a benign
+		// page instead of 1101. Enable DEBUG=1 + `wrangler tail` to see the actual error.
+		try {
 		env = applyUserConfigDefaults(env);
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
@@ -241,7 +300,7 @@ export default {
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
 		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
-		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
+		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(normalizeConfigHost).filter(Boolean) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
 		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
@@ -429,7 +488,7 @@ export default {
 								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('Failed to save configuration:', error);
+								debugError('Failed to save configuration:', error);
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (访问路径 === 'admin/cf.json') {
@@ -455,7 +514,7 @@ export default {
 								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('Failed to save configuration:', error);
+								debugError('Failed to save configuration:', error);
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (访问路径 === 'admin/tg.json') {
@@ -471,7 +530,7 @@ export default {
 								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('Failed to save configuration:', error);
+								debugError('Failed to save configuration:', error);
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (区分大小写访问路径 === 'admin/ADD.txt') {
@@ -481,7 +540,7 @@ export default {
 								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Custom IP list saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
-								console.error('Failed to save custom IP list:', error);
+								debugError('Failed to save custom IP list:', error);
 								return new Response(JSON.stringify({ error: 'Failed to save custom IP list: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else return new Response(JSON.stringify({ error: 'Unsupported POST request path' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -600,7 +659,7 @@ export default {
 									节点备注 = preferredEndpoint.remark;
 								} else {
 
-									console.warn(`[Subscription] Ignored invalid preferred endpoint: ${原始地址}`);
+									debugWarn(`[Subscription] Ignored invalid preferred endpoint: ${原始地址}`);
 									return null;
 								}
 
@@ -614,7 +673,7 @@ export default {
 										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
-										console.warn(`[Subscription] Chain proxy directive parse failed and was ignored: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
+										debugWarn(`[Subscription] Chain proxy directive parse failed and was ignored: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
 									}
 								} else if (反代IP池.length > 0) {
 									const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));
@@ -694,14 +753,26 @@ export default {
 			if (/text|javascript|json|xml/.test(内容类型)) {
 				// Only buffer+rewrite reasonably small camouflage pages; stream large ones unchanged so a
 				// huge/hostile decoy response can't spike isolate memory and disrupt active tunnels.
+				if (反代响应.headers.has('content-encoding')) return decoyResponse(反代响应, 反代URL.origin, url.origin);
+				const 是否有长度头 = 反代响应.headers.has('content-length');
 				const 内容长度 = Number(反代响应.headers.get('content-length') || 0);
-				if (内容长度 > 2 * 1024 * 1024) return 反代响应;
+				if (!是否有长度头 || !Number.isFinite(内容长度) || 内容长度 < 0 || 内容长度 > 2 * 1024 * 1024) return decoyResponse(反代响应, 反代URL.origin, url.origin);
 				const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
-				return new Response(响应内容, { status: 反代响应.status, headers: { ...Object.fromEntries(反代响应.headers), 'Cache-Control': 'no-store' } });
+				const responseHeaders = sanitizeDecoyHeaders(反代响应.headers, 反代URL.origin, url.origin);
+				responseHeaders.delete('content-length');
+				responseHeaders.delete('content-encoding');
+				responseHeaders.delete('etag');
+				responseHeaders.set('Cache-Control', 'no-store');
+				return new Response(响应内容, { status: 反代响应.status, statusText: 反代响应.statusText, headers: responseHeaders });
 			}
-			return 反代响应;
+			return decoyResponse(反代响应, 反代URL.origin, url.origin);
 		} catch (error) { }
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		} catch (顶层错误) {
+			try { log(`[fetch] Uncaught error: ${顶层错误?.message || 顶层错误}`); } catch (e) { }
+			try { return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } }); } catch (e) { }
+			return new Response('Bad Gateway', { status: 502, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+		}
 	}
 	// No scheduled()/cron handler: automated background ProxyIP scanning rapidly probes many
 	// Cloudflare IPs and triggers network-abuse reports. ProxyIP scanning is manual-only.
@@ -880,6 +951,141 @@ function 有效数据长度(data) {
 	return 0;
 }
 
+function 追加首包缓冲(buffer, chunk) {
+	const 当前 = 数据转Uint8Array(buffer);
+	const 新块 = 数据转Uint8Array(chunk);
+	if (!当前.byteLength) {
+		if (新块.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES) throw new Error('first packet is too large');
+		return 新块;
+	}
+	if (当前.byteLength + 新块.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES) throw new Error('first packet is too large');
+	return 拼接字节数据(当前, 新块);
+}
+
+// Shared module-level state for the incremental first-packet parsers, the UUID matcher, and the
+// Shadowsocks key/codec helpers. These were originally grouped with the legacy 解析魏烈思请求/解析木马请求
+// parsers; they are kept here after those dead parsers were removed, since 获取UUID字节, the increment
+// parsers, and the SS AEAD path still depend on them.
+const UUID字节缓存 = new Map();
+const VLESS文本解码器 = new TextDecoder();
+const SS主密钥缓存 = new Map();
+const SS文本解码器 = new TextDecoder();
+const SS文本编码器 = new TextEncoder();
+
+function 尝试解析魏烈思首包增量(data, token) {
+	const length = data.byteLength;
+	if (length < 18) return { 状态: 'need_more' };
+	if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
+
+	const optLen = data[17];
+	const cmdIndex = 18 + optLen;
+	if (length < cmdIndex + 1) return { 状态: 'need_more' };
+
+	const cmd = data[cmdIndex];
+	if (cmd !== 1 && cmd !== 2) return { 状态: 'invalid' };
+
+	const portIndex = cmdIndex + 1;
+	if (length < portIndex + 3) return { 状态: 'need_more' };
+
+	const port = (data[portIndex] << 8) | data[portIndex + 1];
+	const addressType = data[portIndex + 2];
+	const addressIndex = portIndex + 3;
+	let headerLen = -1, hostname = '';
+	if (addressType === 1) {
+		if (length < addressIndex + 4) return { 状态: 'need_more' };
+		hostname = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
+		headerLen = addressIndex + 4;
+	} else if (addressType === 2) {
+		if (length < addressIndex + 1) return { 状态: 'need_more' };
+		const domainLen = data[addressIndex];
+		if (length < addressIndex + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = VLESS文本解码器.decode(data.subarray(addressIndex + 1, addressIndex + 1 + domainLen));
+		headerLen = addressIndex + 1 + domainLen;
+	} else if (addressType === 3) {
+		if (length < addressIndex + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = addressIndex + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		headerLen = addressIndex + 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'vless',
+			hostname,
+			port,
+			isUDP: cmd === 2,
+			rawData: data.subarray(headerLen),
+			respHeader: new Uint8Array([data[0], 0]),
+		}
+	};
+}
+
+function 尝试解析木马首包增量(data, token) {
+	const length = data.byteLength;
+	if (length < 58) return { 状态: 'need_more' };
+	if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
+	const 密码哈希字节 = new TextEncoder().encode(sha224(token));
+	for (let i = 0; i < 56; i++) if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
+
+	const socksStart = 58;
+	if (length < socksStart + 2) return { 状态: 'need_more' };
+	const cmd = data[socksStart];
+	if (cmd !== 1 && cmd !== 3) return { 状态: 'invalid' };
+	const atype = data[socksStart + 1];
+	let cursor = socksStart + 2, hostname = '';
+	if (atype === 1) {
+		if (length < cursor + 4) return { 状态: 'need_more' };
+		hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
+		cursor += 4;
+	} else if (atype === 3) {
+		if (length < cursor + 1) return { 状态: 'need_more' };
+		const domainLen = data[cursor];
+		if (length < cursor + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = VLESS文本解码器.decode(data.subarray(cursor + 1, cursor + 1 + domainLen));
+		cursor += 1 + domainLen;
+	} else if (atype === 4) {
+		if (length < cursor + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = cursor + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		cursor += 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+	if (length < cursor + 4) return { 状态: 'need_more' };
+	const port = (data[cursor] << 8) | data[cursor + 1];
+	if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { 状态: 'invalid' };
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'trojan',
+			hostname,
+			port,
+			isUDP: cmd === 3,
+			rawData: data.subarray(cursor + 4),
+			respHeader: null,
+		}
+	};
+}
+
+function 尝试解析入站首包(data, token) {
+	const 木马结果 = 尝试解析木马首包增量(data, token);
+	if (木马结果.状态 === 'ok') return 木马结果;
+	const 魏烈思结果 = 尝试解析魏烈思首包增量(data, token);
+	if (魏烈思结果.状态 === 'ok') return 魏烈思结果;
+	if (木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid') return { 状态: 'invalid' };
+	return { 状态: 'need_more' };
+}
+
 async function 读取XHTTP首包(reader, token) {
 	const decoder = VLESS文本解码器;
 
@@ -1011,7 +1217,8 @@ async function 读取XHTTP首包(reader, token) {
 			break;
 		}
 
-		const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+		const chunk = 数据转Uint8Array(value);
+		if (offset + chunk.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES) return null;
 		if (offset + chunk.byteLength > buffer.byteLength) {
 			const newBuffer = new Uint8Array(Math.max(buffer.byteLength * 2, offset + chunk.byteLength));
 			newBuffer.set(buffer.subarray(0, offset));
@@ -1046,6 +1253,8 @@ async function 处理gRPC请求(request, yourUUID) {
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
+	let 首包缓冲 = new Uint8Array(0);
+	let VLESS_DNS缓存 = new Uint8Array(0);
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
@@ -1196,6 +1405,16 @@ async function 处理gRPC请求(request, yourUUID) {
 				return 上行写入队列.写入并等待(payload, allowRetry);
 			};
 
+			const 转发VLESS_DNS数据 = async (payload) => {
+				const chunk = 数据转Uint8Array(payload);
+				if (!chunk.byteLength && !VLESS_DNS缓存.byteLength) return;
+				const combined = VLESS_DNS缓存.byteLength ? 拼接字节数据(VLESS_DNS缓存, chunk) : chunk;
+				const parsed = 分离完整DNS_TCP帧(combined);
+				VLESS_DNS缓存 = parsed.pending;
+				if (!parsed.complete.byteLength) return;
+				await forwardataudp(parsed.complete, grpcBridge, null, request);
+			};
+
 			try {
 				let pending = new Uint8Array(0);
 				while (true) {
@@ -1208,43 +1427,38 @@ async function 处理gRPC请求(request, yourUUID) {
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request);
+							else await 转发VLESS_DNS数据(payload);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
-							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							首包缓冲 = 追加首包缓冲(首包缓冲, payload);
+							const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
+							if (首包结果.状态 === 'need_more') continue;
+							if (首包结果.状态 !== 'ok') throw new Error('Invalid first packet');
+							首包缓冲 = new Uint8Array(0);
+							const { 协议, port, hostname, rawData, respHeader, isUDP } = 首包结果.结果;
+							判断是否是木马 = 协议 === 'trojan';
 							if (判断是否是木马) {
-								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
-								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-								const { port, hostname, rawClientData, isUDP } = 解析结果;
 								log(`[gRPC] Trojan first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
 								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
 									isDnsQuery = true;
-									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
+									if (有效数据长度(rawData) > 0) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
 								} else {
-									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
+									await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 								}
 							} else {
-								判断是否是木马 = false;
-								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
-								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid VLESS request');
-								const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 								log(`[gRPC] VLESS first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
 								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 								if (isUDP) {
 									if (port !== 53) throw new Error('UDP is not supported');
 									isDnsQuery = true;
 								}
-								const respHeader = new Uint8Array([version, 0]);
 								grpcBridge.send(respHeader);
-								const rawData = rawClientData;
 								if (isDnsQuery) {
-									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request);
+									if (有效数据长度(rawData) > 0) await 转发VLESS_DNS数据(rawData);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
@@ -1335,6 +1549,8 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	let 首包缓冲 = new Uint8Array(0);
+	let VLESS_DNS缓存 = new Uint8Array(0), VLESS_DNS响应头 = null;
 	let ss上下文 = null, ss初始化任务 = null;
 
 	const 释放远端写入器 = () => {
@@ -1370,6 +1586,19 @@ async function 处理WS请求(request, yourUUID, url) {
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
 		return 上行写入队列.写入并等待(chunk, allowRetry);
+	};
+
+	const 转发VLESS_DNS数据 = async (payload, respHeader = null) => {
+		if (respHeader && !VLESS_DNS响应头) VLESS_DNS响应头 = respHeader;
+		const chunk = 数据转Uint8Array(payload);
+		if (!chunk.byteLength && !VLESS_DNS缓存.byteLength) return;
+		const combined = VLESS_DNS缓存.byteLength ? 拼接字节数据(VLESS_DNS缓存, chunk) : chunk;
+		const parsed = 分离完整DNS_TCP帧(combined);
+		VLESS_DNS缓存 = parsed.pending;
+		if (!parsed.complete.byteLength) return;
+		const header = VLESS_DNS响应头;
+		VLESS_DNS响应头 = null;
+		await forwardataudp(parsed.complete, serverSock, header, request);
 	};
 
 	const 获取SS上下文 = async () => {
@@ -1537,6 +1766,7 @@ async function 处理WS请求(request, yourUUID, url) {
 					入站解密器,
 					回包Socket,
 					首包已建立: false,
+					首包缓冲: new Uint8Array(0),
 					目标主机: '',
 					目标端口: 0,
 				};
@@ -1573,24 +1803,25 @@ async function 处理WS请求(request, yourUUID, url) {
 				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
 				continue;
 			}
-			const 明文数据 = 数据转Uint8Array(明文块);
-			if (明文数据.byteLength < 3) throw new Error('invalid ss data');
+			上下文.首包缓冲 = 追加首包缓冲(上下文.首包缓冲, 明文块);
+			const 明文数据 = 上下文.首包缓冲;
+			if (明文数据.byteLength < 3) continue;
 			const addressType = 明文数据[0];
 			let cursor = 1;
 			let hostname = '';
 			if (addressType === 1) {
-				if (明文数据.byteLength < cursor + 4 + 2) throw new Error('invalid ss ipv4 length');
+				if (明文数据.byteLength < cursor + 4 + 2) continue;
 				hostname = `${明文数据[cursor]}.${明文数据[cursor + 1]}.${明文数据[cursor + 2]}.${明文数据[cursor + 3]}`;
 				cursor += 4;
 			} else if (addressType === 3) {
-				if (明文数据.byteLength < cursor + 1) throw new Error('invalid ss domain length');
+				if (明文数据.byteLength < cursor + 1) continue;
 				const domainLength = 明文数据[cursor];
 				cursor += 1;
-				if (明文数据.byteLength < cursor + domainLength + 2) throw new Error('invalid ss domain data');
+				if (明文数据.byteLength < cursor + domainLength + 2) continue;
 				hostname = SS文本解码器.decode(明文数据.subarray(cursor, cursor + domainLength));
 				cursor += domainLength;
 			} else if (addressType === 4) {
-				if (明文数据.byteLength < cursor + 16 + 2) throw new Error('invalid ss ipv6 length');
+				if (明文数据.byteLength < cursor + 16 + 2) continue;
 				const ipv6 = [];
 				const ipv6View = new DataView(明文数据.buffer, 明文数据.byteOffset + cursor, 16);
 				for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
@@ -1607,6 +1838,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			上下文.首包已建立 = true;
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
+			上下文.首包缓冲 = new Uint8Array(0);
 			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
 		}
 	};
@@ -1618,7 +1850,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request);
+			return await 转发VLESS_DNS数据(chunk);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -1629,9 +1861,11 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null) {
 			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
 			else {
-				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-				const bytes = 当前块字节;
-				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? 'trojan' : 'vless';
+				首包缓冲 = 追加首包缓冲(首包缓冲, chunk);
+				const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
+				if (首包结果.状态 === 'need_more') return;
+				if (首包结果.状态 !== 'ok') throw new Error('Invalid first packet');
+				判断协议类型 = 首包结果.结果.协议;
 			}
 			判断是否是木马 = 判断协议类型 === 'trojan';
 			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
@@ -1643,33 +1877,31 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		if (await 写入远端(chunk)) return;
 		if (判断协议类型 === 'trojan') {
-			const 解析结果 = 解析木马请求(chunk, yourUUID);
-			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-			const { port, hostname, rawClientData, isUDP } = 解析结果;
+			const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
+			if (首包结果.状态 !== 'ok') throw new Error('Invalid Trojan request');
+			首包缓冲 = new Uint8Array(0);
+			const { port, hostname, rawData, isUDP } = 首包结果.结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			if (isUDP) {
 				isDnsQuery = true;
-				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
+				if (有效数据长度(rawData) > 0) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request);
+			await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, yourUUID, request);
 		} else {
 			判断是否是木马 = false;
-			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-			const bytes = 当前块字节;
-			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
-			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid VLESS request');
-			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
+			const 首包结果 = 尝试解析入站首包(首包缓冲, yourUUID);
+			if (首包结果.状态 !== 'ok') throw new Error('Invalid VLESS request');
+			首包缓冲 = new Uint8Array(0);
+			const { port, hostname, isUDP, rawData, respHeader } = 首包结果.结果;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			if (isUDP) {
 				if (port === 53) isDnsQuery = true;
 				else throw new Error('UDP is not supported');
 			}
-			const respHeader = new Uint8Array([version, 0]);
-			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request);
+				return 转发VLESS_DNS数据(rawData, respHeader);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request);
 		}
@@ -1728,6 +1960,10 @@ async function 处理WS请求(request, yourUUID, url) {
 	};
 
 	serverSock.addEventListener('message', (event) => {
+		if (typeof event.data === 'string') {
+			处理WS显式传输错误(new Error('[WS explicit transport] text frames are not supported'));
+			return;
+		}
 		入队WS显式传输(event.data);
 	});
 	serverSock.addEventListener('close', () => {
@@ -1752,75 +1988,6 @@ async function 处理WS请求(request, yourUUID, url) {
 }
 
 const 木马文本解码器 = new TextDecoder();
-
-function 解析木马请求(buffer, passwordPlainText) {
-	const data = 数据转Uint8Array(buffer);
-	if (data.byteLength < 58) return { hasError: true, message: "invalid data" };
-	let crLfIndex = 56;
-	if (data[crLfIndex] !== 0x0d || data[crLfIndex + 1] !== 0x0a) return { hasError: true, message: "invalid header format" };
-	const sha224Password = sha224(passwordPlainText);
-	for (let i = 0; i < crLfIndex; i++) {
-		if (data[i] !== sha224Password.charCodeAt(i)) return { hasError: true, message: "invalid password" };
-	}
-
-	const socks5Index = crLfIndex + 2;
-	if (data.byteLength < socks5Index + 6) return { hasError: true, message: "invalid S5 request data" };
-
-	const cmd = data[socks5Index];
-	if (cmd !== 1 && cmd !== 3) return { hasError: true, message: "unsupported command, only TCP/UDP is allowed" };
-	const isUDP = cmd === 3;
-
-	const atype = data[socks5Index + 1];
-	let addressLength = 0;
-	let addressIndex = socks5Index + 2;
-	let address = "";
-	switch (atype) {
-		case 1: // IPv4
-			addressLength = 4;
-			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-			address = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
-			break;
-		case 3: // Domain
-			if (data.byteLength < addressIndex + 1) return { hasError: true, message: "invalid S5 request data" };
-			addressLength = data[addressIndex];
-			addressIndex += 1;
-			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-			address = 木马文本解码器.decode(data.subarray(addressIndex, addressIndex + addressLength));
-			break;
-		case 4: // IPv6
-			addressLength = 16;
-			if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-			const ipv6 = [];
-			for (let i = 0; i < 8; i++) {
-				const partIndex = addressIndex + i * 2;
-				ipv6.push(((data[partIndex] << 8) | data[partIndex + 1]).toString(16));
-			}
-			address = ipv6.join(":");
-			break;
-		default:
-			return { hasError: true, message: `invalid addressType is ${atype}` };
-	}
-
-	if (!address) {
-		return { hasError: true, message: `address is empty, addressType is ${atype}` };
-	}
-
-	const portIndex = addressIndex + addressLength;
-	if (data.byteLength < portIndex + 4) return { hasError: true, message: "invalid S5 request data" };
-	const portRemote = (data[portIndex] << 8) | data[portIndex + 1];
-
-	return {
-		hasError: false,
-		addressType: atype,
-		port: portRemote,
-		hostname: address,
-		isUDP,
-		rawClientData: data.subarray(portIndex + 4)
-	};
-}
-
-const UUID字节缓存 = new Map();
-const VLESS文本解码器 = new TextDecoder();
 
 function 读取十六进制半字节(code) {
 	if (code >= 48 && code <= 57) return code - 48;
@@ -1858,65 +2025,6 @@ function UUID字节匹配(data, offset, uuid) {
 	}
 	return true;
 }
-
-function 解析魏烈思请求(chunk, token) {
-	const data = 数据转Uint8Array(chunk);
-	const length = data.byteLength;
-	if (length < 24) return { hasError: true, message: 'Invalid data' };
-	const version = data[0];
-	if (!UUID字节匹配(data, 1, token)) return { hasError: true, message: 'Invalid uuid' };
-
-	const optLen = data[17];
-	const cmdIndex = 18 + optLen;
-	if (length < cmdIndex + 4) return { hasError: true, message: 'Invalid data' };
-
-	const cmd = data[cmdIndex];
-	let isUDP = false;
-	if (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: 'Invalid command' } }
-
-	const portIdx = cmdIndex + 1;
-	const port = (data[portIdx] << 8) | data[portIdx + 1];
-	let addrValIdx = portIdx + 3, addrLen = 0, hostname = '';
-	const addressType = data[portIdx + 2];
-	switch (addressType) {
-		case 1:
-			addrLen = 4;
-			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv4 address length' };
-			hostname = `${data[addrValIdx]}.${data[addrValIdx + 1]}.${data[addrValIdx + 2]}.${data[addrValIdx + 3]}`;
-			break;
-		case 2:
-			if (length < addrValIdx + 1) return { hasError: true, message: 'Invalid domain length' };
-			addrLen = data[addrValIdx];
-			addrValIdx += 1;
-			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid domain data' };
-			hostname = VLESS文本解码器.decode(data.subarray(addrValIdx, addrValIdx + addrLen));
-			break;
-		case 3:
-			addrLen = 16;
-			if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv6 address length' };
-			const ipv6 = [];
-			for (let i = 0; i < 8; i++) {
-				const base = addrValIdx + i * 2;
-				ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-			}
-			hostname = ipv6.join(':');
-			break;
-		default:
-			return { hasError: true, message: `Invalid address type: ${addressType}` };
-	}
-	if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
-	const rawIndex = addrValIdx + addrLen;
-	return { hasError: false, addressType, port, hostname, isUDP, rawClientData: data.subarray(rawIndex), version };
-}
-
-const SS支持加密配置 = {
-	'aes-128-gcm': { method: 'aes-128-gcm', keyLen: 16, saltLen: 16, maxChunk: 0x3fff, aesLength: 128 },
-	'aes-256-gcm': { method: 'aes-256-gcm', keyLen: 32, saltLen: 32, maxChunk: 0x3fff, aesLength: 256 },
-};
-
-const SSAEAD标签长度 = 16, SSNonce长度 = 12;
-const SS子密钥信息 = new TextEncoder().encode('ss-subkey');
-const SS文本编码器 = new TextEncoder(), SS文本解码器 = new TextDecoder(), SS主密钥缓存 = new Map();
 
 function 数据转Uint8Array(data) {
 	if (data instanceof Uint8Array) return data;
@@ -2110,7 +2218,7 @@ async function SS派生主密钥(passwordText, keyLen) {
 		while (result.byteLength < keyLen) {
 			const input = new Uint8Array(prev.byteLength + pwBytes.byteLength);
 			input.set(prev, 0); input.set(pwBytes, prev.byteLength);
-			prev = new Uint8Array(await crypto.subtle.digest('MD5', input));
+			prev = await md5Bytes(input);
 			result = 拼接字节数据(result, prev);
 		}
 		return result.slice(0, keyLen);
@@ -2240,9 +2348,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const proxyFallbackEnabled = tunnelContext.proxyFallbackEnabled;
 	const proxyGlobalEnabled = tunnelContext.globalProxyEnabled;
 	const socksWhitelist = Array.isArray(tunnelContext.socksWhitelist) ? tunnelContext.socksWhitelist : DEFAULT_SOCKS5_WHITELIST;
+	const forceProxyHosts = Array.isArray(tunnelContext.forceProxyHosts) ? tunnelContext.forceProxyHosts : [];
+	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	const 首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
-	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'}`);
+	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'} | Forced: ${forceProxyForHost ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
 	let 已通过代理发送首包 = false;
@@ -2266,7 +2376,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	async function 写入首包(remoteSock, data) {
 		if (有效数据长度(data) <= 0) return;
 		const writer = remoteSock.writable.getWriter();
-		try { await writer.write(数据转Uint8Array(data)) }
+		try { await writeWithOperationTimeout(writer, 数据转Uint8Array(data), 连接超时毫秒, 'Initial data write timed out') }
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
@@ -2393,7 +2503,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await turnConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
-					try { await writer.write(数据转Uint8Array(本次首包数据)) }
+					try { await writeWithOperationTimeout(writer, 数据转Uint8Array(本次首包数据), 连接超时毫秒, 'TURN initial data write timed out') }
 					finally { try { writer.releaseLock() } catch (e) { } }
 				}
 			} else if (proxyType === 'sstp') {
@@ -2401,7 +2511,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await sstpConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
 					const writer = newSocket.writable.getWriter();
-					try { await writer.write(数据转Uint8Array(本次首包数据)) }
+					try { await writeWithOperationTimeout(writer, 数据转Uint8Array(本次首包数据), 连接超时毫秒, 'SSTP initial data write timed out') }
 					finally { try { writer.releaseLock() } catch (e) { } }
 				}
 			} else {
@@ -2414,7 +2524,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null);
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env });
 		})();
 
 		remoteConnWrapper.connectingPromise = 当前连接任务;
@@ -2428,8 +2538,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	if (proxyType && (proxyGlobalEnabled || socksWhitelist.some(pattern => matchesHostPattern(host, pattern)))) {
-		log(`[TCP forwarding] SOCKS5/HTTP/HTTPS/TURN/SSTP global proxy enabled`);
+	if (forceProxyForHost || (proxyType && (proxyGlobalEnabled || socksWhitelist.some(pattern => matchesHostPattern(host, pattern))))) {
+		log(`[TCP forwarding] Proxy route selected: ${forceProxyForHost ? 'forced host rule' : 'SOCKS5/HTTP/HTTPS/TURN/SSTP rule'}`);
 		try {
 			await connecttoPry();
 		} catch (err) {
@@ -2444,7 +2554,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
 				await connecttoPry();
-			}, 首字节超时毫秒);
+			}, 首字节超时毫秒, { env });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -2483,18 +2593,65 @@ async function readOneDnsTcpFrame(tcpSocket, timeoutMs) {
 	}
 }
 
+async function readMultipleDnsTcpFrames(tcpSocket, count, timeoutMs) {
+	const safeCount = Math.trunc(Number(count));
+	if (!Number.isFinite(safeCount) || safeCount <= 0) throw new Error('DNS TCP response count is invalid');
+	if (safeCount > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS TCP response frames requested');
+	const reader = tcpSocket.readable.getReader();
+	let buffer = new Uint8Array(0);
+	const frames = [];
+	const deadline = Date.now() + Math.max(1, Number(timeoutMs) || DNS_TCP_RESPONSE_TIMEOUT_MS);
+	const maxBufferedBytes = Math.min(2 * 1024 * 1024, safeCount * 65537);
+	try {
+		while (frames.length < safeCount) {
+			while (buffer.byteLength >= 2) {
+				const responseLength = (buffer[0] << 8) | buffer[1];
+				if (responseLength <= 0) throw new Error('DNS TCP response has invalid length');
+				if (responseLength > 65535) throw new Error('DNS TCP response is too large');
+				const frameLength = responseLength + 2;
+				if (buffer.byteLength < frameLength) break;
+				frames.push(buffer.slice(0, frameLength));
+				buffer = buffer.slice(frameLength);
+				if (frames.length >= safeCount) break;
+			}
+			if (frames.length >= safeCount) break;
+			const remainingMs = Math.max(1, deadline - Date.now());
+			const { done, value } = await readWithOperationTimeout(reader, remainingMs, 'DNS TCP response timed out');
+			if (done) throw new Error('DNS TCP server closed before returning all response frames');
+			const chunk = 数据转Uint8Array(value);
+			if (!chunk.byteLength) continue;
+			if (buffer.byteLength + chunk.byteLength > maxBufferedBytes) throw new Error('DNS TCP response buffer is too large');
+			buffer = buffer.byteLength ? 拼接字节数据(buffer, chunk) : chunk;
+		}
+		return frames.length === 1 ? frames[0] : 拼接字节数据(...frames);
+	} finally {
+		cancelReaderQuietly(reader);
+		try { reader.releaseLock() } catch (e) { }
+	}
+}
+
 // Split a buffer of length-prefixed (DNS-over-TCP) frames into the raw DNS messages.
-function 解析DNS_TCP帧(data) {
+function 分离完整DNS_TCP帧(data) {
+	const bytes = 数据转Uint8Array(data);
 	const frames = [];
 	let cursor = 0;
-	while (cursor + 2 <= data.byteLength) {
-		const len = (data[cursor] << 8) | data[cursor + 1];
+	while (cursor + 2 <= bytes.byteLength) {
+		const len = (bytes[cursor] << 8) | bytes[cursor + 1];
 		const start = cursor + 2, end = start + len;
-		if (len <= 0 || end > data.byteLength) break;
-		frames.push(data.subarray(start, end));
+		if (len <= 0) throw new Error('DNS TCP query frame has invalid length');
+		if (end > bytes.byteLength) break;
+		frames.push(bytes.subarray(cursor, end));
 		cursor = end;
 	}
-	return frames;
+	return {
+		frames,
+		complete: frames.length ? 拼接字节数据(...frames) : new Uint8Array(0),
+		pending: bytes.subarray(cursor),
+	};
+}
+
+function 解析DNS_TCP帧(data) {
+	return 分离完整DNS_TCP帧(data).frames.map(frame => frame.subarray(2));
 }
 
 // Primary tunneled-DNS path: forward each length-prefixed query over DoH (RFC 8484
@@ -2503,27 +2660,33 @@ function 解析DNS_TCP帧(data) {
 async function DNS经DoH转发(requestData, env, timeoutMs) {
 	const frames = 解析DNS_TCP帧(requestData);
 	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
+	if (frames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
 	const dohUrls = getDohLookupUrls(env);
 	let lastErr = null;
 	for (const dohUrl of dohUrls) {
 		try {
-			let out = new Uint8Array(0);
-			for (const query of frames) {
-				const resp = await fetchWithTimeout(dohUrl, {
-					method: 'POST',
-					headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
-					body: query,
-				}, timeoutMs);
-				if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
-				const msg = new Uint8Array(await resp.arrayBuffer());
-				if (!msg.byteLength) throw new Error('empty DoH response');
-				if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
-				const framed = new Uint8Array(2 + msg.byteLength);
-				framed[0] = (msg.byteLength >>> 8) & 0xff;
-				framed[1] = msg.byteLength & 0xff;
-				framed.set(msg, 2);
-				out = out.byteLength ? 拼接字节数据(out, framed) : framed;
+			const results = [];
+			for (let offset = 0; offset < frames.length; offset += 3) {
+				const batch = frames.slice(offset, offset + 3);
+				const batchResults = await Promise.all(batch.map(async query => {
+					const resp = await fetchWithTimeout(dohUrl, {
+						method: 'POST',
+						headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
+						body: query,
+					}, timeoutMs);
+					if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
+					const msg = new Uint8Array(await resp.arrayBuffer());
+					if (!msg.byteLength) throw new Error('empty DoH response');
+					if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
+					const framed = new Uint8Array(2 + msg.byteLength);
+					framed[0] = (msg.byteLength >>> 8) & 0xff;
+					framed[1] = msg.byteLength & 0xff;
+					framed.set(msg, 2);
+					return framed;
+				}));
+				results.push(...batchResults);
 			}
+			const out = results.length === 1 ? results[0] : 拼接字节数据(...results);
 			return out;
 		} catch (err) {
 			lastErr = err;
@@ -2541,13 +2704,16 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 		const { env } = getWorkerRequestContext(request);
 		const dnsEndpoint = getDnsTcpEndpoint(env);
 		log(`[UDP forwarding] DNS-over-TCP fallback -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
+		const queryFrames = 解析DNS_TCP帧(requestData);
+		if (!queryFrames.length) throw new Error('no DNS query frames to forward');
+		if (queryFrames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
 		tcpSocket = TCP连接(dnsEndpoint);
 		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
 		writer = tcpSocket.writable.getWriter();
 		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
 		try { writer.releaseLock() } catch (e) { }
 		writer = null;
-		return await readOneDnsTcpFrame(tcpSocket, timeoutMs);
+		return await readMultipleDnsTcpFrames(tcpSocket, queryFrames.length, timeoutMs);
 	} finally {
 		try { writer?.releaseLock?.() } catch (e) { }
 		try { tcpSocket?.close?.() } catch (e) { }
@@ -2767,7 +2933,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	const enqueue = (data, allowRetry = true, waitForFlush = false) => {
 		if (closed) return false;
 
-		if (!获取写入器()) return false;
 		const chunk = 数据转Uint8Array(data);
 		if (!chunk.byteLength) return true;
 		const nextBytes = queuedBytes + chunk.byteLength;
@@ -2810,9 +2975,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	};
 }
 
-function 创建下行Grain发送器(webSocket, headerData = null) {
-	const packetCap = 下行Grain包字节;
-	const tailBytes = 下行Grain尾部阈值;
+function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput = null) {
+	const packetCapCandidate = Number(packetCapInput);
+	const packetCap = Number.isFinite(packetCapCandidate) && packetCapCandidate > 0 ? Math.round(packetCapCandidate) : 下行Grain包字节;
+	const tailBytes = packetCap === 下行Grain包字节 ? 下行Grain尾部阈值 : Math.max(512, Math.min(16384, Math.round(packetCap / 32)));
 	const lowWaterBytes = Math.max(4096, tailBytes << 3);
 	let header = headerData;
 	let pendingBuffer = new Uint8Array(packetCap);
@@ -2915,18 +3081,19 @@ function 创建下行Grain发送器(webSocket, headerData = null) {
 	};
 }
 
-function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0) {
-	return connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs).catch(error => {
+function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
+	return connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs, pipeMeta).catch(error => {
 		log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
 		closeSocketQuietly(webSocket);
 	});
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0) {
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
-	const 下行发送器 = 创建下行Grain发送器(webSocket, header);
+	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
+	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes);
 	header = null;
 
 	try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
@@ -2956,7 +3123,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
 				hasData = true;
-				if (value.byteLength >= 下行Grain包字节) {
+				if (value.byteLength >= downlinkGrainBytes) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
 					readBuffer = new ArrayBuffer(BYOB单次读取上限);
@@ -2975,6 +3142,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	}
 	if (!hasData && retryFunc) {
 		try {
+			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
 			return;
 		} catch (retryError) {
@@ -3797,7 +3965,7 @@ class TlsClient {
 					break
 				}
 				case HANDSHAKE_TYPE_CERTIFICATE: {
-					const certificate = extractLeafCertificate(message.body);
+					const certificate = extractLeafCertificate(message.body, 1);
 					if (!certificate) throw new Error("Missing TLS 1.3 certificate");
 					await this.acceptCertificate(certificate), this.recordHandshake(message.raw);
 					break
@@ -4147,7 +4315,7 @@ async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
 			if (!realmBytes || !nonce?.byteLength) throw new Error('TURN authentication challenge is missing realm or nonce');
 
 			const realm = textDecoder.decode(realmBytes);
-			integrityKey = new Uint8Array(await crypto.subtle.digest('MD5', textEncoder.encode(`${proxy.username}:${realm}:${proxy.password}`)));
+			integrityKey = await md5Bytes(textEncoder.encode(`${proxy.username}:${realm}:${proxy.password}`));
 			authAttributes = [
 				createTurnStunAttribute(TURN_STUN_ATTR.USERNAME, textEncoder.encode(proxy.username)),
 				createTurnStunAttribute(TURN_STUN_ATTR.REALM, textEncoder.encode(realm)),
@@ -4687,6 +4855,7 @@ function base64SecretEncode(plaintext, secret) {
 	const encoder = new TextEncoder();
 	const data = encoder.encode(plaintext);
 	const key = encoder.encode(secret);
+	if (!key.length) throw new Error('Secret is empty');
 	const mixed = new Uint8Array(data.length);
 
 	for (let i = 0; i < data.length; i++) {
@@ -4711,6 +4880,7 @@ function base64SecretDecode(encoded, secret) {
 
 	const encoder = new TextEncoder();
 	const key = encoder.encode(secret);
+	if (!key.length) throw new Error('Secret is empty');
 	const data = new Uint8Array(mixed.length);
 
 	for (let i = 0; i < mixed.length; i++) {
@@ -4731,13 +4901,20 @@ function 获取传输协议配置(配置 = {}) {
 }
 
 function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优选订阅生成器 = false) {
-	const 路径值 = 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
-	if (配置.传输协议 !== 'grpc') return 路径值;
-	return 路径值.split('?')[0] || '/';
+	if (配置.传输协议 === 'grpc') return (作为优选订阅生成器 ? '/' : 节点路径).split('?')[0] || '/';
+	return 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
 }
 
 function log(...args) {
 	if (调试日志打印) console.log(...args);
+}
+
+function debugWarn(...args) {
+	if (调试日志打印) console.warn(...args);
+}
+
+function debugError(...args) {
+	if (调试日志打印) console.error(...args);
 }
 
 function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
@@ -4750,7 +4927,7 @@ function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON 
 	const gRPCUserAgent = (typeof config_JSON?.gRPCUserAgent === 'string' && config_JSON.gRPCUserAgent.trim()) ? config_JSON.gRPCUserAgent.trim() : null;
 	const 需要处理gRPC = config_JSON?.传输协议 === "grpc" && Boolean(gRPCUserAgent);
 	const gRPCUserAgentYAML = gRPCUserAgent ? JSON.stringify(gRPCUserAgent) : null;
-	let clash_yaml = Clash_原始订阅内容.replace(/mode:\s*Rule\b/g, 'mode: rule');
+	let clash_yaml = String(Clash_原始订阅内容 || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/mode:\s*Rule\b/g, 'mode: rule');
 
 	const baseDnsBlock = `dns:
   enable: true
@@ -4962,7 +5139,7 @@ async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, co
 	const fingerprint = config_JSON?.Fingerprint || "chrome";
 	const ECH启用 = Boolean(config_JSON?.ECH);
 	const ECH_SNI = config_JSON?.ECHConfig?.SNI || "cloudflare-ech.com";
-	const sb_json_text = SingBox_原始订阅内容.replace('1.1.1.1', '8.8.8.8').replace('1.0.0.1', '8.8.4.4');
+	const sb_json_text = String(SingBox_原始订阅内容 || '');
 	try {
 		const config = JSON.parse(sb_json_text);
 		const 数组化 = value => value === undefined || value === null ? [] : (Array.isArray(value) ? value : [value]);
@@ -5206,9 +5383,8 @@ async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, co
 
 				if ((outbound.uuid && outbound.uuid === uuid) || (outbound.password && outbound.password === uuid)) {
 
-					if (!outbound.tls) {
-						outbound.tls = { enabled: true };
-					}
+					if (!outbound.tls || typeof outbound.tls !== 'object' || Array.isArray(outbound.tls)) outbound.tls = {};
+					outbound.tls.enabled = true;
 
 
 					if (fingerprint) {
@@ -5232,7 +5408,7 @@ async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, co
 
 		return JSON.stringify(config, null, 2);
 	} catch (e) {
-		console.error("Singbox hot patch failed:", e);
+		debugError("Singbox hot patch failed:", e);
 		return sb_json_text;
 	}
 }
@@ -5307,7 +5483,7 @@ async function readLegacyRequestLogs(env = {}) {
 		const parsed = JSON.parse(legacy);
 		return Array.isArray(parsed) ? parsed : [];
 	} catch (error) {
-		console.error(`Failed to read legacy request logs: ${error.message}`);
+		debugError(`Failed to read legacy request logs: ${error.message}`);
 		return [];
 	}
 }
@@ -5321,33 +5497,51 @@ async function readRequestLogs(env = {}, options = {}) {
 
 	const logs = [];
 	let cursor;
+	let kvOps = 0;
+	let sawEntryKeys = false;
 	try {
 		do {
-			const pageLimit = Math.min(REQUEST_LOG_MAX_READ_LIMIT, Math.max(1, limit - logs.length));
+			if (kvOps >= REQUEST_LOG_KV_OPS_LIMIT || logs.length >= limit) break;
+			const remainingOpsAfterList = Math.max(0, REQUEST_LOG_KV_OPS_LIMIT - kvOps - 1);
+			if (!remainingOpsAfterList) break;
+			const pageLimit = Math.min(REQUEST_LOG_MAX_READ_LIMIT, remainingOpsAfterList, Math.max(1, limit - logs.length));
+			kvOps++;
 			const page = await env.KV.list({ prefix: REQUEST_LOG_ENTRY_PREFIX, limit: pageLimit, cursor });
 			const keys = Array.isArray(page?.keys) ? page.keys : [];
-			const values = await Promise.all(keys.map(async key => {
-				try {
-					const raw = await env.KV.get(key.name);
-					if (!raw) return null;
-					const parsed = JSON.parse(raw);
-					return parsed && typeof parsed === 'object' ? parsed : null;
-				} catch (error) {
-					return null;
-				}
-			}));
+			if (keys.length) sawEntryKeys = true;
+			const values = [];
+			const readableKeys = keys.slice(0, Math.min(keys.length, REQUEST_LOG_KV_OPS_LIMIT - kvOps, limit - logs.length));
+			for (let i = 0; i < readableKeys.length;) {
+				if (kvOps >= REQUEST_LOG_KV_OPS_LIMIT || logs.length + values.length >= limit) break;
+				const batchSize = Math.min(REQUEST_LOG_KV_GET_BATCH_SIZE, REQUEST_LOG_KV_OPS_LIMIT - kvOps, limit - logs.length - values.length);
+				if (batchSize <= 0) break;
+				const batch = readableKeys.slice(i, i + batchSize);
+				i += batchSize;
+				kvOps += batch.length;
+				const batchValues = await Promise.all(batch.map(async key => {
+					try {
+						const raw = await env.KV.get(key.name);
+						if (!raw) return null;
+						const parsed = JSON.parse(raw);
+						return parsed && typeof parsed === 'object' ? parsed : null;
+					} catch (error) {
+						return null;
+					}
+				}));
+				values.push(...batchValues);
+			}
 			for (const value of values) {
 				if (value) logs.push(value);
 				if (logs.length >= limit) break;
 			}
 			cursor = page?.cursor;
-			if (page?.list_complete !== false || logs.length >= limit) break;
+			if (page?.list_complete !== false || logs.length >= limit || kvOps >= REQUEST_LOG_KV_OPS_LIMIT) break;
 		} while (cursor);
 	} catch (error) {
-		console.error(`Failed to read request logs: ${error.message}`);
+		debugError(`Failed to read request logs: ${error.message}`);
 	}
 
-	return logs.length ? logs : readLegacyRequestLogs(env);
+	return logs.length || sawEntryKeys ? logs : readLegacyRequestLogs(env);
 }
 
 async function writeRequestLogEntry(env = {}, logEntry, requestType = "Get_SUB", now = Date.now()) {
@@ -5361,13 +5555,13 @@ async function writeRequestLogEntry(env = {}, logEntry, requestType = "Get_SUB",
 			try {
 				if (await env.KV.get(dedupeKey)) return false;
 			} catch (error) {
-				console.error(`Failed to read request log dedupe key: ${error.message}`);
+				debugError(`Failed to read request log dedupe key: ${error.message}`);
 			}
 		}
 		try {
 			await env.KV.put(dedupeKey, String(entry.TIME), { expirationTtl: REQUEST_LOG_DEDUPE_TTL_SECONDS });
 		} catch (error) {
-			console.error(`Failed to write request log dedupe key: ${error.message}`);
+			debugError(`Failed to write request log dedupe key: ${error.message}`);
 		}
 	}
 
@@ -5406,12 +5600,12 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 						}
 					});
 				}
-			} catch (error) { console.error(`Failed to read tg.json: ${error.message}`) }
+			} catch (error) { debugError(`Failed to read tg.json: ${error.message}`) }
 		}
 		是否写入KV日志 = Boolean(是否写入KV日志) && isKvRequestLoggingEnabled(env);
 		if (!是否写入KV日志) return;
 		await writeRequestLogEntry(env, 日志内容, 请求类型, 当前时间.getTime());
-	} catch (error) { console.error(`Failed to record log: ${error.message}`) }
+	} catch (error) { debugError(`Failed to record log: ${error.message}`) }
 }
 
 function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
@@ -5425,8 +5619,17 @@ function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
 	return `${前缀}${'*'.repeat(星号数量)}${后缀}`;
 }
 
-function md5HexFallback(文本) {
-	const bytes = Array.from(new TextEncoder().encode(String(文本 || '')));
+let md5SubtleSupported = null;
+
+function toUint8ArrayView(data) {
+	if (data instanceof Uint8Array) return data;
+	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	if (data instanceof ArrayBuffer) return new Uint8Array(data);
+	return textEncoder.encode(String(data ?? ''));
+}
+
+function md5BytesFallback(data) {
+	const bytes = Array.from(toUint8ArrayView(data));
 	const bitLenLow = (bytes.length * 8) >>> 0;
 	const bitLenHigh = Math.floor((bytes.length * 8) / 0x100000000) >>> 0;
 	bytes.push(0x80);
@@ -5464,15 +5667,45 @@ function md5HexFallback(文本) {
 		d0 = (d0 + d) >>> 0;
 	}
 
-	const wordHex = word => [0, 8, 16, 24].map(shift => ((word >>> shift) & 0xff).toString(16).padStart(2, '0')).join('');
-	return `${wordHex(a0)}${wordHex(b0)}${wordHex(c0)}${wordHex(d0)}`;
+	const out = new Uint8Array(16);
+	const writeWord = (offset, word) => {
+		out[offset] = word & 0xff;
+		out[offset + 1] = (word >>> 8) & 0xff;
+		out[offset + 2] = (word >>> 16) & 0xff;
+		out[offset + 3] = (word >>> 24) & 0xff;
+	};
+	writeWord(0, a0);
+	writeWord(4, b0);
+	writeWord(8, c0);
+	writeWord(12, d0);
+	return out;
+}
+
+function bytesToHex(bytes) {
+	return Array.from(bytes).map(byte => byte.toString(16).padStart(2, '0')).join('').toLowerCase();
+}
+
+function md5HexFallback(文本) {
+	return bytesToHex(md5BytesFallback(String(文本 || '')));
+}
+
+async function md5Bytes(data) {
+	const bytes = toUint8ArrayView(data);
+	if (md5SubtleSupported !== false) {
+		try {
+			const 哈希 = await crypto.subtle.digest('MD5', bytes);
+			md5SubtleSupported = true;
+			return new Uint8Array(哈希);
+		} catch (error) {
+			md5SubtleSupported = false;
+		}
+	}
+	return md5BytesFallback(bytes);
 }
 
 async function md5Hex(文本) {
-	const 编码器 = new TextEncoder();
 	try {
-		const 哈希 = await crypto.subtle.digest('MD5', 编码器.encode(文本));
-		return Array.from(new Uint8Array(哈希)).map(字节 => 字节.toString(16).padStart(2, '0')).join('').toLowerCase();
+		return bytesToHex(await md5Bytes(String(文本 ?? '')));
 	} catch (error) {
 		return md5HexFallback(文本).toLowerCase();
 	}
@@ -5497,10 +5730,18 @@ async function MD5MD5(文本) {
 
 function 随机路径(完整节点路径 = "/") {
 	const 常用路径目录 = ["about", "account", "acg", "act", "activity", "ad", "ads", "ajax", "album", "albums", "anime", "api", "app", "apps", "archive", "archives", "article", "articles", "ask", "auth", "avatar", "bbs", "bd", "blog", "blogs", "book", "books", "bt", "buy", "cart", "category", "categories", "cb", "channel", "channels", "chat", "china", "city", "class", "classify", "clip", "clips", "club", "cn", "code", "collect", "collection", "comic", "comics", "community", "company", "config", "contact", "content", "course", "courses", "cp", "data", "detail", "details", "dh", "directory", "discount", "discuss", "dl", "dload", "doc", "docs", "document", "documents", "doujin", "download", "downloads", "drama", "edu", "en", "ep", "episode", "episodes", "event", "events", "f", "faq", "favorite", "favourites", "favs", "feedback", "file", "files", "film", "films", "forum", "forums", "friend", "friends", "game", "games", "gif", "go", "go.html", "go.php", "group", "groups", "help", "home", "hot", "htm", "html", "image", "images", "img", "index", "info", "intro", "item", "items", "ja", "jp", "jump", "jump.html", "jump.php", "jumping", "knowledge", "lang", "lesson", "lessons", "lib", "library", "link", "links", "list", "live", "lives", "m", "mag", "magnet", "mall", "manhua", "map", "member", "members", "message", "messages", "mobile", "movie", "movies", "music", "my", "new", "news", "note", "novel", "novels", "online", "order", "out", "out.html", "out.php", "outbound", "p", "page", "pages", "pay", "payment", "pdf", "photo", "photos", "pic", "pics", "picture", "pictures", "play", "player", "playlist", "post", "posts", "product", "products", "program", "programs", "project", "qa", "question", "rank", "ranking", "read", "readme", "redirect", "redirect.html", "redirect.php", "reg", "register", "res", "resource", "retrieve", "sale", "search", "season", "seasons", "section", "seller", "series", "service", "services", "setting", "settings", "share", "shop", "show", "shows", "site", "soft", "sort", "source", "special", "star", "stars", "static", "stock", "store", "stream", "streaming", "streams", "student", "study", "tag", "tags", "task", "teacher", "team", "tech", "temp", "test", "thread", "tool", "tools", "topic", "topics", "torrent", "trade", "travel", "tv", "txt", "type", "u", "upload", "uploads", "url", "urls", "user", "users", "v", "version", "videos", "view", "vip", "vod", "watch", "web", "wenku", "wiki", "work", "www", "zh", "zh-cn", "zh-tw", "zip"];
+	const 保留路径 = new Set(['admin', 'login', 'logout', 'sub', 'version', 'robots.txt', 'locations']);
+	const 候选路径 = 常用路径目录.filter(item => !保留路径.has(item.toLowerCase()));
 	const 随机数 = Math.floor(Math.random() * 3 + 1);
-	const 随机路径 = 常用路径目录.sort(() => 0.5 - Math.random()).slice(0, 随机数).join('/');
-	if (完整节点路径 === "/") return `/${随机路径}`;
-	else return `/${随机路径 + 完整节点路径.replace('/?', '?')}`;
+	const 已选择 = new Set();
+	while (已选择.size < 随机数 && 已选择.size < 候选路径.length) {
+		已选择.add(候选路径[Math.floor(Math.random() * 候选路径.length)]);
+	}
+	const 随机片段 = [...已选择].join('/');
+	const [路径部分, 查询部分 = ''] = String(完整节点路径 || '/').split('?');
+	const 规范路径 = ('/' + 路径部分).replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+	const 输出路径 = 规范路径 === '/' ? `/${随机片段}` : `${规范路径}/${随机片段}`;
+	return 查询部分 ? `${输出路径}?${查询部分}` : 输出路径;
 }
 
 function 替换星号为随机字符(内容) {
@@ -5657,6 +5898,15 @@ function writeDohCache(cacheKey, answers, now = Date.now()) {
 	}, DNS_RESULT_CACHE_MAX_ENTRIES);
 }
 
+function writeDohNegativeCache(cacheKey, now = Date.now()) {
+	const ttlMs = Math.max(1000, Number(DNS_RESULT_NEGATIVE_TTL_MS) || 30 * 1000);
+	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
+		expiresAt: now + ttlMs,
+		answers: [],
+		negative: true,
+	}, DNS_RESULT_CACHE_MAX_ENTRIES);
+}
+
 async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOOKUP_URL) {
 	const 开始时间 = performance.now();
 	const normalizedDomain = String(域名 || '').trim().toLowerCase();
@@ -5668,7 +5918,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 	try {
 
 		const 类型映射 = { 'A': 1, 'NS': 2, 'CNAME': 5, 'MX': 15, 'TXT': 16, 'AAAA': 28, 'SRV': 33, 'HTTPS': 65 };
-		const qtype = 类型映射[记录类型.toUpperCase()] || 1;
+		const qtype = 类型映射[normalizedType] || 1;
 
 
 		const 编码域名 = (name) => {
@@ -5687,7 +5937,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		};
 
 
-		const qname = 编码域名(域名);
+		const qname = 编码域名(normalizedDomain);
 		const query = new Uint8Array(12 + qname.length + 4);
 		const qview = new DataView(query.buffer);
 		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]); // ID (random per RFC 1035)
@@ -5709,13 +5959,14 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		}, DOH_LOOKUP_TIMEOUT_MS);
 		if (!response.ok) {
 			try { response.body?.cancel() } catch (e) { }
-			console.warn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
+			debugWarn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
+			writeDohNegativeCache(cacheKey);
 			return [];
 		}
 
 
 		const buf = new Uint8Array(await response.arrayBuffer());
-		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
+		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); writeDohNegativeCache(cacheKey); return []; }
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
@@ -5794,7 +6045,8 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		return answers;
 	} catch (error) {
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
-		console.error(`[DoH lookup] Query failed for ${域名} ${记录类型} via ${DoH解析服务} after ${耗时}ms:`, error);
+		debugError(`[DoH lookup] Query failed for ${域名} ${记录类型} via ${DoH解析服务} after ${耗时}ms:`, error);
+		writeDohNegativeCache(cacheKey);
 		return [];
 	}
 }
@@ -6541,7 +6793,18 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 	}
 
 	const loadPromise = (async () => {
-		const upstream = await fetch(Pages静态页面 + path);
+		let upstream;
+		try {
+			upstream = await fetchWithTimeout(Pages静态页面 + path, {}, 5000);
+		} catch (error) {
+			return {
+				body: await nginx(),
+				status: statusOverride ?? 502,
+				statusText: 'Bad Gateway',
+				headers: [['Content-Type', 'text/html; charset=UTF-8'], ['Cache-Control', 'no-store']],
+				createdAt: Date.now(),
+			};
+		}
 		const headers = new Headers(upstream.headers);
 		headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 		headers.set('Pragma', 'no-cache');
@@ -6648,7 +6911,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		启用0RTT: false,
 		TLS分片: null,
 		随机路径: false,
-		ECH: true,
+		ECH: false,
 		ECHConfig: {
 			DNS: Ali_DoH,
 			SNI: ECH_SNI,
@@ -6738,7 +7001,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			config_JSON = JSON.parse(configJSON);
 		}
 	} catch (error) {
-		console.error(`Failed to read config_JSON: ${error.message}`);
+		debugError(`Failed to read config_JSON: ${error.message}`);
 		config_JSON = 默认配置JSON;
 	}
 
@@ -6764,7 +7027,6 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 
 	applyTopConfigAliases(config_JSON, env);
 	if (!config_JSON.gRPCUserAgent) config_JSON.gRPCUserAgent = UA;
-	const normalizeConfigHost = h => String(h || '').toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0].trim();
 	const currentHostname = normalizeConfigHost(hostname);
 	config_JSON.HOST = currentHostname || host;
 	if (env.HOST) {
@@ -6784,6 +7046,10 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 
 	if (env.PATH) config_JSON.PATH = env.PATH.startsWith('/') ? env.PATH : '/' + env.PATH;
 	else if (!config_JSON.PATH) config_JSON.PATH = '/';
+	// A custom PATH turns on the tunnel path-gate (which requires a fixed path prefix). Random path
+	// would prepend random segments (/rand/.../mypath) that the gate rejects, breaking connections.
+	// So when a non-root PATH is set, force random path off — the two features are mutually exclusive.
+	if (config_JSON.随机路径 && config_JSON.PATH && config_JSON.PATH !== '/') config_JSON.随机路径 = false;
 
 	if (!config_JSON.gRPC模式) config_JSON.gRPC模式 = 'gun';
 	if (!config_JSON.SS) config_JSON.SS = { 加密方式: "aes-128-gcm", TLS: false };
@@ -6864,7 +7130,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			config_JSON.TG.BotToken = TG_JSON.BotToken ? 掩码敏感信息(TG_JSON.BotToken) : null;
 		}
 	} catch (error) {
-		console.error(`Failed to read tg.json: ${error.message}`);
+		debugError(`Failed to read tg.json: ${error.message}`);
 	}
 
 	const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
@@ -6881,7 +7147,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 					const Usage = await response.json();
 					config_JSON.CF.Usage = Usage;
 				} catch (err) {
-					console.error(`CF_JSON.UsageAPI request failed: ${err.message}`);
+					debugError(`CF_JSON.UsageAPI request failed: ${err.message}`);
 				}
 			} else {
 				config_JSON.CF.Email = CF_JSON.Email ? CF_JSON.Email : null;
@@ -6894,7 +7160,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			}
 		}
 	} catch (error) {
-		console.error(`Failed to read cf.json: ${error.message}`);
+		debugError(`Failed to read cf.json: ${error.message}`);
 	}
 
 	config_JSON.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
@@ -6945,7 +7211,7 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const cfname = 运营商名称映射[运营商文件标识] || 'CF Official Preferred';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
-	try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	try { const res = await fetchWithTimeout(cidr_url, {}, 5000); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
 
 	const generateRandomIPFromCIDR = (cidr) => {
 		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
@@ -6965,11 +7231,16 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 }
 
 async function 整理成数组(内容) {
-	var 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
+	if (内容 == null) return [];
+	if (Array.isArray(内容)) {
+		const nested = await Promise.all(内容.map(item => 整理成数组(item)));
+		return nested.flat();
+	}
+	var 替换后的内容 = String(内容).replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
 	if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
 	if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
 	const 地址数组 = 替换后的内容.split(',');
-	return 地址数组;
+	return 地址数组.map(item => item.trim()).filter(Boolean);
 }
 
 async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
@@ -7105,7 +7376,7 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 					return;
 				}
 			} catch (e) {
-				console.error('Failed to decode response:', e);
+				debugError('Failed to decode response:', e);
 				return;
 			}
 
@@ -7301,7 +7572,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 		return { success: true, pages, workers, total, max };
 
 	} catch (error) {
-		console.error('Failed to fetch usage:', error.message);
+		debugError('Failed to fetch usage:', error.message);
 		return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
 	}
 }
@@ -7356,6 +7627,7 @@ function emptyTunnelContext() {
 		proxyAccount: null,
 		parsedProxyAddress: {},
 		socksWhitelist: DEFAULT_SOCKS5_WHITELIST,
+		forceProxyHosts: [],
 		tcpDialConcurrency: 2,
 		preloadRaceDial: false,
 	};
@@ -7370,9 +7642,22 @@ async function getSocksWhitelist(env) {
 	return 缓存SOCKS5白名单;
 }
 
+async function getForceProxyHosts(env) {
+	const key = String(env?.FORCE_PROXY_HOSTS || env?.PROXYIP_HOSTS || '');
+	if (缓存强制反代主机 && 缓存强制反代主机键 === key) return 缓存强制反代主机;
+	缓存强制反代主机 = key.trim() ? [...new Set((await 整理成数组(key)).map(value => String(value || '').trim()).filter(Boolean))] : [];
+	缓存强制反代主机键 = key;
+	return 缓存强制反代主机;
+}
+
 async function getProxyIPList(env) {
 	const raw = String(env?.PROXYIP || '');
 	if (cachedProxyIPList && cachedProxyIPRaw === raw) return cachedProxyIPList;
+	if (raw.trim().toLowerCase() === 'auto') {
+		cachedProxyIPRaw = raw;
+		cachedProxyIPList = [];
+		return cachedProxyIPList;
+	}
 	cachedProxyIPList = raw.trim()
 		? (await 整理成数组(raw)).map(value => String(value || '').trim()).filter(Boolean)
 		: [];
@@ -7394,6 +7679,7 @@ async function createTunnelContext(request, env = {}) {
 		tunnelContext.proxyFallbackEnabled = true;
 	}
 	tunnelContext.socksWhitelist = await getSocksWhitelist(env);
+	tunnelContext.forceProxyHosts = await getForceProxyHosts(env);
 	tunnelContext.tcpDialConcurrency = 识别运营商(request) === 'cmcc' ? 1 : 2;
 	tunnelContext.preloadRaceDial = ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL || '').toLowerCase());
 	// NOTE: no automatic ProxyIP scan here. Auto-scanning rapidly TCP-probes many Cloudflare IPs,
@@ -7436,7 +7722,7 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 			if (isNaN(tunnelContext.parsedProxyAddress.port)) throw new Error('Invalid chain proxy port');
 			return tunnelContext;
 		} catch (err) {
-			console.error('Failed to parse chain proxy parameters:', err.message);
+			debugError('Failed to parse chain proxy parameters:', err.message);
 		}
 	}
 
@@ -7513,7 +7799,7 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 		else if (searchParams.get('sstp')) tunnelContext.proxyType = 'sstp';
 		else tunnelContext.proxyType = tunnelContext.proxyType || 'socks5';
 	} catch (err) {
-		console.error('Failed to parse SOCKS5 address:', err.message);
+		debugError('Failed to parse SOCKS5 address:', err.message);
 		tunnelContext.proxyType = null;
 		tunnelContext.parsedProxyAddress = {};
 	}
@@ -7887,11 +8173,11 @@ function expandPreferredEndpointVariants(value) {
 	const labelCount = lowerAddress.split('.').filter(Boolean).length;
 	const isWwwApexPair = lowerAddress.startsWith('www.') && labelCount === 3;
 	const isBareApexPair = !lowerAddress.startsWith('www.') && labelCount === 2;
-	if (!isWwwApexPair && !isBareApexPair) return [formatPreferredEndpointVariant(parsed, address)];
-	const pairedAddress = isWwwApexPair ? address.slice(4) : `www.${address}`;
-	if (!pairedAddress || pairedAddress === address || !isValidProxyEndpointHost(pairedAddress) || isIPHostname(pairedAddress)) return [value];
+	if (!isWwwApexPair && !isBareApexPair) return [formatPreferredEndpointVariant(parsed, lowerAddress)];
+	const pairedAddress = isWwwApexPair ? lowerAddress.slice(4) : `www.${lowerAddress}`;
+	if (!pairedAddress || pairedAddress === lowerAddress || !isValidProxyEndpointHost(pairedAddress) || isIPHostname(pairedAddress)) return [formatPreferredEndpointVariant(parsed, lowerAddress)];
 	return [...new Set([
-		formatPreferredEndpointVariant(parsed, address),
+		formatPreferredEndpointVariant(parsed, lowerAddress),
 		formatPreferredEndpointVariant(parsed, pairedAddress),
 	])];
 }
@@ -7993,6 +8279,8 @@ export const __testPerformanceHelpers = {
 	recordProxyEndpointResult,
 	DoH查询,
 	MD5MD5,
+	md5Bytes,
+	deriveShadowsocksMasterKey: SS派生主密钥,
 	sha224,
 	parsePreferredEndpoint,
 	expandPreferredEndpointVariants,
@@ -8011,6 +8299,7 @@ export const __testPerformanceHelpers = {
 	getSubscriptionRequestOptions,
 	finalizeSubscriptionContent,
 	getTransportConfig: 获取传输协议配置,
+	getTransportPathParamValue: 获取传输路径参数值,
 	readConfigJson: 读取config_JSON,
 	translateHTMLVisibleText,
 	injectEnglishRuntimeTranslator,
@@ -8021,10 +8310,17 @@ export const __testPerformanceHelpers = {
 	writeRequestLogEntry,
 	isSpeedTestSite,
 	matchesHostPattern,
+	patchClashSubscription: Clash订阅配置文件热补丁,
 	patchSingboxSubscription: Singbox订阅配置文件热补丁,
 	patchSurgeSubscription: Surge订阅配置文件热补丁,
 	readGrpcFrameLength,
 	parseDnsTcpFrames: 解析DNS_TCP帧,
+	readXhttpFirstPacket: 读取XHTTP首包,
+	createUploadQueue: 创建上行写入队列,
+	normalizeConfigHost,
+	splitConfigArray: 整理成数组,
+	base64SecretEncode,
+	base64SecretDecode,
 };
 
 async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', env = null, ctx = null) {

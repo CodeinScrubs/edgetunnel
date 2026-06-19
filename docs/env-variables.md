@@ -105,6 +105,7 @@ from a Worker (Error 1034) and use a relay called a **ProxyIP**.
 |---|---|---|---|
 | **`PROXYIP`** | `auto` (per-datacenter community relay) | The relay for Cloudflare-hosted destinations. | `auto` uses a shared community relay (variable quality). Set a specific `host:port` if you have a reliable one. Most of your traffic doesn't use this. |
 | **`PROXYIP_FALLBACK`** | off | flag | When you set a **custom** `PROXYIP`, fallback is normally disabled. `PROXYIP_FALLBACK=1` keeps the community-relay fallback on, so a dead custom ProxyIP doesn't kill the connection. | Turn on if you set a custom `PROXYIP` and want resilience. N/A if you use `auto`. |
+| **`FORCE_PROXY_HOSTS`** | none | Comma/newline list of target host patterns that skip direct dialing and go straight through ProxyIP or the configured chain proxy. | Use for your own Cloudflare-hosted panel/custom domains, for example `xpanel.a6w.ir,*.a6w.ir`, when they fail only while tunneled. Leave unset for normal browsing. |
 | **`GO2SOCKS5`** | none | Comma/newline list of domains forced through a SOCKS5 upstream. | Advanced; leave unset unless you run a SOCKS5 server. |
 
 ---

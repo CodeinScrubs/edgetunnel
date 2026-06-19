@@ -51,3 +51,5 @@ node ../scripts/live-tunnel-benchmark.mjs --url https://your-tunnel.example/ --u
 ```
 
 Use 1 MiB first. Then try 4 MiB and 8 MiB only after success rate stays at `1`.
+
+For the full baseline/candidate workflow and tuning report commands, see `../docs/benchmarking-and-tuning.md`.

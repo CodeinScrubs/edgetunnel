@@ -38,17 +38,21 @@ function scenarioLabel(item) {
 	return `${profile}/${transport}/${frontHost}`;
 }
 
-function normalizeSummaryEntry(item, sourceFile) {
-	const scenario = item.scenario || {};
-	const summaryArray = Array.isArray(item.summary?.summary)
-		? item.summary.summary
-		: Array.isArray(item.summary)
-			? item.summary
-			: [];
+function isMatrixCommand(item) {
+	return String(item.command || '').includes('live-benchmark-matrix.mjs');
+}
+
+function isWrapperAggregateScenario(item) {
+	return isMatrixCommand(item)
+		&& item.summary?.type === 'summary'
+		&& String(item.scenario?.frontHost || '').includes(',');
+}
+
+function normalizeSummaryArray(summaryArray, scenario, item, sourceFile) {
 	return summaryArray.map(summary => ({
 		sourceFile,
 		scenario,
-		label: scenarioLabel({ ...item, summary }),
+		label: scenarioLabel({ ...item, scenario, summary }),
 		transport: summary.transport || 'unknown',
 		profile: scenario.profile || item.profile || 'unknown',
 		frontHost: scenario.frontHost || item.frontHost || '',
@@ -57,14 +61,36 @@ function normalizeSummaryEntry(item, sourceFile) {
 		successRate: Number(summary.successRate || 0),
 		tlsP50Ms: numberOrNull(summary.tlsP50Ms),
 		tlsP95Ms: numberOrNull(summary.tlsP95Ms),
+		tlsJitterMs: numberOrNull(summary.tlsJitterMs),
 		firstByteP50Ms: numberOrNull(summary.firstByteP50Ms),
 		firstByteP95Ms: numberOrNull(summary.firstByteP95Ms),
+		firstByteJitterMs: numberOrNull(summary.firstByteJitterMs),
 		totalP50Ms: numberOrNull(summary.totalP50Ms),
 		totalP95Ms: numberOrNull(summary.totalP95Ms),
+		totalJitterMs: numberOrNull(summary.totalJitterMs),
 		throughputP50Mbps: numberOrNull(summary.throughputP50Mbps),
 		throughputP95Mbps: numberOrNull(summary.throughputP95Mbps),
 		raw: summary,
 	}));
+}
+
+function normalizeSummaryEntry(item, sourceFile) {
+	if (isWrapperAggregateScenario(item)) return [];
+	if (item.summary?.type === 'matrix-summary' && Array.isArray(item.summary.ranked)) {
+		return item.summary.ranked.flatMap(rankedItem => normalizeSummaryArray(
+			Array.isArray(rankedItem.summary) ? rankedItem.summary : [],
+			rankedItem.scenario || item.scenario || {},
+			item,
+			sourceFile
+		));
+	}
+	const scenario = item.scenario || {};
+	const summaryArray = Array.isArray(item.summary?.summary)
+		? item.summary.summary
+		: Array.isArray(item.summary)
+			? item.summary
+			: [];
+	return normalizeSummaryArray(summaryArray, scenario, item, sourceFile);
 }
 
 function numberOrNull(value) {
@@ -114,6 +140,8 @@ function makeSignals(entries, minRuns) {
 		if (entry.successRate < 1) signals.push({ level: 'fail', label: entry.label, message: `Inner success rate is ${entry.successRate}; target/front/transport is not stable enough.` });
 		if ((entry.tlsP95Ms ?? 0) > 1500) signals.push({ level: 'warn', label: entry.label, message: `Inner TLS p95 is ${entry.tlsP95Ms}ms; real HTTPS browsing may feel slow before page data starts.` });
 		if ((entry.firstByteP95Ms ?? 0) > 1000) signals.push({ level: 'warn', label: entry.label, message: `First-byte p95 is ${entry.firstByteP95Ms}ms; users may feel stalls on browsing or Telegram bursts.` });
+		if ((entry.firstByteJitterMs ?? 0) > 500) signals.push({ level: 'warn', label: entry.label, message: `First-byte jitter is ${entry.firstByteJitterMs}ms; route feels inconsistent even when success rate is high.` });
+		if ((entry.tlsJitterMs ?? 0) > 500) signals.push({ level: 'warn', label: entry.label, message: `Inner TLS jitter is ${entry.tlsJitterMs}ms; HTTPS opens may feel randomly slow.` });
 		if ((entry.totalP95Ms ?? 0) > 3000 && ['latency', 'burst'].includes(entry.profile)) signals.push({ level: 'warn', label: entry.label, message: `Small-response total p95 is ${entry.totalP95Ms}ms; front host or path is jittery.` });
 		if (['download', 'upload'].includes(entry.profile) && entry.throughputP50Mbps !== null && entry.throughputP50Mbps < 5) {
 			signals.push({ level: 'warn', label: entry.label, message: `Throughput p50 is ${entry.throughputP50Mbps} Mbps; test bigger payloads and alternate fronts before tuning buffers.` });

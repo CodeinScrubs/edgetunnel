@@ -28,17 +28,54 @@ function readJsonFile(file) {
 	return JSON.parse(readFileSync(file, 'utf8'));
 }
 
+function normalizeList(value) {
+	const list = Array.isArray(value)
+		? value
+		: String(value || '').split(',');
+	return list.map(item => String(item).trim()).filter(Boolean).sort();
+}
+
+function comparableValue(value) {
+	if (Array.isArray(value)) return normalizeList(value).join(',');
+	if (value && typeof value === 'object') return JSON.stringify(value);
+	return String(value ?? '');
+}
+
+function addMismatch(mismatches, field, baselineValue, candidateValue) {
+	if (baselineValue === undefined || candidateValue === undefined) return;
+	const left = comparableValue(baselineValue);
+	const right = comparableValue(candidateValue);
+	if (left !== right) mismatches.push({ field, baseline: baselineValue, candidate: candidateValue });
+}
+
+function compareReportMetadata(baseline, candidate) {
+	const mismatches = [];
+	addMismatch(mismatches, 'frontHosts', baseline.frontHosts, candidate.frontHosts);
+	addMismatch(mismatches, 'profiles', baseline.profiles, candidate.profiles);
+	addMismatch(mismatches, 'transports', baseline.transports, candidate.transports);
+	addMismatch(mismatches, 'target', baseline.target, candidate.target);
+	addMismatch(mismatches, 'port', baseline.port, candidate.port);
+	for (const name of ['http', 'https', 'benchmark']) {
+		addMismatch(mismatches, `targets.${name}`, baseline.targets?.[name], candidate.targets?.[name]);
+	}
+	return mismatches;
+}
+
 function numberOrNull(value) {
 	return Number.isFinite(value) ? Number(value) : null;
 }
 
-function normalizeSummaryEntry(item, sourceFile) {
-	const scenario = item.scenario || {};
-	const summaryArray = Array.isArray(item.summary?.summary)
-		? item.summary.summary
-		: Array.isArray(item.summary)
-			? item.summary
-			: [];
+function isMatrixCommand(item) {
+	return String(item.command || '').includes('live-benchmark-matrix.mjs');
+}
+
+function isWrapperAggregateScenario(item) {
+	return isMatrixCommand(item)
+		&& item.summary?.type === 'summary'
+		&& String(item.scenario?.frontHost || '').includes(',');
+}
+
+function normalizeSummaryArray(summaryArray, scenario, item, sourceFile) {
 	return summaryArray.map(summary => ({
 		sourceFile,
 		key: [
@@ -53,11 +90,33 @@ function normalizeSummaryEntry(item, sourceFile) {
 		acceptRate: Number(summary.acceptRate || 0),
 		successRate: Number(summary.successRate || 0),
 		tlsP95Ms: numberOrNull(summary.tlsP95Ms),
+		tlsJitterMs: numberOrNull(summary.tlsJitterMs),
 		firstByteP95Ms: numberOrNull(summary.firstByteP95Ms),
+		firstByteJitterMs: numberOrNull(summary.firstByteJitterMs),
 		totalP95Ms: numberOrNull(summary.totalP95Ms),
+		totalJitterMs: numberOrNull(summary.totalJitterMs),
 		throughputP50Mbps: numberOrNull(summary.throughputP50Mbps),
 		raw: summary,
 	}));
+}
+
+function normalizeSummaryEntry(item, sourceFile) {
+	if (isWrapperAggregateScenario(item)) return [];
+	if (item.summary?.type === 'matrix-summary' && Array.isArray(item.summary.ranked)) {
+		return item.summary.ranked.flatMap(rankedItem => normalizeSummaryArray(
+			Array.isArray(rankedItem.summary) ? rankedItem.summary : [],
+			rankedItem.scenario || item.scenario || {},
+			item,
+			sourceFile
+		));
+	}
+	const scenario = item.scenario || {};
+	const summaryArray = Array.isArray(item.summary?.summary)
+		? item.summary.summary
+		: Array.isArray(item.summary)
+			? item.summary
+			: [];
+	return normalizeSummaryArray(summaryArray, scenario, item, sourceFile);
 }
 
 function collectEntries(report, sourceFile) {
@@ -78,8 +137,11 @@ function compareEntry(baseline, candidate, options) {
 		acceptRateDelta: candidate.acceptRate - baseline.acceptRate,
 		successRateDelta: candidate.successRate - baseline.successRate,
 		tlsP95DeltaPct: percentDelta(baseline.tlsP95Ms, candidate.tlsP95Ms, true),
+		tlsJitterDeltaPct: percentDelta(baseline.tlsJitterMs, candidate.tlsJitterMs, true),
 		firstByteP95DeltaPct: percentDelta(baseline.firstByteP95Ms, candidate.firstByteP95Ms, true),
+		firstByteJitterDeltaPct: percentDelta(baseline.firstByteJitterMs, candidate.firstByteJitterMs, true),
 		totalP95DeltaPct: percentDelta(baseline.totalP95Ms, candidate.totalP95Ms, true),
+		totalJitterDeltaPct: percentDelta(baseline.totalJitterMs, candidate.totalJitterMs, true),
 		throughputP50DeltaPct: percentDelta(baseline.throughputP50Mbps, candidate.throughputP50Mbps, false),
 	};
 	const signals = [];
@@ -91,8 +153,17 @@ function compareEntry(baseline, candidate, options) {
 	if (changes.firstByteP95DeltaPct !== null && changes.firstByteP95DeltaPct < -options.maxLatencyRegressionPct) {
 		signals.push({ level: 'fail', message: `firstByteP95 regressed ${Math.abs(changes.firstByteP95DeltaPct).toFixed(1)}%` });
 	}
+	if (changes.firstByteJitterDeltaPct !== null && changes.firstByteJitterDeltaPct < -options.maxLatencyRegressionPct) {
+		signals.push({ level: 'fail', message: `firstByteJitter regressed ${Math.abs(changes.firstByteJitterDeltaPct).toFixed(1)}%` });
+	}
 	if (changes.totalP95DeltaPct !== null && changes.totalP95DeltaPct < -options.maxLatencyRegressionPct) {
 		signals.push({ level: 'fail', message: `totalP95 regressed ${Math.abs(changes.totalP95DeltaPct).toFixed(1)}%` });
+	}
+	if (changes.totalJitterDeltaPct !== null && changes.totalJitterDeltaPct < -options.maxLatencyRegressionPct) {
+		signals.push({ level: 'fail', message: `totalJitter regressed ${Math.abs(changes.totalJitterDeltaPct).toFixed(1)}%` });
+	}
+	if (changes.tlsJitterDeltaPct !== null && changes.tlsJitterDeltaPct < -options.maxLatencyRegressionPct) {
+		signals.push({ level: 'fail', message: `tlsJitter regressed ${Math.abs(changes.tlsJitterDeltaPct).toFixed(1)}%` });
 	}
 	if (changes.throughputP50DeltaPct !== null && changes.throughputP50DeltaPct < -options.maxThroughputRegressionPct) {
 		signals.push({ level: 'fail', message: `throughputP50 regressed ${Math.abs(changes.throughputP50DeltaPct).toFixed(1)}%` });
@@ -100,8 +171,11 @@ function compareEntry(baseline, candidate, options) {
 	if (!signals.length) {
 		const improved = [
 			changes.tlsP95DeltaPct,
+			changes.tlsJitterDeltaPct,
 			changes.firstByteP95DeltaPct,
+			changes.firstByteJitterDeltaPct,
 			changes.totalP95DeltaPct,
+			changes.totalJitterDeltaPct,
 			changes.throughputP50DeltaPct,
 		].some(value => value !== null && value > 0);
 		signals.push({ level: improved ? 'pass' : 'neutral', message: improved ? 'candidate improves at least one tracked metric without regressions' : 'candidate is statistically similar by configured thresholds' });
@@ -133,8 +207,11 @@ const options = {
 	maxThroughputRegressionPct: Math.max(0, Number(args['max-throughput-regression'] || 5)),
 };
 
-const baselineEntries = collectEntries(readJsonFile(args.baseline), args.baseline);
-const candidateEntries = collectEntries(readJsonFile(args.candidate), args.candidate);
+const baselineReport = readJsonFile(args.baseline);
+const candidateReport = readJsonFile(args.candidate);
+const metadataMismatches = compareReportMetadata(baselineReport, candidateReport);
+const baselineEntries = collectEntries(baselineReport, args.baseline);
+const candidateEntries = collectEntries(candidateReport, args.candidate);
 const candidateByKey = new Map(candidateEntries.map(entry => [entry.key, entry]));
 const comparisons = [];
 const missing = [];
@@ -148,22 +225,28 @@ for (const baseline of baselineEntries) {
 }
 
 const failures = comparisons.flatMap(comparison => comparison.signals.filter(signal => signal.level === 'fail').map(signal => ({ key: comparison.key, ...signal })));
+if (comparisons.length === 0) failures.push({ key: null, level: 'fail', message: 'No comparable benchmark scenarios were found' });
 const report = {
 	generatedAt: new Date().toISOString(),
 	options,
 	baseline: args.baseline,
 	candidate: args.candidate,
 	compared: comparisons.length,
+	metadataMismatches,
 	missing,
 	failures,
 	comparisons,
-	verdict: failures.length || missing.length ? 'fail' : 'pass',
+	verdict: failures.length || missing.length || metadataMismatches.length ? 'fail' : 'pass',
 };
 
 if (args.json) {
 	console.log(JSON.stringify(report, null, 2));
 } else {
 	console.log(`Compared ${comparisons.length} matching benchmark scenario(s). Verdict: ${report.verdict.toUpperCase()}`);
+	if (metadataMismatches.length) {
+		console.log('\nMetadata mismatches:');
+		for (const mismatch of metadataMismatches) console.log(`- ${mismatch.field}: ${JSON.stringify(mismatch.baseline)} -> ${JSON.stringify(mismatch.candidate)}`);
+	}
 	if (missing.length) {
 		console.log('\nMissing candidate scenarios:');
 		for (const key of missing) console.log(`- ${key}`);
@@ -171,15 +254,21 @@ if (args.json) {
 	for (const comparison of comparisons) {
 		const label = `${comparison.profile}/${comparison.transport}/${comparison.frontHost || '(none)'}`;
 		const tls = comparison.changes.tlsP95DeltaPct;
+		const tlsJitter = comparison.changes.tlsJitterDeltaPct;
 		const first = comparison.changes.firstByteP95DeltaPct;
+		const firstJitter = comparison.changes.firstByteJitterDeltaPct;
 		const total = comparison.changes.totalP95DeltaPct;
+		const totalJitter = comparison.changes.totalJitterDeltaPct;
 		const throughput = comparison.changes.throughputP50DeltaPct;
 		console.log(`\n${label}`);
 		console.log(`  acceptRate: ${comparison.baseline.acceptRate} -> ${comparison.candidate.acceptRate}`);
 		console.log(`  successRate: ${comparison.baseline.successRate} -> ${comparison.candidate.successRate}`);
 		console.log(`  tlsP95: ${comparison.baseline.tlsP95Ms ?? 'n/a'}ms -> ${comparison.candidate.tlsP95Ms ?? 'n/a'}ms (${tls === null ? 'n/a' : tls.toFixed(1) + '%'})`);
+		console.log(`  tlsJitter: ${comparison.baseline.tlsJitterMs ?? 'n/a'}ms -> ${comparison.candidate.tlsJitterMs ?? 'n/a'}ms (${tlsJitter === null ? 'n/a' : tlsJitter.toFixed(1) + '%'})`);
 		console.log(`  firstByteP95: ${comparison.baseline.firstByteP95Ms ?? 'n/a'}ms -> ${comparison.candidate.firstByteP95Ms ?? 'n/a'}ms (${first === null ? 'n/a' : first.toFixed(1) + '%'})`);
+		console.log(`  firstByteJitter: ${comparison.baseline.firstByteJitterMs ?? 'n/a'}ms -> ${comparison.candidate.firstByteJitterMs ?? 'n/a'}ms (${firstJitter === null ? 'n/a' : firstJitter.toFixed(1) + '%'})`);
 		console.log(`  totalP95: ${comparison.baseline.totalP95Ms ?? 'n/a'}ms -> ${comparison.candidate.totalP95Ms ?? 'n/a'}ms (${total === null ? 'n/a' : total.toFixed(1) + '%'})`);
+		console.log(`  totalJitter: ${comparison.baseline.totalJitterMs ?? 'n/a'}ms -> ${comparison.candidate.totalJitterMs ?? 'n/a'}ms (${totalJitter === null ? 'n/a' : totalJitter.toFixed(1) + '%'})`);
 		console.log(`  throughputP50: ${comparison.baseline.throughputP50Mbps ?? 'n/a'}Mbps -> ${comparison.candidate.throughputP50Mbps ?? 'n/a'}Mbps (${throughput === null ? 'n/a' : throughput.toFixed(1) + '%'})`);
 		for (const signal of comparison.signals) console.log(`  ${signal.level.toUpperCase()}: ${signal.message}`);
 	}

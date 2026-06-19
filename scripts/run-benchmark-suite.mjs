@@ -23,7 +23,9 @@ function usage() {
 		'  --dry-run                 Print commands without running them',
 		'  --out-dir benchmark-runs  Directory for JSON reports',
 		'  --prefix baseline         Report file prefix',
+		'  --label baseline          Human label stored in the suite report',
 		'  --front-hosts a,b         Clean/front hosts to compare',
+		'  --transports grpc         grpc, ws, xhttp, all, or comma-separated list for latency/burst/download/upload',
 		'  --http-target host        Plain HTTP small-response target, default neverssl.com',
 		'  --https-target host       HTTPS browsing target, default example.com',
 		'  --bench-target host       Optional deterministic benchmark target for download/upload',
@@ -50,31 +52,18 @@ function parseSummaryLine(stdout) {
 		try {
 			const parsed = JSON.parse(line);
 			if (parsed?.type === 'summary' && Array.isArray(parsed.summary)) return parsed;
+			if (parsed?.type === 'matrix-summary' && Array.isArray(parsed.ranked)) return parsed;
 		} catch {}
 	}
 	return null;
 }
 
-function buildMatrixCommand(options, { profiles, target, port, runs, out }) {
+function buildMatrixCommand(options, { profiles, target, port, runs, out, httpPath, httpMethod, bodyBytes, timeout }) {
 	const commandArgs = ['scripts/live-benchmark-matrix.mjs'];
 	for (const name of ['url', 'uuid', 'sni', 'authority']) addFlag(commandArgs, name, options[name]);
-	addFlag(commandArgs, 'transports', 'grpc');
+	addFlag(commandArgs, 'transports', profiles === 'https' ? 'grpc' : options.transports);
 	addFlag(commandArgs, 'front-hosts', options['front-hosts']);
 	addFlag(commandArgs, 'profiles', profiles);
-	addFlag(commandArgs, 'runs', runs);
-	addFlag(commandArgs, 'service-name', options['service-name']);
-	addFlag(commandArgs, 'target', target);
-	addFlag(commandArgs, 'port', port);
-	addFlag(commandArgs, 'out', out);
-	return commandArgs;
-}
-
-function buildLiveCommand(options, { profile, target, port, httpPath, httpMethod, bodyBytes, runs }) {
-	const commandArgs = ['scripts/live-tunnel-benchmark.mjs'];
-	for (const name of ['url', 'uuid', 'sni', 'authority']) addFlag(commandArgs, name, options[name]);
-	addFlag(commandArgs, 'transports', 'grpc');
-	addFlag(commandArgs, 'front-host', options.primaryFrontHost);
-	addFlag(commandArgs, 'profile', profile);
 	addFlag(commandArgs, 'runs', runs);
 	addFlag(commandArgs, 'service-name', options['service-name']);
 	addFlag(commandArgs, 'target', target);
@@ -82,7 +71,8 @@ function buildLiveCommand(options, { profile, target, port, httpPath, httpMethod
 	addFlag(commandArgs, 'http-path', httpPath);
 	addFlag(commandArgs, 'http-method', httpMethod);
 	addFlag(commandArgs, 'body-bytes', bodyBytes);
-	addFlag(commandArgs, 'timeout', 30000);
+	addFlag(commandArgs, 'timeout', timeout);
+	addFlag(commandArgs, 'out', out);
 	commandArgs.push('--summary-line');
 	return commandArgs;
 }
@@ -118,6 +108,7 @@ if ((!url || !uuid || !args['front-hosts']) && !dryRun) {
 
 const outDir = args['out-dir'] || 'benchmark-runs';
 const prefix = args.prefix || 'baseline';
+const label = args.label || prefix;
 const frontHosts = args['front-hosts'] || 'sourceforge.net,www.modrinth.com';
 const primaryFrontHost = frontHosts.split(',').map(item => item.trim()).filter(Boolean)[0] || '';
 const options = {
@@ -126,12 +117,14 @@ const options = {
 	uuid,
 	'front-hosts': frontHosts,
 	primaryFrontHost,
+	transports: args.transports || process.env.TUNNEL_BENCH_TRANSPORTS || 'grpc',
 	'service-name': args['service-name'] || '/',
 };
 if (!dryRun) mkdirSync(outDir, { recursive: true });
 
 const latencyOut = join(outDir, `${prefix}-latency-burst.json`);
 const httpsOut = join(outDir, `${prefix}-https.json`);
+const throughputReportFiles = [];
 const suiteResults = [];
 
 suiteResults.push({
@@ -146,7 +139,7 @@ suiteResults.push({
 });
 
 suiteResults.push({
-	scenario: { profile: 'https', frontHost: frontHosts },
+	scenario: { profile: 'https', frontHost: frontHosts, transportNote: 'grpc-only' },
 	...runCommand(buildMatrixCommand(options, {
 		profiles: 'https',
 		target: args['https-target'] || 'example.com',
@@ -160,28 +153,33 @@ if (args['bench-target']) {
 	for (const item of [
 		{
 			profile: 'download',
+			out: join(outDir, `${prefix}-download.json`),
 			httpPath: `/bytes/${args['download-bytes'] || 1048576}`,
 			httpMethod: '',
 			bodyBytes: '',
 		},
 		{
 			profile: 'upload',
+			out: join(outDir, `${prefix}-upload.json`),
 			httpPath: '/sink',
 			httpMethod: 'POST',
 			bodyBytes: args['upload-bytes'] || 1048576,
 		},
 	]) {
-		const result = runCommand(buildLiveCommand(options, {
-			profile: item.profile,
+		throughputReportFiles.push(item.out);
+		const result = runCommand(buildMatrixCommand(options, {
+			profiles: item.profile,
 			target: args['bench-target'],
 			port: args['bench-port'] || 80,
 			httpPath: item.httpPath,
 			httpMethod: item.httpMethod,
 			bodyBytes: item.bodyBytes,
 			runs: args['throughput-runs'] || 10,
+			timeout: 30000,
+			out: item.out,
 		}), dryRun);
 		suiteResults.push({
-			scenario: { profile: item.profile, frontHost: primaryFrontHost },
+			scenario: { profile: item.profile, frontHost: frontHosts },
 			...result,
 		});
 	}
@@ -189,12 +187,22 @@ if (args['bench-target']) {
 
 const suiteReport = {
 	generatedAt: new Date().toISOString(),
+	label,
+	prefix,
 	dryRun,
 	primaryFrontHost,
+	frontHosts: frontHosts.split(',').map(item => item.trim()).filter(Boolean),
+	transports: options.transports,
+	httpsTransportNote: 'HTTPS suite uses the gRPC inner-TLS benchmark; latency/burst/download/upload honor --transports.',
+	targets: {
+		http: args['http-target'] || 'neverssl.com',
+		https: args['https-target'] || 'example.com',
+		benchmark: args['bench-target'] || null,
+	},
 	scenarios: suiteResults,
-	reportFiles: dryRun ? [] : [latencyOut, httpsOut],
+	reportFiles: dryRun ? [] : [latencyOut, httpsOut, ...throughputReportFiles],
 };
 if (!dryRun) writeFileSync(join(outDir, `${prefix}-suite.json`), JSON.stringify(suiteReport, null, 2));
 console.log(JSON.stringify({ type: 'suite-summary', dryRun, scenarios: suiteResults.length, reportFiles: suiteReport.reportFiles }, null, 2));
 
-if (suiteResults.some(result => !result.dryRun && (result.exitCode !== 0 || !result.summary) && !result.command.includes('live-benchmark-matrix.mjs'))) process.exit(1);
+if (suiteResults.some(result => !result.dryRun && (result.exitCode !== 0 || !result.summary))) process.exit(1);

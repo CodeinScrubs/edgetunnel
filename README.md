@@ -70,9 +70,7 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 | `DIAL_STAGGER_MS` | No | `90` | Optional stagger between clean-IP/proxy candidate dials. Defaults to `90` ms and is clamped from `0` to `500` ms. |
 | `DNS_SERVER` | No | `1.1.1.1:53` | Optional TCP DNS upstream for tunneled UDP DNS requests. Defaults to `8.8.4.4:53`. |
 | `DOH_URL` | No | `https://dns.google/dns-query` | Optional DoH endpoint for preload race dialing and proxy-domain resolution. Defaults to Cloudflare DoH. |
-| `NAT64_PREFIX` | No | `2602:fc59:b0:64::` | Optional NAT64 `/96` prefix. When set, destinations that resolve into Cloudflare IP ranges are dialed via a synthesized NAT64 IPv6 address instead of directly. This fixes `Error 1034` (Edge IP Restricted) when reaching Cloudflare-hosted sites through the Worker. Off when empty. Verify which prefix works from your deployment before relying on it. |
-| `CF_VIA_PROXYIP` | No | `1` | Opts in to routing Cloudflare-hosted destinations through the ProxyIP relay instead of dialing them directly. An alternative to `NAT64_PREFIX` for fixing `Error 1034`; requires a working ProxyIP relay. Ignored when `NAT64_PREFIX` is set (NAT64 takes precedence). Off by default. |
-| `PROXYIP_SCAN_SOURCE` | No | `https://example.com/proxyip.txt` | Optional URL returning extra ProxyIP candidates (one per line or comma-separated) for the `/admin/proxyip` scanner. |
+| `FORCE_PROXY_HOSTS` | No | none | Optional comma/newline list of target host patterns that should skip direct dialing and go straight through ProxyIP or the configured chain proxy. Useful for Cloudflare-hosted panel/custom domains that return 5xx when reached from a Worker egress path. Unset by default. |
 
 ## Admin Panel
 

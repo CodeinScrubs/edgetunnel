@@ -309,13 +309,13 @@ async function runGrpc(options) {
 			}
 		});
 		req.on('end', () => {
-			const bodyBytes = concatBytes(chunks);
-			const payloads = decodeGrpcPayloads(bodyBytes);
+			const responseBytes = concatBytes(chunks);
+			const payloads = decodeGrpcPayloads(responseBytes);
 			const rawTunneled = concatBytes(payloads);
 			const accepted = hasVlessResponseHeader(rawTunneled);
 			const tunneled = stripVlessResponseHeader(rawTunneled);
 			const text = new TextDecoder().decode(tunneled.subarray(0, 160));
-			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, bodyBytes.byteLength, tunneled.byteLength, text, accepted));
+			finish(resolve, summarizeRun('grpc', status, status >= 200 && status < 300, firstByteMs, startedAt, responseBytes.byteLength, tunneled.byteLength, text, accepted, measuredTransferBytes(options, tunneled.byteLength)));
 		});
 		req.on('error', error => finish(reject, error));
 		req.write(Buffer.from(encodeGrpcFrame([makeHttpPayload(options)])));
@@ -340,7 +340,7 @@ async function runXhttp(options) {
 		const accepted = hasVlessResponseHeader(body.bytes);
 		const tunneled = stripVlessResponseHeader(body.bytes);
 		const text = new TextDecoder().decode(tunneled.subarray(0, 160));
-		return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, tunneled.byteLength, text, accepted);
+		return summarizeRun('xhttp', response.status, response.ok, body.firstByteMs, startedAt, body.bytes.byteLength, tunneled.byteLength, text, accepted, measuredTransferBytes(options, tunneled.byteLength));
 	} finally {
 		clearTimeout(timer);
 	}
@@ -396,11 +396,17 @@ async function runWs(options) {
 	const accepted = hasVlessResponseHeader(result);
 	const tunneled = stripVlessResponseHeader(result);
 	const text = new TextDecoder().decode(tunneled.subarray(0, 160));
-	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, tunneled.byteLength, text, accepted);
+	return summarizeRun('ws', status, status === 101, firstByteMs, startedAt, result.byteLength, tunneled.byteLength, text, accepted, measuredTransferBytes(options, tunneled.byteLength));
 }
 
-function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, tunneledBytes, text, accepted = false) {
+function measuredTransferBytes(options, tunneledBytes) {
+	if (options.profile === 'upload' && Number(options.bodyBytes) > 0) return Number(options.bodyBytes);
+	return tunneledBytes;
+}
+
+function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, bytes, tunneledBytes, text, accepted = false, measuredBytes = tunneledBytes) {
 	const totalMs = performance.now() - startedAt;
+	const inner = parseInnerHttpStatus(text);
 	return {
 		transport,
 		status,
@@ -408,10 +414,23 @@ function summarizeRun(transport, status, transportOk, firstByteMs, startedAt, by
 		totalMs,
 		bytes,
 		tunneledBytes,
-		throughputMbps: totalMs > 0 ? Number(((tunneledBytes * 8) / totalMs / 1000).toFixed(3)) : null,
+		measuredBytes,
+		throughputMbps: totalMs > 0 ? Number(((measuredBytes * 8) / totalMs / 1000).toFixed(3)) : null,
 		accepted,
-		ok: Boolean(transportOk && /HTTP\/1\.[01]\s+\d+/.test(text)),
+		innerStatus: inner.status,
+		innerStatusText: inner.statusText,
+		ok: Boolean(transportOk && accepted && isInnerHttpOk(inner.status)),
 	};
+}
+
+function parseInnerHttpStatus(text) {
+	const match = /^HTTP\/1\.[01]\s+(\d{3})(?:\s+([^\r\n]*))?/m.exec(text || '');
+	if (!match) return { status: null, statusText: '' };
+	return { status: Number(match[1]), statusText: match[2] || '' };
+}
+
+function isInnerHttpOk(status) {
+	return Number.isFinite(status) && status >= 200 && status < 500;
 }
 
 function percentile(values, p) {
@@ -419,6 +438,13 @@ function percentile(values, p) {
 	const sorted = [...values].sort((a, b) => a - b);
 	const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
 	return sorted[index];
+}
+
+function roundedSpread(values) {
+	if (values.length < 2) return null;
+	const p50 = percentile(values, 50);
+	const p95 = percentile(values, 95);
+	return Number.isFinite(p50) && Number.isFinite(p95) ? Math.max(0, Math.round(p95 - p50)) : null;
 }
 
 function summarizeTransport(transport, results) {
@@ -439,10 +465,13 @@ function summarizeTransport(transport, results) {
 		acceptedFirstByteP95Ms: acceptedFirstByteValues.length ? Math.round(percentile(acceptedFirstByteValues, 95)) : null,
 		firstByteP50Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 50)) : null,
 		firstByteP95Ms: firstByteValues.length ? Math.round(percentile(firstByteValues, 95)) : null,
+		firstByteJitterMs: roundedSpread(firstByteValues),
 		totalP50Ms: totalValues.length ? Math.round(percentile(totalValues, 50)) : null,
 		totalP95Ms: totalValues.length ? Math.round(percentile(totalValues, 95)) : null,
+		totalJitterMs: roundedSpread(totalValues),
 		bytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + result.bytes, 0) / successful.length) : 0,
 		tunneledBytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + (result.tunneledBytes || 0), 0) / successful.length) : 0,
+		measuredBytesAvg: successful.length ? Math.round(successful.reduce((sum, result) => sum + (result.measuredBytes || 0), 0) / successful.length) : 0,
 		throughputP50Mbps: throughputValues.length ? Number(percentile(throughputValues, 50).toFixed(3)) : null,
 		throughputP95Mbps: throughputValues.length ? Number(percentile(throughputValues, 95).toFixed(3)) : null,
 	};
