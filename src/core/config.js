@@ -29,6 +29,7 @@ export const USER_CONFIG = {
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
 	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
+	IDLE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
 	DOH_URL_FALLBACK: undefined,
 	FORCE_PROXY_HOSTS: undefined,

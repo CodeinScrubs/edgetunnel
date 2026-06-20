@@ -83,6 +83,7 @@ so the admin panel and config can be saved. Without it the panel can't store set
 | **`DIAL_STAGGER_MS`** | `90` | 0–500 | Delay between firing parallel connection attempts. | `0` = fire candidates at once (fastest connect, one extra socket). `90` balances speed vs. waste. Try `0`–`40`. |
 | **`PRELOAD_RACE_DIAL`** | off | flag | Resolve the target to multiple IPs (A+AAAA via DoH) and **race** them. | **Leave off.** It adds a DNS lookup per connection; only helps hostnames with many IPs. We measured it as net-neutral-to-negative for normal use. |
 | **`FIRST_BYTE_TIMEOUT_MS`** | `0` (off) | 0–10000 | If a direct connection *opens* but sends **no data** within this many ms, cancel it and fall back to the ProxyIP relay. | **Off by default.** Turn on (try `1500`–`2500`) **only if you get "connected but page loads forever"** — it rescues blackholed routes. **Con:** a genuinely slow server (>your value to first byte) gets an unnecessary fallback. |
+| **`IDLE_TIMEOUT_MS`** | `0` (off) | 1000–600000 | After data is flowing, if the remote sends **nothing** for this many ms (a mid-stream stall), cancel and close so the client re-dials instead of freezing. | **Off by default.** Turn on (try `60000`–`120000`) **only if downloads/streams freeze and never recover.** Safe — only fires after the first byte, never replays. **Con:** set too low and it drops genuinely slow transfers; keep it generous. |
 
 ---
 

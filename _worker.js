@@ -31,6 +31,7 @@ const USER_CONFIG = {
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
 	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
+	IDLE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
 	DOH_URL_FALLBACK: undefined,
 	FORCE_PROXY_HOSTS: undefined,
@@ -3073,6 +3074,18 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		首字节计时器 = setTimeout(() => { if (!hasData) { try { reader.cancel() } catch (e) { } } }, firstByteTimeoutMs);
 	}
 
+	// Optional post-first-byte idle watchdog: once data is flowing, if the remote goes silent for the
+	// configured window (a mid-stream stall on a flaky relay), cancel the read so the stream ends and the
+	// client re-dials, instead of hanging forever. Off unless IDLE_TIMEOUT_MS is set. Safe: only fires
+	// after the first byte (hasData), so it never retries/replays — it just ends the stream like a normal EOF.
+	const 空闲超时毫秒 = getIdleTimeoutMs(pipeMeta?.env);
+	let 空闲计时器 = null;
+	const 重置空闲计时器 = () => {
+		if (空闲超时毫秒 <= 0) return;
+		if (空闲计时器) clearTimeout(空闲计时器);
+		空闲计时器 = setTimeout(() => { try { reader.cancel() } catch (e) { } }, 空闲超时毫秒);
+	};
+
 	try {
 		if (!useBYOB) {
 			while (true) {
@@ -3081,6 +3094,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
 				await 下行发送器.发送(value);
+				重置空闲计时器();
 			}
 		} else {
 			let readBuffer = new ArrayBuffer(BYOB单次读取上限);
@@ -3097,12 +3111,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 					await 下行发送器.发送(value);
 					readBuffer = value.buffer.byteLength >= BYOB单次读取上限 ? value.buffer : new ArrayBuffer(BYOB单次读取上限);
 				}
+				重置空闲计时器();
 			}
 		}
 		await 下行发送器.flush();
 	} catch (err) { readError = err }
 	finally {
 		if (首字节计时器) { try { clearTimeout(首字节计时器) } catch (e) { } }
+		if (空闲计时器) { try { clearTimeout(空闲计时器) } catch (e) { } }
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
@@ -7803,6 +7819,13 @@ function getDownlinkGrainBytes(env) {
 	const configured = Number(env?.DOWNLINK_GRAIN_PACKET_BYTES);
 	if (!Number.isFinite(configured) || configured <= 0) return 下行Grain包字节;
 	return Math.max(4 * 1024, Math.min(1024 * 1024, Math.round(configured)));
+}
+
+// Optional post-first-byte idle watchdog timeout (ms). 0 = disabled (default). Clamped to [1s, 10min].
+function getIdleTimeoutMs(env) {
+	const configured = Number(env?.IDLE_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return 0;
+	return Math.max(1000, Math.min(600000, Math.round(configured)));
 }
 
 function getDialStaggerMs(env) {
