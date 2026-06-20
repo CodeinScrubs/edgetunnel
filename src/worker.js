@@ -178,12 +178,6 @@ export default {
 		// exception"). On any unexpected error we serve the nginx camouflage page instead of throwing.
 		try {
 		env = applyUserConfigDefaults(env);
-		// Future-proofing: request.fetcher.connect is the working outbound-TCP mechanism in this deployment.
-		// If a runtime ever lacks it, lazily load the documented cloudflare:sockets connect() so tunnels still
-		// work. Runs ONLY when fetcher.connect is absent, so the normal path (and Node imports) are unaffected.
-		if (!cloudflareConnect && typeof request?.fetcher?.connect !== 'function') {
-			try { cloudflareConnect = (await import('cloudflare:sockets')).connect; } catch (e) { }
-		}
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
 		let config_JSON;
@@ -3298,21 +3292,11 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 	}
 }
 
-// Outbound TCP. request.fetcher.connect is the working mechanism in this deployment; cloudflareConnect
-// is the documented cloudflare:sockets connect(), loaded lazily in fetch() ONLY when fetcher is absent
-// (kept null otherwise, so the normal path and Node imports of this file are unaffected).
-let cloudflareConnect = null;
 function 创建请求TCP连接器(request) {
 	const 请求对象 = /** @type {any} */ (request);
 	const fetcher = 请求对象?.fetcher;
-	if (fetcher && typeof fetcher.connect === 'function') {
-		return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
-	}
-	// Future-proof fallback to the documented Cloudflare runtime TCP API.
-	if (typeof cloudflareConnect === 'function') {
-		return (options, init) => init === undefined ? cloudflareConnect(options) : cloudflareConnect(options, init);
-	}
-	throw new Error('request.fetcher.connect unavailable and cloudflare:sockets connect() could not be loaded');
+	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
+	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
