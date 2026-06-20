@@ -2324,7 +2324,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
-					rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间, Date.now(), host, yourUUID);
+					const 成功候选 = candidate, 成功开始时间 = 开始时间;
+					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
+					remoteConnWrapper.反代无数据回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					缓存反代数组索引 = candidate.index;
 					return socket;
@@ -2354,6 +2356,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		const 本次首包数据 = 本次发送首包 ? rawData : null;
 
 		const 当前连接任务 = (async () => {
+			remoteConnWrapper.反代首字节回调 = null;
+			remoteConnWrapper.反代无数据回调 = null;
 			let newSocket;
 			if (proxyType === 'socks5') {
 				log(`[SOCKS5 proxy] Proxying to: ${host}:${portNum}`);
@@ -2392,7 +2396,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env });
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env, onFirstByte: remoteConnWrapper.反代首字节回调, onNoData: remoteConnWrapper.反代无数据回调 });
 		})();
 
 		remoteConnWrapper.connectingPromise = 当前连接任务;
@@ -2949,6 +2953,8 @@ function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firs
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
+	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
+	const 标记首字节 = () => { if (hasData) return; hasData = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes);
@@ -2971,7 +2977,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				const { done, value } = await reader.read();
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				标记首字节();
 				await 下行发送器.发送(value);
 			}
 		} else {
@@ -2980,7 +2986,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				标记首字节();
 				if (value.byteLength >= downlinkGrainBytes) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -2998,6 +3004,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
+	if (!hasData) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
 	if (!hasData && retryFunc) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
