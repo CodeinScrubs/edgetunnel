@@ -280,6 +280,12 @@ export default {
 		// exception"). On any unexpected error we serve the nginx camouflage page instead of throwing.
 		try {
 		env = applyUserConfigDefaults(env);
+		// Future-proofing: request.fetcher.connect is the working outbound-TCP mechanism in this deployment.
+		// If a runtime ever lacks it, lazily load the documented cloudflare:sockets connect() so tunnels still
+		// work. Runs ONLY when fetcher.connect is absent, so the normal path (and Node imports) are unaffected.
+		if (!cloudflareConnect && typeof request?.fetcher?.connect !== 'function') {
+			try { cloudflareConnect = (await import('cloudflare:sockets')).connect; } catch (e) { }
+		}
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
 		let config_JSON;
@@ -2426,7 +2432,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
 					await 写入首包(socket, data);
-					rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], true, performance.now() - 开始时间, Date.now(), host, yourUUID);
+					const 成功候选 = candidate, 成功开始时间 = 开始时间;
+					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
+					remoteConnWrapper.反代无数据回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					缓存反代数组索引 = candidate.index;
 					return socket;
@@ -2456,6 +2464,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		const 本次首包数据 = 本次发送首包 ? rawData : null;
 
 		const 当前连接任务 = (async () => {
+			remoteConnWrapper.反代首字节回调 = null;
+			remoteConnWrapper.反代无数据回调 = null;
 			let newSocket;
 			if (proxyType === 'socks5') {
 				log(`[SOCKS5 proxy] Proxying to: ${host}:${portNum}`);
@@ -2494,7 +2504,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env });
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env, onFirstByte: remoteConnWrapper.反代首字节回调, onNoData: remoteConnWrapper.反代无数据回调 });
 		})();
 
 		remoteConnWrapper.connectingPromise = 当前连接任务;
@@ -3051,6 +3061,8 @@ function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firs
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
+	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
+	const 标记首字节 = () => { if (hasData) return; hasData = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes);
@@ -3073,7 +3085,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				const { done, value } = await reader.read();
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				标记首字节();
 				await 下行发送器.发送(value);
 			}
 		} else {
@@ -3082,7 +3094,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				标记首字节();
 				if (value.byteLength >= downlinkGrainBytes) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -3100,6 +3112,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
+	if (!hasData) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
 	if (!hasData && retryFunc) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
@@ -3394,11 +3407,21 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 	}
 }
 
+// Outbound TCP. request.fetcher.connect is the working mechanism in this deployment; cloudflareConnect
+// is the documented cloudflare:sockets connect(), loaded lazily in fetch() ONLY when fetcher is absent
+// (kept null otherwise, so the normal path and Node imports of this file are unaffected).
+let cloudflareConnect = null;
 function 创建请求TCP连接器(request) {
 	const 请求对象 = /** @type {any} */ (request);
 	const fetcher = 请求对象?.fetcher;
-	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
-	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	if (fetcher && typeof fetcher.connect === 'function') {
+		return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	}
+	// Future-proof fallback to the documented Cloudflare runtime TCP API.
+	if (typeof cloudflareConnect === 'function') {
+		return (options, init) => init === undefined ? cloudflareConnect(options) : cloudflareConnect(options, init);
+	}
+	throw new Error('request.fetcher.connect unavailable and cloudflare:sockets connect() could not be loaded');
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
