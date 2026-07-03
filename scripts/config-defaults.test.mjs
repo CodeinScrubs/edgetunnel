@@ -48,7 +48,7 @@ function makeFakeKV(initialEntries = {}) {
 }
 
 {
-	const generated = await readFile('_worker.js', 'utf8');
+	const generated = await readFile('_worker_copypaste.js', 'utf8');
 	assert.equal(generated.startsWith('// Generated from src/worker.js by scripts/build-worker.mjs.'), true);
 	assert.equal(/^import\s+/m.test(generated), false, 'generated deployable Worker must not contain unresolved imports');
 	assert.equal(generated.includes('const USER_CONFIG = {'), true);
@@ -56,7 +56,7 @@ function makeFakeKV(initialEntries = {}) {
 }
 
 {
-	const workerModule = await import('../_worker.js');
+	const workerModule = await import('../_worker_copypaste.js');
 	const { readConfigJson } = workerModule.__testPerformanceHelpers;
 	const config = await readConfigJson({
 		KV: makeFakeKV(),

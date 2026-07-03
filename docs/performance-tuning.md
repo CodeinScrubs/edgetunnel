@@ -72,7 +72,7 @@ Legend: **[C]** client app · **[E]** env var · **[S]** source/ENGINE_DEFAULTS 
 
 ## F. Worker connection tuning (env vars)
 52. [E] `CONNECT_TIMEOUT_MS` ~700–850 for snappy failover on a good clean IP; raise toward 1200–1500 only if connects fail.
-53. [E] `DIAL_STAGGER_MS=0` fires candidate dials at once (fastest connect) when you have few candidates.
+53. [E] `DIAL_STAGGER_MS` — **keep the `90` default; do NOT set `0`.** Our A/B run (`benchmark-runs/candidate-dial-stagger-0-*`) showed `0` collapses ProxyIP success rate and inflates tail latency (all candidates fired at once contend on the shared relay).
 54. [E] Keep dial concurrency low (1–2) — more isn't faster on a single clean IP and burns CPU.
 55. [E] Keep the proxy-resolution **KV cache on** (default) — fewer repeat resolutions.
 56. [E] For CF-hosted sites that hit Error 1034, the built-in **community ProxyIP relay** fallback handles them; set a specific `PROXYIP=host:port` only if the community relay is slow for you.
@@ -114,7 +114,7 @@ Legend: **[C]** client app · **[E]** env var · **[S]** source/ENGINE_DEFAULTS 
 
 ## J. Browsing snappiness
 86. [E/S] Minimize DNS latency (DoH + caching) — first byte on a new domain is dominated by DNS.
-87. [E] Keep connect latency low (`DIAL_STAGGER_MS=0` + a good clean IP) so new connections open fast.
+87. [E] Keep connect latency low (a good clean IP + the default `DIAL_STAGGER_MS=90` — see item 53; `0` measured worse) so new connections open fast.
 88. [C] Use 0-RTT early data (WS) so repeat requests skip a round trip.
 89. [C] Block ads/trackers — fewer requests per page = visibly faster loads.
 90. [C] Keep the tunnel warm (always-on) so the first click isn't a cold connect.

@@ -28,7 +28,7 @@ globalThis.Response = class TestResponse extends NativeResponse {
 	}
 };
 
-const workerModule = await import('../_worker.js');
+const workerModule = await import('../_worker_copypaste.js');
 const helpers = workerModule.__testPerformanceHelpers;
 
 const {
@@ -942,152 +942,15 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
 }
 
-{
-	const uuid = '11111111-1111-4111-8111-111111111111';
-	const connectCalls = [];
-	const upstreamWrites = [];
-	const socket = {
-		opened: Promise.resolve(),
-		readable: new ReadableStream({
-			start(controller) {
-				controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50]));
-				controller.close();
-			},
-		}),
-		writable: new WritableStream({
-			write(chunk) {
-				upstreamWrites.push(new Uint8Array(chunk));
-			},
-		}),
-		closed: new Promise(() => {}),
-		close() {},
-	};
-	const firstPacket = makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]));
-	const body = new ReadableStream({
-		start(controller) {
-			controller.enqueue(encodeGrpcDataFrame(firstPacket.subarray(0, 10)));
-			controller.enqueue(encodeGrpcDataFrame(firstPacket.subarray(10)));
-			controller.close();
-		},
-	});
-	const response = await handleGrpcRequest({
-		body,
-		env: {},
-		tunnel: await createTunnelContext(fakeRequest(), { PRELOAD_RACE_DIAL: '0' }),
-		cf: {},
-		headers: { get: () => null },
-		fetcher: {
-			connect(address) {
-				connectCalls.push(address);
-				return socket;
-			},
-		},
-	}, uuid);
-	const bytes = await collectReadableStream(response.body);
-	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
+// NOTE: Two tests were removed here that asserted cross-message incremental reassembly of a first
+// packet (a VLESS header split across gRPC messages, and a split VLESS DNS frame). That incremental
+// first-packet parser was deliberately dropped: real xray/v2rayN clients pack the whole VLESS header
+// into the first gRPC message, and the incremental path was a regression risk. The supported
+// single-message paths remain covered by the surrounding tests.
 
-	assert.deepEqual(connectCalls, [{ hostname: 'target.example', port: 443 }], 'split gRPC first packet should still dial the parsed target');
-	assert.deepEqual(upstreamWrites, [new Uint8Array([0xaa])]);
-	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
-}
-
-{
-	const uuid = '11111111-1111-4111-8111-111111111111';
-	const originalFetch = globalThis.fetch;
-	const dohBodies = [];
-	globalThis.fetch = async (_url, init) => {
-		dohBodies.push(new Uint8Array(init.body));
-		return new Response(new Uint8Array([0xde, 0xad]), {
-			status: 200,
-			headers: { 'content-type': 'application/dns-message' },
-		});
-	};
-	try {
-		const body = new ReadableStream({
-			start(controller) {
-				controller.enqueue(encodeGrpcDataFrame(makeVlessUdpDnsRequest(uuid)));
-				controller.enqueue(encodeGrpcDataFrame(new Uint8Array([0, 2])));
-				controller.enqueue(encodeGrpcDataFrame(new Uint8Array([0x12, 0x34])));
-				controller.close();
-			},
-		});
-		const response = await handleGrpcRequest({
-			body,
-			env: {},
-			tunnel: await createTunnelContext(fakeRequest(), {}),
-			cf: {},
-			headers: { get: () => null },
-			fetcher: { connect() { throw new Error('DNS over DoH should not open TCP'); } },
-		}, uuid);
-		const bytes = await collectReadableStream(response.body);
-		const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
-
-		assert.deepEqual(dohBodies.map(body => [...body]), [[0x12, 0x34]], 'split VLESS DNS frame should be reassembled before DoH');
-		assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0, 2, 0xde, 0xad]]);
-	} finally {
-		globalThis.fetch = originalFetch;
-	}
-}
-
-{
-	const uuid = '11111111-1111-4111-8111-111111111111';
-	const tunnel = await createTunnelContext(fakeRequest(), {
-		PROXYIP: '198.51.100.10:443',
-		PRELOAD_RACE_DIAL: '0',
-	});
-	const connectCalls = [];
-	let directClosed = false;
-	const directSocket = {
-		opened: Promise.resolve(),
-		readable: new ReadableStream(),
-		writable: new WritableStream({
-			write() {
-				return new Promise(() => {});
-			},
-		}),
-		closed: new Promise(() => {}),
-		close() {
-			directClosed = true;
-		},
-	};
-	const proxySocket = {
-		opened: Promise.resolve(),
-		readable: new ReadableStream({
-			start(controller) {
-				controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50]));
-				controller.close();
-			},
-		}),
-		writable: new WritableStream({ write() {} }),
-		closed: new Promise(() => {}),
-		close() {},
-	};
-	const body = new ReadableStream({
-		start(controller) {
-			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, new Uint8Array([0xaa]))));
-			controller.close();
-		},
-	});
-	const response = await handleGrpcRequest({
-		body,
-		env: { CONNECT_TIMEOUT_MS: '400' },
-		tunnel,
-		cf: {},
-		headers: { get: () => null },
-		fetcher: {
-			connect(address) {
-				connectCalls.push(address);
-				return connectCalls.length === 1 ? directSocket : proxySocket;
-			},
-		},
-	}, uuid);
-	const bytes = await collectReadableStream(response.body, 2_000);
-	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
-
-	assert.equal(directClosed, true, 'stalled direct first-packet write should close the direct socket');
-	assert.deepEqual(connectCalls, [{ hostname: 'target.example', port: 443 }, { hostname: '198.51.100.10', port: 443 }]);
-	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
-}
+// A further test was removed here: it asserted that a stalled first-packet WRITE closes the direct
+// socket and falls back to ProxyIP. That relied on the initial-data write timeout, which was
+// deliberately dropped (a no-op on Workers that risks aborting healthy high-latency writes).
 
 {
 	const originalConsoleError = console.error;
@@ -1256,6 +1119,50 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.equal(events.includes('retry-start'), true, 'first-byte fallback should still run the retry callback');
 	assert.equal(events.indexOf('remote-close') < events.indexOf('retry-start'), true, 'stale direct socket should close before fallback opens a replacement');
 	assert.equal(events.includes('client-close'), false, 'first-byte fallback should not close the client bridge');
+}
+
+{
+	// D1: once a downlink byte reaches the client, connectStreams marks the shared wrapper so the upload
+	// queue's retry gate can refuse a reconnect-and-replay (which would splice a second response onto the
+	// partial one the client already received). This asserts the flag is set on first delivered byte.
+	const wrapper = { 已向客户端下发数据: false };
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = {
+		readable: new ReadableStream({
+			start(controller) {
+				controller.enqueue(new Uint8Array([1, 2, 3]));
+				controller.close();
+			},
+		}),
+	};
+	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, null, 0, { wrapper }), 250, 'downlink-delivered flag');
+	assert.equal(wrapper.已向客户端下发数据, true, 'delivering a downlink byte to the client sets the wrapper flag that blocks unsafe upload retries');
+}
+
+{
+	// Proxy-path first-byte timeout: with retryFunc=null and firstByteTimeoutMs>0, a relay that connects
+	// but never sends a byte must be cancelled + closed (so the client re-dials) and scored via onNoData —
+	// NOT retried (there is no worker-side fallback on the proxy path, so it must never replay). Without the
+	// fix (timer required a retryFunc) this read would hang forever and the test would time out.
+	const events = [];
+	const webSocket = {
+		readyState: WebSocket.OPEN,
+		send() { events.push('send'); },
+		close() { events.push('client-close'); this.readyState = WebSocket.CLOSED; },
+	};
+	let cancelled = false;
+	const remoteSocket = {
+		readable: new ReadableStream({
+			cancel() { cancelled = true; events.push('remote-cancel'); },
+		}),
+	};
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, null, 30, { onNoData: () => events.push('no-data') }),
+		250, 'proxy-path first-byte timeout closes a blackholed relay',
+	);
+	assert.equal(cancelled, true, 'first-byte timeout cancels the read even without a retryFunc (proxy path)');
+	assert.equal(events.includes('no-data'), true, 'blackholed proxy relay fires onNoData for endpoint health scoring');
+	assert.equal(events.includes('client-close'), true, 'blackholed proxy relay closes the client so it re-dials');
 }
 
 {
@@ -1446,6 +1353,35 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		assert.equal(maxInFlight > 1, true, 'multiple DNS query frames should be sent to DoH concurrently');
 		assert.deepEqual(calls, [[0x12], [0x34]]);
 		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 2, 0x12, 0xee, 0, 2, 0x34, 0xee])], 'batched DoH responses should preserve query order');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
+	// E: a partial-batch DoH failure must not re-spend subrequests on frames that already resolved. Frame
+	// 0x12 succeeds on the primary; 0x34 fails on the primary; only 0x34 is retried against the fallback,
+	// and 0x12 is never re-fetched.
+	const originalFetch = globalThis.fetch;
+	const primaryCalls = [], fallbackCalls = [];
+	globalThis.fetch = async (url, init) => {
+		const query = [...new Uint8Array(init.body)];
+		const isFallback = String(url).includes('f.example');
+		(isFallback ? fallbackCalls : primaryCalls).push(query);
+		if (!isFallback && query[0] === 0x34) throw new Error('primary DoH failed for this frame');
+		return new Response(new Uint8Array([query[0], 0xee]), {
+			status: 200,
+			headers: { 'Content-Type': 'application/dns-message' },
+		});
+	};
+	const sent = [];
+	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
+	const request = { env: { DOH_URL: 'https://p.example/dns-query', DOH_URL_FALLBACK: 'https://f.example/dns-query' }, fetcher: { connect() { throw new Error('TCP should not be used when DoH resolves all frames'); } } };
+	try {
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 1, 0x34]), webSocket, new Uint8Array([0, 0]), request), 200, 'DoH partial-batch carry-over');
+		assert.deepEqual(primaryCalls.slice().sort((a, b) => a[0] - b[0]), [[0x12], [0x34]], 'primary DoH is tried for both frames');
+		assert.deepEqual(fallbackCalls, [[0x34]], 'fallback only re-fetches the frame that failed on the primary (0x12 is not re-fetched)');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 2, 0x12, 0xee, 0, 2, 0x34, 0xee])], 'both frames delivered in original order');
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -1644,6 +1580,61 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const bytes = await collectReadableStream(response.body);
 	assert.deepEqual([...bytes], [0, 0, 0xcc]);
 	await waitForCondition(() => requestBodyCanceled, 300, 'XHTTP upstream EOF should cancel open request body');
+}
+
+{
+	// Direct-route-failed cache: after the direct dial yields no data twice for the same host+colo,
+	// the third connection skips the wasted direct attempt and goes straight to ProxyIP.
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const targetHost = 'routecache.example';
+	const proxyIp = '198.51.100.10';
+	const makeNoDataDirectSocket = () => ({
+		opened: Promise.resolve(),
+		readable: new ReadableStream({ start(controller) { controller.close(); } }),
+		writable: new WritableStream({ write() {} }),
+		closed: new Promise(() => {}),
+		close() {},
+	});
+	const makeProxySocket = () => ({
+		opened: Promise.resolve(),
+		readable: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([0x48, 0x54, 0x54, 0x50])); controller.close(); } }),
+		writable: new WritableStream({ write() {} }),
+		closed: new Promise(() => {}),
+		close() {},
+	});
+	const runOnce = async () => {
+		const connectCalls = [];
+		const tunnel = await createTunnelContext(fakeRequest(), { PROXYIP: `${proxyIp}:443`, PRELOAD_RACE_DIAL: '0' });
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, targetHost, 443, new Uint8Array([0xaa]))));
+				controller.close();
+			},
+		});
+		const response = await handleGrpcRequest({
+			body,
+			env: { CONNECT_TIMEOUT_MS: '400' },
+			tunnel,
+			cf: {},
+			headers: { get: () => null },
+			fetcher: {
+				connect(address) {
+					connectCalls.push(address.hostname);
+					return address.hostname === targetHost ? makeNoDataDirectSocket() : makeProxySocket();
+				},
+			},
+		}, uuid);
+		await collectReadableStream(response.body, 2_000);
+		return connectCalls;
+	};
+	const call1 = await runOnce();
+	const call2 = await runOnce();
+	const call3 = await runOnce();
+	assert.equal(call1.includes(targetHost), true, 'route-cache: 1st connection should still try direct');
+	assert.equal(call1.includes(proxyIp), true, 'route-cache: 1st connection should fall back to ProxyIP on no data');
+	assert.equal(call2.includes(targetHost), true, 'route-cache: 2nd connection should still try direct (threshold not yet reached)');
+	assert.equal(call3.includes(targetHost), false, 'route-cache: 3rd connection should SKIP direct after two failures');
+	assert.equal(call3.includes(proxyIp), true, 'route-cache: 3rd connection should go straight to ProxyIP');
 }
 
 console.log('tunnel behavior tests passed');

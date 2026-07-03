@@ -105,7 +105,36 @@ function applyUserConfigDefaults(env = {}) {
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
-let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 缓存反代数组索引 = 0, 调试日志打印 = false;
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false;
+const PROXY_ENDPOINT_CURSOR = new Map();
+// Adaptive direct-route cache: remembers hosts that consistently fail a DIRECT dial (per colo) and
+// routes them straight through ProxyIP for a short window, skipping the wasted direct attempt + the
+// failover wait. Bounded + TTL'd so it self-heals — a recovered host is retried after the TTL, and a
+// successful direct first byte clears the entry immediately (so transient blips don't pin a good host).
+const DIRECT_ROUTE_STATUS_CACHE = new Map();
+const DIRECT_ROUTE_FAILURE_THRESHOLD = 2;
+const DIRECT_ROUTE_STATUS_TTL_MS = 10 * 60 * 1000;
+const DIRECT_ROUTE_STATUS_MAX_ENTRIES = 512;
+function getDirectRouteFailed(key) {
+	if (!key) return false;
+	const now = Date.now();
+	const entry = DIRECT_ROUTE_STATUS_CACHE.get(key);
+	if (!entry) return false;
+	if (now >= entry.expiresAt) { DIRECT_ROUTE_STATUS_CACHE.delete(key); return false; }
+	return entry.failures >= DIRECT_ROUTE_FAILURE_THRESHOLD;
+}
+function recordDirectRouteFailure(key) {
+	if (!key) return;
+	const now = Date.now();
+	const entry = DIRECT_ROUTE_STATUS_CACHE.get(key);
+	const failures = (entry && now < entry.expiresAt ? entry.failures : 0) + 1;
+	DIRECT_ROUTE_STATUS_CACHE.delete(key);
+	DIRECT_ROUTE_STATUS_CACHE.set(key, { failures, expiresAt: now + DIRECT_ROUTE_STATUS_TTL_MS });
+	while (DIRECT_ROUTE_STATUS_CACHE.size > DIRECT_ROUTE_STATUS_MAX_ENTRIES) DIRECT_ROUTE_STATUS_CACHE.delete(DIRECT_ROUTE_STATUS_CACHE.keys().next().value);
+}
+function recordDirectRouteOk(key) {
+	if (key) DIRECT_ROUTE_STATUS_CACHE.delete(key);
+}
 const Pages静态页面 = ENGINE_DEFAULTS.PAGES_STATIC_URL;
 
 const WS早期数据最大字节 = ENGINE_DEFAULTS.WS_EARLY_DATA_MAX_BYTES, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
@@ -343,7 +372,7 @@ export default {
 				} else if (访问路径 === 'login') {
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
+					if (authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
 						return new Response('Redirecting...', { status: 302, headers: { 'Location': '/admin' } });
 					}
 					if (request.method === 'POST') {
@@ -726,9 +755,13 @@ export default {
 				} else if (访问路径 === 'locations') {
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
+					if (authCookie && authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
 				} else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
-			} else if (!envUUID) return fetchEnglishStaticPage('/noKV', 404);
+			}
+			// A KV-less deploy with a derived (non-explicit) UUID still works as a tunnel, so a bare
+			// unauthenticated GET / here must NOT betray the proxy: serving the /noKV help page would make
+			// an outbound fetch + return 404 on an unauthenticated request (a fingerprint). Fall through to
+			// the camouflage/decoy page below instead — it makes zero outbound calls and looks like nginx.
 		}
 
 		let 伪装页URL = env.URL || 'nginx';
@@ -1396,9 +1429,12 @@ function 解码WS早期数据(header, token) {
 async function 处理WS请求(request, yourUUID, url) {
 	const WS套接字对 = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(WS套接字对);
+	// Set binaryType BEFORE accept() so every binary frame is delivered as ArrayBuffer (Cloudflare
+	// docs: with newer compatibility dates binary frames default to Blob, and binaryType only affects
+	// messages dispatched after it is set).
+	serverSock.binaryType = 'arraybuffer';
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
 	catch (_) { serverSock.accept() }
-	serverSock.binaryType = 'arraybuffer';
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
@@ -1445,6 +1481,19 @@ async function 处理WS请求(request, yourUUID, url) {
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
 		return 上行写入队列.写入并等待(chunk, allowRetry);
+	};
+
+	// WS first packet must be parsed before a remote TCP socket exists. The upload queue is only
+	// valid after forwardataTCP() has created remoteConnWrapper.socket. If we enqueue the first
+	// WS frame before parsing it, the queue sees no writer, closes the WebSocket, and VLESS/Trojan
+	// WS configs fail while gRPC/XHTTP still work. Wait for an in-flight connect when present,
+	// otherwise return false so the caller continues to protocol parsing.
+	const 尝试写入已存在远端 = async (chunk, allowRetry = true) => {
+		if (remoteConnWrapper.connectingPromise) {
+			try { await remoteConnWrapper.connectingPromise } catch (_) { }
+		}
+		if (!remoteConnWrapper.socket) return false;
+		return 写入远端(chunk, allowRetry);
 	};
 
 	const 获取SS上下文 = async () => {
@@ -1628,7 +1677,11 @@ async function 处理WS请求(request, yourUUID, url) {
 			明文块数组 = await 上下文.入站解密器.输入(chunk);
 		} catch (err) {
 			const msg = err?.message || `${err}`;
-			if (msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
+			// A steady-state AEAD tag failure surfaces as a WebCrypto DOMException named 'OperationError'
+				// whose message ("The operation failed for an operation-specific reason") matches none of the
+				// substrings below, so classify by name too — otherwise it falls through to the generic
+				// WS-forwarding handler and is logged as an opaque failure instead of a decrypt failure.
+				if (err?.name === 'OperationError' || msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
 				log(`[SS inbound] Decryption failed; connection closed: ${msg}`);
 				closeSocketQuietly(serverSock);
 				return;
@@ -1638,7 +1691,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		for (const 明文块 of 明文块数组) {
 			let 已写入 = false;
 			try {
-				已写入 = await 写入远端(明文块, false);
+				已写入 = await 尝试写入已存在远端(明文块, false);
 			} catch (err) {
 				if ((/** @type {any} */ (err))?.isQueueOverflow) throw err;
 				已写入 = false;
@@ -1699,7 +1752,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			await 处理SS数据(chunk);
 			return;
 		}
-		if (await 写入远端(chunk)) return;
+		if (await 尝试写入已存在远端(chunk)) return;
 
 		if (判断协议类型 === null) {
 			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
@@ -1716,7 +1769,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			await 处理SS数据(chunk);
 			return;
 		}
-		if (await 写入远端(chunk)) return;
+		if (await 尝试写入已存在远端(chunk)) return;
 		if (判断协议类型 === 'trojan') {
 			const 解析结果 = 解析木马请求(chunk, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
@@ -1811,9 +1864,13 @@ async function 处理WS请求(request, yourUUID, url) {
 	});
 	serverSock.addEventListener('close', () => {
 		closeSocketQuietly(serverSock);
+		// Close the outbound remote socket too, so a client disconnect while the remote is silent
+		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
+		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		收尾WS显式传输();
 	});
 	serverSock.addEventListener('error', (err) => {
+		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		处理WS显式传输错误(err);
 	});
 
@@ -2084,10 +2141,30 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 	return payloads;
 }
 
+// Buffers this parser allocated itself; only these are safe to append into in place.
+const GRPC_REASSEMBLY_BUFFERS = new WeakSet();
 function parseGrpcFrameChunk(pending, chunk) {
 	const prior = 数据转Uint8Array(pending);
 	const current = 数据转Uint8Array(chunk);
-	const merged = prior.byteLength ? 拼接字节数据(prior, current) : current;
+	let merged;
+	if (!prior.byteLength) {
+		merged = current;
+	} else if (GRPC_REASSEMBLY_BUFFERS.has(prior.buffer) && prior.buffer.byteLength - (prior.byteOffset + prior.byteLength) >= current.byteLength) {
+		// Append into spare capacity of a buffer we own — O(current), not O(prior+current) — so a frame
+		// arriving in many small fragments reassembles in O(total) instead of O(total^2) (a DoS vector).
+		new Uint8Array(prior.buffer).set(current, prior.byteOffset + prior.byteLength);
+		merged = new Uint8Array(prior.buffer, prior.byteOffset, prior.byteLength + current.byteLength);
+	} else {
+		// Grow into a fresh owned buffer with 2x headroom (also the path for an external/test prior, which
+		// must be copied — never mutated in place).
+		const needed = prior.byteLength + current.byteLength;
+		const backing = new ArrayBuffer(Math.max(needed * 2, 1024));
+		GRPC_REASSEMBLY_BUFFERS.add(backing);
+		const view = new Uint8Array(backing);
+		view.set(prior, 0);
+		view.set(current, prior.byteLength);
+		merged = new Uint8Array(backing, 0, needed);
+	}
 	const payloads = [];
 	let offset = 0;
 	while (merged.byteLength - offset >= 5) {
@@ -2259,36 +2336,49 @@ async function openStaggeredCandidates(candidates, openCandidate, options = {}) 
 		let settled = false, launched = 0, active = 0;
 		const failures = [];
 		const timers = new Set();
+		const controllers = new Set();
 		const clearTimers = () => {
 			for (const timer of timers) clearTimeout(timer);
 			timers.clear();
+		};
+		const abortLosers = (winnerController = null) => {
+			for (const controller of controllers) {
+				if (controller !== winnerController) controller.abort();
+			}
+			controllers.clear();
 		};
 		const maybeReject = () => {
 			if (!settled && launched >= unique.length && active === 0) {
 				settled = true;
 				clearTimers();
+				abortLosers();
 				reject(new AggregateError(failures, 'All dial candidates failed'));
 			}
 		};
 		const launchNext = () => {
 			if (settled || launched >= unique.length) return;
 			const candidate = unique[launched++];
+			const controller = new AbortController();
+			controllers.add(controller);
 			active++;
 			Promise.resolve()
-				.then(() => openCandidate(candidate))
+				.then(() => openCandidate(candidate, controller.signal))
 				.then(socket => {
 					active--;
+					controllers.delete(controller);
 					if (settled) {
 						closeRemoteSocketQuietly(socket);
 						return;
 					}
 					settled = true;
 					clearTimers();
+					abortLosers(controller);
 					resolve({ socket, candidate });
 				})
 				.catch(error => {
 					active--;
-					failures.push(error);
+					controllers.delete(controller);
+					if (!controller.signal.aborted) failures.push(error);
 					if (!settled && launched < unique.length) {
 						clearTimers();
 						launchNext();
@@ -2311,6 +2401,7 @@ async function openStaggeredCandidates(candidates, openCandidate, options = {}) 
 }
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
+	validateTunnelTarget(host, portNum);
 	const { env, ctx } = getWorkerRequestContext(request);
 	const tunnelContext = getRequestTunnelContext(request);
 	const parsedProxyAddress = tunnelContext.parsedProxyAddress || {};
@@ -2322,7 +2413,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const forceProxyHosts = Array.isArray(tunnelContext.forceProxyHosts) ? tunnelContext.forceProxyHosts : [];
 	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
-	const 首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
+	const 已有首包数据 = 有效数据长度(rawData) > 0;
+	const 配置首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
+	const 首字节超时毫秒 = 已有首包数据 ? 0 : 配置首字节超时毫秒;
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'} | Forced: ${forceProxyForHost ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
@@ -2333,14 +2426,22 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		await socketOpenedWithTimeout(remoteSock, timeoutMs, 'Connection timed out');
 	}
 
-	async function 打开TCP连接(address, port) {
+	async function 打开TCP连接(address, port, signal = null) {
 		const remoteSock = TCP连接({ hostname: address, port });
+		const abort = () => { try { remoteSock?.close?.() } catch (e) { } };
+		if (signal?.aborted) {
+			abort();
+			throw new Error('dial aborted');
+		}
+		signal?.addEventListener?.('abort', abort, { once: true });
 		try {
 			await 等待连接建立(remoteSock);
 			return remoteSock;
 		} catch (err) {
-			try { remoteSock?.close?.() } catch (e) { }
+			abort();
 			throw err;
+		} finally {
+			signal?.removeEventListener?.('abort', abort);
 		}
 	}
 
@@ -2352,7 +2453,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function 并发打开候选连接(候选列表) {
-		return openStaggeredCandidates(候选列表, 候选 => 打开TCP连接(候选.hostname, 候选.port), { staggerMs: getDialStaggerMs(env) });
+		return openStaggeredCandidates(候选列表, (候选, signal) => 打开TCP连接(候选.hostname, 候选.port, signal), { staggerMs: getDialStaggerMs(env) });
 	}
 
 	async function 构建预加载竞速候选列表(address, port) {
@@ -2415,7 +2516,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			for (let i = 0; i < 所有反代数组.length; i += dialConcurrency) {
 				const 候选列表 = [];
 				for (let j = 0; j < dialConcurrency && i + j < 所有反代数组.length; j++) {
-					const 反代数组索引 = (缓存反代数组索引 + i + j) % 所有反代数组.length;
+					const 反代数组索引 = (getProxyEndpointCursor(proxyIP, host, 所有反代数组.length) + i + j) % 所有反代数组.length;
 					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
 				}
@@ -2431,7 +2532,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
 					remoteConnWrapper.反代无数据回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
-					缓存反代数组索引 = candidate.index;
+					setProxyEndpointCursor(proxyIP, host, candidate.index, 所有反代数组.length);
 					return socket;
 				} catch (err) {
 					try { socket?.close?.() } catch (e) { }
@@ -2477,17 +2578,24 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				log(`[TURN proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = await turnConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
-					const writer = newSocket.writable.getWriter();
-					try { await writer.write(数据转Uint8Array(本次首包数据)) }
-					finally { try { writer.releaseLock() } catch (e) { } }
+					// Close the socket if the first-packet write fails, matching connectDirect/connectProxyIP —
+					// otherwise a socket that connected but rejected its first write leaks (never assigned to
+					// remoteConnWrapper.socket, so nothing else closes it).
+					try {
+						const writer = newSocket.writable.getWriter();
+						try { await writer.write(数据转Uint8Array(本次首包数据)) }
+						finally { try { writer.releaseLock() } catch (e) { } }
+					} catch (err) { try { newSocket.close?.() } catch (e) { } throw err; }
 				}
 			} else if (proxyType === 'sstp') {
 				log(`[SSTP proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = await sstpConnect(proxyAddressForConnect, host, portNum, TCP连接);
 				if (有效数据长度(本次首包数据) > 0) {
-					const writer = newSocket.writable.getWriter();
-					try { await writer.write(数据转Uint8Array(本次首包数据)) }
-					finally { try { writer.releaseLock() } catch (e) { } }
+					try {
+						const writer = newSocket.writable.getWriter();
+						try { await writer.write(数据转Uint8Array(本次首包数据)) }
+						finally { try { writer.releaseLock() } catch (e) { } }
+					} catch (err) { try { newSocket.close?.() } catch (e) { } throw err; }
 				}
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
@@ -2499,7 +2607,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 0, { env, onFirstByte: remoteConnWrapper.反代首字节回调, onNoData: remoteConnWrapper.反代无数据回调 });
+			// Honor FIRST_BYTE_TIMEOUT_MS on the proxy path too (opt-in; 0 = off by default). There is no
+			// fallback here (retryFunc=null), so a fired timeout just CLOSES the stream — it never replays
+			// the first packet from the worker — turning a blackholed relay (connects, then sends nothing)
+			// into a fast client re-dial instead of a frozen tab, and scoring the endpoint as failed via
+			// onNoData. Uses the raw configured value (not forced to 0 on a data-carrying first packet)
+			// because a clean close is not a worker replay; see the direct path where the timeout is forced
+			// to 0 precisely because there it triggers a worker-side retry/replay.
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(newSocket, ws, respHeader, null, 配置首字节超时毫秒, { env, wrapper: remoteConnWrapper, onFirstByte: remoteConnWrapper.反代首字节回调, onNoData: remoteConnWrapper.反代无数据回调 });
 		})();
 
 		remoteConnWrapper.connectingPromise = 当前连接任务;
@@ -2511,10 +2626,23 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			}
 		}
 	}
-	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
+	remoteConnWrapper.retryConnect = async () => {
+		// Once any downlink byte has reached the client, reconnecting is unsafe: connecttoPry replays the
+		// original first packet to a fresh remote, so the client would receive a second response spliced
+		// onto the partial one it already got (corruption + a non-idempotent first-packet replay). Refuse
+		// the retry — the caller then tears the connection down cleanly and the client re-dials. Mirrors the
+		// download path's `!hasData` retry gate. The pre-first-byte case (safe to retry) is unaffected.
+		if (remoteConnWrapper.已向客户端下发数据) throw new Error('[TCP forwarding] Upload retry aborted: downlink data already delivered to client');
+		return connecttoPry(!已通过代理发送首包);
+	};
 
-	if (forceProxyForHost || (proxyType && (proxyGlobalEnabled || socksWhitelist.some(pattern => matchesHostPattern(host, pattern))))) {
-		log(`[TCP forwarding] Proxy route selected: ${forceProxyForHost ? 'forced host rule' : 'SOCKS5/HTTP/HTTPS/TURN/SSTP rule'}`);
+	const 直连路由键 = `${host}:${portNum}|${String(request?.cf?.colo || '')}`;
+	const 反代兜底可用 = !!(proxyIP || proxyType);
+	const 直连近期失败 = 反代兜底可用 && getDirectRouteFailed(直连路由键);
+	if (直连近期失败) log(`[TCP forwarding] Direct route recently failed for ${host}:${portNum}; skipping direct and using proxy`);
+
+	if (forceProxyForHost || 直连近期失败 || (proxyType && (proxyGlobalEnabled || socksWhitelist.some(pattern => matchesHostPattern(host, pattern))))) {
+		log(`[TCP forwarding] Proxy route selected: ${forceProxyForHost ? 'forced host rule' : (直连近期失败 ? 'direct route recently failed' : 'SOCKS5/HTTP/HTTPS/TURN/SSTP rule')}`);
 		try {
 			await connecttoPry();
 		} catch (err) {
@@ -2528,14 +2656,16 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			remoteConnWrapper.socket = initialSocket;
 			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
+				recordDirectRouteFailure(直连路由键);
 				await connecttoPry();
-			}, 首字节超时毫秒, { env });
+			}, 首字节超时毫秒, { env, wrapper: remoteConnWrapper, onFirstByte: () => recordDirectRouteOk(直连路由键) });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
 				closeSocketQuietly(ws);
 				throw err;
 			}
+			recordDirectRouteFailure(直连路由键);
 			await connecttoPry();
 		}
 	}
@@ -2628,37 +2758,42 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 	if (frames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
 	const dohUrls = getDohLookupUrls(env);
 	let lastErr = null;
+	// Per-frame results preserved across DoH-URL attempts: a fallback URL (or a later batch) only
+	// re-fetches frames still missing, so a partial-batch failure never re-spends subrequests on frames
+	// that already resolved. Matters on the free plan's shared per-connection (50) subrequest budget.
+	const results = new Array(frames.length).fill(null);
+	const 查询单帧 = async (dohUrl, query) => {
+		const resp = await fetchWithTimeout(dohUrl, {
+			method: 'POST',
+			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
+			body: query,
+		}, timeoutMs);
+		if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
+		const msg = new Uint8Array(await resp.arrayBuffer());
+		if (!msg.byteLength) throw new Error('empty DoH response');
+		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
+		const framed = new Uint8Array(2 + msg.byteLength);
+		framed[0] = (msg.byteLength >>> 8) & 0xff;
+		framed[1] = msg.byteLength & 0xff;
+		framed.set(msg, 2);
+		return framed;
+	};
 	for (const dohUrl of dohUrls) {
-		try {
-			const results = [];
-			for (let offset = 0; offset < frames.length; offset += 3) {
-				const batch = frames.slice(offset, offset + 3);
-				const batchResults = await Promise.all(batch.map(async query => {
-					const resp = await fetchWithTimeout(dohUrl, {
-						method: 'POST',
-						headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
-						body: query,
-					}, timeoutMs);
-					if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
-					const msg = new Uint8Array(await resp.arrayBuffer());
-					if (!msg.byteLength) throw new Error('empty DoH response');
-					if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
-					const framed = new Uint8Array(2 + msg.byteLength);
-					framed[0] = (msg.byteLength >>> 8) & 0xff;
-					framed[1] = msg.byteLength & 0xff;
-					framed.set(msg, 2);
-					return framed;
-				}));
-				results.push(...batchResults);
+		const 待查询索引 = [];
+		for (let i = 0; i < frames.length; i++) if (!results[i]) 待查询索引.push(i);
+		if (!待查询索引.length) break;
+		for (let offset = 0; offset < 待查询索引.length; offset += 3) {
+			const batch = 待查询索引.slice(offset, offset + 3);
+			const settled = await Promise.allSettled(batch.map(i => 查询单帧(dohUrl, frames[i])));
+			for (let k = 0; k < batch.length; k++) {
+				if (settled[k].status === 'fulfilled') results[batch[k]] = settled[k].value;
+				else { lastErr = settled[k].reason; log(`[UDP forwarding] DoH via ${dohUrl} failed: ${settled[k].reason?.message || settled[k].reason}`); }
 			}
-			const out = results.length === 1 ? results[0] : 拼接字节数据(...results);
-			return out;
-		} catch (err) {
-			lastErr = err;
-			log(`[UDP forwarding] DoH via ${dohUrl} failed: ${err?.message || err}`);
 		}
+		if (results.every(Boolean)) break;
 	}
-	throw lastErr || new Error('all DoH endpoints failed');
+	if (!results.every(Boolean)) throw lastErr || new Error('all DoH endpoints failed');
+	return results.length === 1 ? results[0] : 拼接字节数据(...results);
 }
 
 // Fallback tunneled-DNS path: one DNS-over-TCP round trip (legacy behavior) if DoH is unreachable.
@@ -2693,11 +2828,25 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		log(`[UDP forwarding] Received DNS request: ${requestBytes}B`);
 		let rawResponse;
-		try {
-			rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
-		} catch (dohError) {
-			log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
-			rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+		// DNS_TUNNEL_TCP_FIRST=1 prefers DNS-over-TCP (connect(), no subrequest cost) over DoH (fetch(), one
+		// subrequest per query). Useful on the Free plan: a long-lived WS connection shares a 50-subrequest
+		// budget, so a client that tunnels its DNS can exhaust it mid-session (→ DNS silently stops). Default
+		// keeps DoH-first (fast edge resolver). Enable only if your client routes DNS through the tunnel.
+		const 隧道DNS优先TCP = ['1', 'true'].includes(String(env?.DNS_TUNNEL_TCP_FIRST || '').toLowerCase());
+		if (隧道DNS优先TCP) {
+			try {
+				rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+			} catch (tcpError) {
+				log(`[UDP forwarding] DNS-over-TCP failed (${tcpError?.message || tcpError}); falling back to DoH`);
+				rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+			}
+		} else {
+			try {
+				rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+			} catch (dohError) {
+				log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
+				rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+			}
 		}
 		if (!rawResponse || !rawResponse.byteLength) return;
 		log(`[UDP forwarding] DNS response: ${rawResponse.byteLength}B`);
@@ -2975,7 +3124,9 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 		flushTimer = null;
 		microtaskQueued = false;
 		if (!pendingBytes) return;
-		const output = pendingBuffer.subarray(0, pendingBytes).slice();
+		// No defensive copy needed: the next line rebinds pendingBuffer to a fresh array, orphaning this
+		// backing buffer, so nothing mutates it while `output` is in flight — a zero-copy view is safe.
+		const output = pendingBuffer.subarray(0, pendingBytes);
 		pendingBuffer = new Uint8Array(packetCap);
 		pendingBytes = 0;
 		waitRounds = 0;
@@ -3057,7 +3208,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
 	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
-	const 标记首字节 = () => { if (hasData) return; hasData = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
+	const 标记首字节 = () => { if (hasData) return; hasData = true; if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes);
@@ -3067,10 +3218,12 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	catch (e) { reader = remoteSocket.readable.getReader() }
 
 	// Optional first-byte timeout: if the remote connects but sends nothing within the window, cancel
-	// the read so the no-data fallback (retryFunc) can try the ProxyIP relay instead of hanging on a
-	// blackholed direct connection. Disabled unless FIRST_BYTE_TIMEOUT_MS is set.
+	// the read. With a retryFunc (direct path) the no-data fallback then tries the ProxyIP relay; without
+	// one (proxy path) the stream just closes and the client re-dials. Either way it rescues a blackholed
+	// connection instead of hanging. Armed whenever firstByteTimeoutMs > 0 — the caller decides the value
+	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
 	let 首字节计时器 = null;
-	if (firstByteTimeoutMs > 0 && retryFunc) {
+	if (firstByteTimeoutMs > 0) {
 		首字节计时器 = setTimeout(() => { if (!hasData) { try { reader.cancel() } catch (e) { } } }, firstByteTimeoutMs);
 	}
 
@@ -3169,6 +3322,86 @@ function matchesHostPattern(hostname, pattern) {
 	} catch (e) {
 		return false;
 	}
+}
+
+
+function isValidIPv6Literal(host) {
+	let value = String(host || '').trim();
+	if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+	if (!value.includes(':') || value.includes(':::')) return false;
+	const parts = value.split('::');
+	if (parts.length > 2) return false;
+	const left = parts[0] ? parts[0].split(':') : [];
+	const right = parts.length === 2 && parts[1] ? parts[1].split(':') : [];
+	const all = left.concat(right);
+	if (all.some(part => !/^[0-9a-fA-F]{1,4}$/.test(part))) return false;
+	if (parts.length === 1) return all.length === 8;
+	return all.length < 8;
+}
+
+function isPrivateOrLocalIPv4(host) {
+	const m = String(host || '').match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+	if (!m) return false;
+	const a = Number(m[1]), b = Number(m[2]);
+	return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+		|| (a === 100 && b >= 64 && b <= 127) // CGNAT 100.64.0.0/10
+		|| (a === 198 && (b === 18 || b === 19)); // benchmarking 198.18.0.0/15
+}
+
+function isLocalhostName(host) {
+	const value = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+	return value === 'localhost' || value.endsWith('.localhost');
+}
+
+function getFirstIpv6Hextet(host) {
+	let value = stripIPv6Brackets(String(host || '').trim()).toLowerCase();
+	if (!isValidIPv6Literal(value)) return null;
+	if (value.startsWith('::')) return 0;
+	const first = value.split(':')[0] || '0';
+	const parsed = parseInt(first, 16);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isPrivateOrLocalIPv6(host) {
+	const value = stripIPv6Brackets(String(host || '').trim()).toLowerCase();
+	// Unwrap IPv4-mapped (::ffff:a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) forms to the embedded IPv4 FIRST —
+	// isValidIPv6Literal rejects the mixed-dotted notation, so this must run before it. Prevents e.g.
+	// ::ffff:127.0.0.1 or 64:ff9b::a9fe:a9fe smuggling a private target past the guard.
+	if (value.startsWith('::ffff:') || value.startsWith('64:ff9b:')) {
+		const dotted = value.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+		if (dotted) return isPrivateOrLocalIPv4(dotted[1]);
+		const groups = value.split(':').filter(g => g.length > 0);
+		if (groups.length >= 2) {
+			const hi = parseInt(groups[groups.length - 2], 16), lo = parseInt(groups[groups.length - 1], 16);
+			if (Number.isFinite(hi) && Number.isFinite(lo)) return isPrivateOrLocalIPv4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
+		}
+	}
+	if (!isValidIPv6Literal(value)) return false;
+	if (value === '::' || value === '0:0:0:0:0:0:0:0' || value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
+	const first = getFirstIpv6Hextet(value);
+	if (first === null) return false;
+	return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80; // fc00::/7 ULA, fe80::/10 link-local.
+}
+
+function isProbablyValidDomain(host) {
+	const value = String(host || '').trim().replace(/\.$/, '');
+	if (!value || value.length > 253 || /[\s\0]/.test(value)) return false;
+	if (!value.includes('.')) return false;
+	const labels = value.split('.');
+	return labels.every(label => label.length >= 1 && label.length <= 63 && /^[a-zA-Z0-9-]+$/.test(label) && !label.startsWith('-') && !label.endsWith('-'));
+}
+
+function validateTunnelTarget(host, port) {
+	const hostname = String(host || '').trim();
+	const unbracketedHost = stripIPv6Brackets(hostname);
+	const portNum = Number(port);
+	if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) throw new Error(`invalid target port: ${port}`);
+	if (portNum === 25) throw new Error('SMTP port 25 is not allowed');
+	if (!hostname) throw new Error('empty target host');
+	if (isLocalhostName(hostname)) throw new Error(`localhost target blocked: ${hostname}`);
+	if (isPrivateOrLocalIPv4(unbracketedHost)) throw new Error(`private/local target blocked: ${hostname}`);
+	if (isPrivateOrLocalIPv6(unbracketedHost)) throw new Error(`private/local IPv6 target blocked: ${hostname}`);
+	if (!isIPHostname(hostname) && !isProbablyValidDomain(hostname)) throw new Error(`invalid target hostname: ${hostname}`);
 }
 
 
@@ -5556,7 +5789,14 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 	try {
 		const 当前时间 = new Date();
 		const cf = request.cf || {};
-		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
+		// Don't persist the subscription token (a long-lived, UUID-equivalent credential) verbatim into KV /
+		// the admin operation log. Mask it so the log still shows a token was present without leaking it.
+		let 记录URL = request.url;
+		try {
+			const u = new URL(request.url);
+			if (u.searchParams.has('token')) { u.searchParams.set('token', '***'); 记录URL = u.toString(); }
+		} catch (e) { }
+		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: 记录URL, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON?.TG?.启用) {
 			try {
 				const TG_TXT = await env.KV.get('tg.json');
@@ -5890,6 +6130,18 @@ function writeDohNegativeCache(cacheKey, now = Date.now()) {
 	}, DNS_RESULT_CACHE_MAX_ENTRIES);
 }
 
+function getDnsRcode(buf) {
+	if (!buf || buf.byteLength < 4) return -1;
+	return buf[3] & 0x0f;
+}
+
+function shouldNegativeCacheDnsResponse(buf, answers) {
+	const rcode = getDnsRcode(buf);
+	if (rcode === 3) return true; // NXDOMAIN.
+	if (rcode === 0 && Array.isArray(answers) && answers.length === 0) return true; // NODATA.
+	return false;
+}
+
 async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOOKUP_URL) {
 	const 开始时间 = performance.now();
 	const normalizedDomain = String(域名 || '').trim().toLowerCase();
@@ -5943,13 +6195,12 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		if (!response.ok) {
 			try { response.body?.cancel() } catch (e) { }
 			debugWarn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
-			writeDohNegativeCache(cacheKey);
 			return [];
 		}
 
 
 		const buf = new Uint8Array(await response.arrayBuffer());
-		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); writeDohNegativeCache(cacheKey); return []; }
+		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
@@ -6024,12 +6275,12 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		}
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
 		log(`[DoH lookup] Query complete for ${域名} ${记录类型} via ${DoH解析服务} in ${耗时}ms with ${answers.length} results${answers.length > 0 ? '\n' + answers.map((a, i) => `  ${i + 1}. ${a.name} type=${a.type} TTL=${a.TTL} data=${a.data}`).join('\n') : ''}`);
-		writeDohCache(cacheKey, answers);
+		if (answers.length > 0) writeDohCache(cacheKey, answers);
+		else if (shouldNegativeCacheDnsResponse(buf, answers)) writeDohNegativeCache(cacheKey);
 		return answers;
 	} catch (error) {
 		const 耗时 = (performance.now() - 开始时间).toFixed(2);
 		debugError(`[DoH lookup] Query failed for ${域名} ${记录类型} via ${DoH解析服务} after ${耗时}ms:`, error);
-		writeDohNegativeCache(cacheKey);
 		return [];
 	}
 }
@@ -7193,10 +7444,13 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	try { const res = await fetchWithTimeout(cidr_url, {}, 5000); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
 
 	const generateRandomIPFromCIDR = (cidr) => {
-		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
-		const ipInt = baseIP.split('.').reduce((a, p, i) => a | (parseInt(p) << (24 - i * 8)), 0);
+		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength, 10);
+		// Clamp prefix to 0–32 (treat a malformed prefix as /32 = a single host). hostBits === 32 (a /0)
+		// must give mask 0, but JS `<<` is mod-32 so `0xFFFFFFFF << 32` is a no-op — special-case it.
+		const hostBits = Number.isInteger(prefix) ? Math.max(0, Math.min(32, 32 - prefix)) : 0;
+		const ipInt = baseIP.split('.').reduce((a, p, i) => a | ((parseInt(p, 10) || 0) << (24 - i * 8)), 0);
 		const randomOffset = Math.floor(Math.random() * Math.pow(2, hostBits));
-		const mask = (0xFFFFFFFF << hostBits) >>> 0, randomIP = (((ipInt & mask) >>> 0) + randomOffset) >>> 0;
+		const mask = hostBits >= 32 ? 0 : (0xFFFFFFFF << hostBits) >>> 0, randomIP = (((ipInt & mask) >>> 0) + randomOffset) >>> 0;
 		return [(randomIP >>> 24) & 0xFF, (randomIP >>> 16) & 0xFF, (randomIP >>> 8) & 0xFF, randomIP & 0xFF].join('.');
 	};
 	const randomIPs = Array.from({ length: count }, (_, index) => {
@@ -7237,16 +7491,29 @@ async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
 	const 优选订阅生成器URL = `${格式化HOST}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
 
 	try {
-		const response = await fetch(优选订阅生成器URL, {
+		const response = await fetchWithTimeout(优选订阅生成器URL, {
 			headers: { 'User-Agent': 'v2rayN/edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' }
-		});
+		}, 3000);
 
 		if (!response.ok) {
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: ${response.statusText}`);
 			return [优选IP, 其他节点LINK];
 		}
 
-		const 优选订阅生成器返回订阅内容 = atob(await response.text());
+		// This body is untrusted (an arbitrary host the caller passed via ?sub=). Cap it so a hostile/huge
+		// response can't spike isolate memory; the timeout above bounds a slow/hung upstream.
+		const 声明长度 = Number(response.headers.get('content-length') || 0);
+		if (Number.isFinite(声明长度) && 声明长度 > 512 * 1024) {
+			try { response.body?.cancel() } catch (e) { }
+			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: response too large`);
+			return [优选IP, 其他节点LINK];
+		}
+		const 优选订阅生成器原始文本 = await response.text();
+		if (优选订阅生成器原始文本.length > 512 * 1024) {
+			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: response too large`);
+			return [优选IP, 其他节点LINK];
+		}
+		const 优选订阅生成器返回订阅内容 = atob(优选订阅生成器原始文本);
 		const 订阅行列表 = 优选订阅生成器返回订阅内容.includes('\r\n')
 			? 优选订阅生成器返回订阅内容.split('\r\n')
 			: 优选订阅生成器返回订阅内容.split('\n');
@@ -7917,6 +8184,23 @@ function isValidProxyEndpointHost(host) {
 	return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i.test(host);
 }
 
+function getProxyEndpointCursorKey(proxyIP, targetHost) {
+	return `${String(proxyIP || '').toLowerCase()}|${String(targetHost || '').toLowerCase()}`;
+}
+
+function getProxyEndpointCursor(proxyIP, targetHost, length) {
+	if (!length) return 0;
+	const key = getProxyEndpointCursorKey(proxyIP, targetHost);
+	return (PROXY_ENDPOINT_CURSOR.get(key) || 0) % length;
+}
+
+function setProxyEndpointCursor(proxyIP, targetHost, index, length) {
+	if (!length) return;
+	const key = getProxyEndpointCursorKey(proxyIP, targetHost);
+	PROXY_ENDPOINT_CURSOR.set(key, index % length);
+	while (PROXY_ENDPOINT_CURSOR.size > 256) PROXY_ENDPOINT_CURSOR.delete(PROXY_ENDPOINT_CURSOR.keys().next().value);
+}
+
 function normalizeProxyEndpoint(endpoint) {
 	if (!Array.isArray(endpoint) || endpoint.length < 2) return null;
 	const host = String(endpoint[0] || '').trim().toLowerCase();
@@ -8242,6 +8526,7 @@ async function resolveProxyEndpointsLiveWithEnv(env, proxyIP, 目标域名 = 'da
 }
 
 export const __testPerformanceHelpers = {
+	validateTunnelTarget,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS,

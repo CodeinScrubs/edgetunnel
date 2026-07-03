@@ -7,12 +7,17 @@ This repository contains a Cloudflare Worker / Pages deployment with an admin pa
 1. Create a Cloudflare Worker or Pages project.
 2. Set an `ADMIN` environment variable. This is the admin panel password.
 3. Bind a KV namespace using the binding name `KV`.
-4. Deploy `_worker.js`.
+4. Deploy `_worker_copypaste.js` (Dashboard copy-paste) or `wrangler_deploy_method_worker/_worker.js` (Wrangler).
 5. Open `/admin` on your deployed domain and sign in with the admin password.
 
 ## Source And Build
 
-`src/worker.js` is the source of truth. `_worker.js` is the generated deployable Worker file for Wrangler or manual copy-paste deployment.
+`src/worker.js` is the source of truth. `npm run build` generates two deployable builds from it:
+
+- **`_worker_copypaste.js`** — for Dashboard "Edit Code" copy-paste. Uses `request.fetcher.connect` for outbound TCP.
+- **`wrangler_deploy_method_worker/_worker.js`** — for `wrangler deploy`. Uses the documented `connect()` from `cloudflare:sockets`.
+
+The two builds are identical except for that outbound-TCP mechanism. Do **not** paste the Wrangler build into the Dashboard — its `cloudflare:sockets` import causes Error 1101 there; use `_worker_copypaste.js` for copy-paste instead.
 
 ```bash
 npm run build
@@ -32,7 +37,7 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 ## Worker Deployment
 
 1. Create a new Cloudflare Worker.
-2. Copy the contents of `_worker.js` into the Worker editor, or deploy with Wrangler.
+2. For Dashboard copy-paste, paste the contents of `_worker_copypaste.js` into the Worker editor. For Wrangler, run `wrangler deploy -c wrangler_deploy_method_worker/wrangler.toml`.
 3. Add the `ADMIN` environment variable.
 4. Add a KV namespace binding named `KV`.
 5. Optional: add a custom domain from the Worker triggers page.
@@ -65,8 +70,8 @@ Edit user-facing static defaults in `src/core/config.js`, then run `npm run buil
 | `OFF_PROXY_CACHE` | No | `1` | Force-disables the persistent KV proxy-resolution cache (the in-memory cache stays on). |
 | `BEST_SUB` | No | `1` | Enables preferred subscription generator mode when set to `1` or `true`. |
 | `PRELOAD_RACE_DIAL` | No | `1` | Enables preload race dialing when set to `1` or `true`. |
-| `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `1500` ms. |
-| `DNS_TIMEOUT_MS` | No | `1200` | Optional DNS-over-TCP response timeout. Falls back to `CONNECT_TIMEOUT_MS` when set, otherwise `1200` ms. Values are clamped from `400` to `1500` ms. |
+| `CONNECT_TIMEOUT_MS` | No | `850` | Optional outbound connect timeout. Values are clamped from `400` to `5000` ms. |
+| `DNS_TIMEOUT_MS` | No | `1200` | Optional DNS-over-TCP response timeout. Falls back to `CONNECT_TIMEOUT_MS` when set, otherwise `1200` ms. Values are clamped from `400` to `5000` ms. |
 | `DIAL_STAGGER_MS` | No | `90` | Optional stagger between clean-IP/proxy candidate dials. Defaults to `90` ms and is clamped from `0` to `500` ms. |
 | `DNS_SERVER` | No | `1.1.1.1:53` | Optional TCP DNS upstream for tunneled UDP DNS requests. Defaults to `8.8.4.4:53`. |
 | `DOH_URL` | No | `https://dns.google/dns-query` | Optional DoH endpoint for preload race dialing and proxy-domain resolution. Defaults to Cloudflare DoH. |
@@ -91,7 +96,8 @@ Use the `ADMIN` password to sign in. The panel can update runtime configuration,
 - Proxy endpoint resolution uses a bounded memory cache plus a persistent last-known-good KV cache (on by default). KV writes are globally throttled (at most one every few minutes per isolate) and expire via TTL, so active browsing cannot exhaust the free-plan KV write quota; a write failure is always swallowed and never drops a connection. Set `OFF_PROXY_CACHE=1` or `ENABLE_KV_PROXY_CACHE=0` to keep it memory-only.
 - Request logging is off by default to avoid exhausting Cloudflare's free-tier KV write quota during subscription traffic. Set `ENABLE_KV_LOG=1` to store append-only KV entries under `log:entry:`; existing legacy `log.json` data is still readable as a fallback when no append-only entries exist.
 - `PRELOAD_RACE_DIAL=1` can improve first-open latency when DoH is fast and nearby, but it adds a DoH lookup before dialing each new hostname. Leave it off on networks where DoH is slow or blocked.
-- TCP outbound dialing currently uses the request `fetcher.connect` adapter provided by the deployed runtime. Cloudflare's documented Workers socket API is `connect()` from `cloudflare:sockets`; migrate that adapter only after validating it in the same deployment target because the current path is known to work in this project.
+- TCP outbound dialing uses `request.fetcher.connect` in the copy-paste build (`_worker_copypaste.js`) and the documented `connect()` from `cloudflare:sockets` in the Wrangler build (`wrangler_deploy_method_worker/_worker.js`). The Dashboard editor mishandles the `cloudflare:sockets` import (Error 1101), so the sockets build must be deployed with Wrangler only.
+- Tunnel targets are validated before dialing (`validateTunnelTarget`): SMTP port 25, localhost, and private/loopback/link-local IPv4 & IPv6 ranges are rejected to reduce SSRF/abuse surface.
 - gRPC flush timing should be tuned only from measurements. Use `node scripts/grpc-live-smoke-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid` to smoke-test a deployed gRPC endpoint before changing batching constants.
 - Use `node scripts/live-tunnel-benchmark.mjs --url https://your-domain.example/ --uuid your-vless-uuid --transports all --runs 5` to compare deployed WS, gRPC, and XHTTP first-byte latency, total time, and success rate before tuning speed-related defaults.
 

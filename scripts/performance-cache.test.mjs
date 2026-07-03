@@ -24,7 +24,7 @@ const {
 	deriveShadowsocksMasterKey,
 	sha224,
 	parseDnsTcpFrames,
-} = await import('../_worker.js').then(mod => mod.__testPerformanceHelpers);
+} = await import('../_worker_copypaste.js').then(mod => mod.__testPerformanceHelpers);
 
 const now = 1_700_000_000_000;
 
@@ -175,7 +175,7 @@ function decodeDnsQuestion(packet) {
 		const second = await DoH查询('negative-cache.example', 'A', 'https://resolver.test/dns-query');
 		assert.deepEqual(first, []);
 		assert.deepEqual(second, []);
-		assert.equal(fetchCalls, 1, 'failed DoH lookups should be briefly negative-cached');
+		assert.equal(fetchCalls, 2, 'DoH transport failures (HTTP errors) must NOT be negative-cached, so a transient resolver hiccup cannot poison DNS for a real domain; the retry re-queries the resolver (only genuine NXDOMAIN/NODATA is negative-cached)');
 		assert.equal(warnings.length, 0, 'failed DoH lookups should not emit ungated console.warn output');
 	} finally {
 		globalThis.fetch = originalFetch;
