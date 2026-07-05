@@ -261,7 +261,9 @@ import { join } from 'node:path';
 	assert.match(source, /function getDownlinkBackpressureHwm\(env\)[\s\S]*?return 下行背压高水位字节/,
 		'backpressure HWM is env-tunable but falls back to the bounded default');
 	assert.match(source, /return 等待下行可写\(\)/, 'downstream bridge must apply pull-based backpressure (wait until the stream drains)');
-	assert.match(source, /webSocket\.bufferedAmount > WS缓冲上限字节/, 'WebSocket downstream must pace against bufferedAmount');
+	assert.match(source, /webSocket\.bufferedAmount > bufferedLimit/, 'WebSocket downstream must pace against bufferedAmount');
+	assert.match(source, /function getWsBufferedAmountLimitBytes\(env\)[\s\S]*?return WS缓冲上限字节/,
+		'WS bufferedAmount limit is env-tunable but falls back to the bounded default');
 	assert.match(source, /Stitch them back onto the front of the stream/, 'SOCKS5 must preserve bundled target-response bytes');
 	assert.match(source, /this\.handshakeComplete = !0, this\.timeout = 0/, 'TlsClient must drop its per-read timeout after the handshake');
 	assert.match(source, /判断协议类型 === null && !isDnsQuery && 有效数据长度\(chunk\) === 0/, 'empty pre-handshake WS frames must be ignored before the parser');

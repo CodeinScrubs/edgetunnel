@@ -1359,6 +1359,35 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// VLESS/plain-UDP DNS reassembly: a length-prefixed query frame split across two forwardataudp calls
+	// (chunk boundaries don't align with tunneled frame boundaries) must reassemble via a shared
+	// udpContext — the Trojan-UDP path already buffers, the VLESS path previously dropped the tail.
+	const originalFetch = globalThis.fetch;
+	const calls = [];
+	globalThis.fetch = (url, init) => {
+		calls.push([...new Uint8Array(init.body)]);
+		return Promise.resolve(new Response(new Uint8Array([0xaa, 0xbb, 0xcc]), { status: 200, headers: { 'Content-Type': 'application/dns-message' } }));
+	};
+	const sent = [];
+	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
+	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
+	const udpContext = { 缓存: new Uint8Array(0) };
+	try {
+		// Query frame [0,2,0x12,0x34] (length=2, payload 0x12 0x34) split after 3 bytes.
+		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12]), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 1');
+		assert.equal(calls.length, 0, 'no DoH request until the frame is complete');
+		assert.equal(sent.length, 0, 'nothing sent until the frame is complete');
+		await withTestTimeout(forwardataudp(new Uint8Array([0x34]), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 2');
+		assert.equal(calls.length, 1, 'exactly one DoH request once the frame completes');
+		assert.deepEqual(calls[0], [0x12, 0x34], 'reassembled query matches the original unsplit frame');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])], 'response delivered once, correctly framed');
+		assert.equal(udpContext.缓存.byteLength, 0, 'reassembly buffer empty after a fully-consumed frame');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
 	// E: a partial-batch DoH failure must not re-spend subrequests on frames that already resolved. Frame
 	// 0x12 succeeds on the primary; 0x34 fails on the primary; only 0x34 is retried against the fallback,
 	// and 0x12 is never re-fetched.

@@ -61,7 +61,7 @@ const ENGINE_DEFAULTS = {
 	GRPC_MAX_FRAME_PAYLOAD_BYTES: 4 * 1024 * 1024,
 	XHTTP_FIRST_PACKET_MAX_BYTES: 64 * 1024,
 	PROXY_RESOLUTION_CACHE_VERSION: 1,
-	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 24,
+	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 64,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
@@ -108,6 +108,9 @@ const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
+// env.HOST is a static per-deployment env var, so its parsed form is memoized here instead of
+// re-parsed on every request (realistically holds one entry; the size guard is just defensive).
+const HOSTS_LIST_CACHE = new Map();
 // Adaptive direct-route cache: remembers hosts that consistently fail a DIRECT dial (per colo) and
 // routes them straight through ProxyIP for a short window, skipping the wasted direct attempt + the
 // failover wait. Bounded + TTL'd so it self-heals — a recovered host is retried after the TTL, and a
@@ -330,7 +333,18 @@ export default {
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
 		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
-		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(normalizeConfigHost).filter(Boolean) : [url.hostname];
+		let hosts;
+		if (env.HOST) {
+			const hostConfigKey = String(env.HOST);
+			hosts = HOSTS_LIST_CACHE.get(hostConfigKey);
+			if (!hosts) {
+				hosts = (await 整理成数组(env.HOST)).map(normalizeConfigHost).filter(Boolean);
+				if (HOSTS_LIST_CACHE.size >= 8) HOSTS_LIST_CACHE.clear();
+				HOSTS_LIST_CACHE.set(hostConfigKey, hosts);
+			}
+		} else {
+			hosts = [url.hostname];
+		}
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
 		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
@@ -876,6 +890,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
 			const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
+			const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 			const xhttpBridge = {
 				readyState: WebSocket.OPEN,
 				send(data) {
@@ -933,7 +948,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				if (首包.isUDP) {
 					if (首包.rawData?.byteLength) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request);
+						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, VLESS_UDP上下文);
 						udpRespHeader = null;
 					}
 				} else {
@@ -946,7 +961,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					if (!value || value.byteLength === 0) continue;
 					if (首包.isUDP) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(value, xhttpBridge, udpRespHeader, request);
+						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, VLESS_UDP上下文);
 						udpRespHeader = null;
 					} else {
 						if (!(await 写入远端(value))) throw new Error('Remote socket is not ready');
@@ -1154,6 +1169,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
+	const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
@@ -1317,7 +1333,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request);
+							else await forwardataudp(payload, grpcBridge, null, request, null, VLESS_UDP上下文);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
@@ -1353,7 +1369,7 @@ async function 处理gRPC请求(request, yourUUID) {
 								const rawData = rawClientData;
 								if (isDnsQuery) {
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request);
+									else await forwardataudp(rawData, grpcBridge, null, request, null, VLESS_UDP上下文);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
@@ -1440,6 +1456,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
+	const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
 	let WS上行写入队列 = null;
@@ -1747,7 +1764,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request);
+			return await forwardataudp(chunk, serverSock, null, request, null, VLESS_UDP上下文);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -1798,7 +1815,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, VLESS_UDP上下文);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request);
 		}
@@ -2710,16 +2727,21 @@ async function readMultipleDnsTcpFrames(tcpSocket, count, timeoutMs) {
 	const maxBufferedBytes = Math.min(2 * 1024 * 1024, safeCount * 65537);
 	try {
 		while (frames.length < safeCount) {
-			while (buffer.byteLength >= 2) {
-				const responseLength = (buffer[0] << 8) | buffer[1];
+			// Cursor through `buffer` and slice the tail once after the loop, instead of re-slicing the
+			// whole remaining tail on every extracted frame (was ~O(frames_in_buffer^2) when several
+			// complete frames arrived in one read).
+			let cursor = 0;
+			while (buffer.byteLength - cursor >= 2) {
+				const responseLength = (buffer[cursor] << 8) | buffer[cursor + 1];
 				if (responseLength <= 0) throw new Error('DNS TCP response has invalid length');
 				if (responseLength > 65535) throw new Error('DNS TCP response is too large');
 				const frameLength = responseLength + 2;
-				if (buffer.byteLength < frameLength) break;
-				frames.push(buffer.slice(0, frameLength));
-				buffer = buffer.slice(frameLength);
+				if (buffer.byteLength - cursor < frameLength) break;
+				frames.push(buffer.slice(cursor, cursor + frameLength));
+				cursor += frameLength;
 				if (frames.length >= safeCount) break;
 			}
+			if (cursor > 0) buffer = buffer.slice(cursor);
 			if (frames.length >= safeCount) break;
 			const remainingMs = Math.max(1, deadline - Date.now());
 			const { done, value } = await readWithOperationTimeout(reader, remainingMs, 'DNS TCP response timed out');
@@ -2821,8 +2843,20 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
-	const requestData = 数据转Uint8Array(udpChunk);
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null) {
+	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
+	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
+	// messages / stream reads lost its tail and the next chunk's leading bytes were misread as a new
+	// frame's length prefix. The Trojan-UDP path already avoids this via 转发木马UDP数据's own accumulator;
+	// this gives the direct VLESS/plain-UDP path the same protection when a caller supplies a udpContext.
+	let requestData = 数据转Uint8Array(udpChunk);
+	if (udpContext) {
+		requestData = udpContext.缓存?.byteLength ? 拼接字节数据(udpContext.缓存, requestData) : requestData;
+		const completeFrames = 解析DNS_TCP帧(requestData);
+		const consumedBytes = completeFrames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
+		udpContext.缓存 = requestData.subarray(consumedBytes);
+		if (!completeFrames.length) return; // no complete frame yet; wait for the rest to arrive
+	}
 	const requestBytes = requestData.byteLength;
 	try {
 		const { env } = getWorkerRequestContext(request);
@@ -2886,15 +2920,30 @@ function formatIdentifier(arr, offset = 0) {
 	return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
 
-async function WebSocket发送并等待(webSocket, payload) {
+// Env-overridable, same clamp pattern as getDownlinkGrainBytes/getDownlinkBackpressureHwm. These two
+// were previously the only tunables in their family with no per-deployment override.
+function getWsBufferedAmountLimitBytes(env) {
+	const configured = Number(env?.WS_BUFFERED_AMOUNT_LIMIT_BYTES);
+	if (!Number.isFinite(configured) || configured <= 0) return WS缓冲上限字节;
+	return Math.max(64 * 1024, Math.min(8 * 1024 * 1024, Math.round(configured)));
+}
+function getWsBufferedAmountMaxWaitMs(env) {
+	const configured = Number(env?.WS_BUFFERED_AMOUNT_MAX_WAIT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return WS缓冲最大等待毫秒;
+	return Math.max(100, Math.min(10000, Math.round(configured)));
+}
+
+async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
 	// Real-WebSocket downstream pacing: gRPC/XHTTP bridges signal backpressure via the awaited
 	// promise above; a native WebSocket has no such signal, so when the runtime exposes
 	// bufferedAmount we pause until its outbound buffer drains. Bounded so it can never hang.
-	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > WS缓冲上限字节) {
+	const bufferedLimit = limits?.bufferedLimitBytes ?? WS缓冲上限字节;
+	const maxWaitMs = limits?.maxWaitMs ?? WS缓冲最大等待毫秒;
+	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > bufferedLimit) {
 		let 已等待 = 0;
-		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > WS缓冲上限字节 && 已等待 < WS缓冲最大等待毫秒) {
+		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit && 已等待 < maxWaitMs) {
 			await new Promise(r => setTimeout(r, 5));
 			已等待 += 5;
 		}
@@ -3090,7 +3139,8 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	};
 }
 
-function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput = null) {
+function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput = null, env = null) {
+	const wsSendLimits = { bufferedLimitBytes: getWsBufferedAmountLimitBytes(env), maxWaitMs: getWsBufferedAmountMaxWaitMs(env) };
 	const packetCapCandidate = Number(packetCapInput);
 	const packetCap = Number.isFinite(packetCapCandidate) && packetCapCandidate > 0 ? Math.round(packetCapCandidate) : 下行Grain包字节;
 	const tailBytes = packetCap === 下行Grain包字节 ? 下行Grain尾部阈值 : Math.max(512, Math.min(16384, Math.round(packetCap / 32)));
@@ -3107,7 +3157,7 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 
 	const 发送原始块 = async (chunk) => {
 		if (webSocket.readyState !== WebSocket.OPEN) throw new Error('ws.readyState is not open');
-		await WebSocket发送并等待(webSocket, chunk);
+		await WebSocket发送并等待(webSocket, chunk, wsSendLimits);
 	};
 
 	const 附加响应头 = (chunk) => {
@@ -3212,7 +3262,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	const 标记首字节 = () => { if (hasData) return; hasData = true; if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
-	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes);
+	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env);
 	header = null;
 
 	try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
@@ -3309,9 +3359,18 @@ function isSpeedTestSite(hostname) {
 	return false;
 }
 
+// Bounded cache so forceProxyHosts/socksWhitelist patterns (small, static, admin-configured) aren't
+// recompiled into a RegExp on every connection; every lookup after the first is a cache hit.
+const HOST_PATTERN_REGEX_CACHE = new Map();
 function wildcardPatternToRegex(pattern = '') {
-	const escaped = String(pattern || '').replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-	return new RegExp(`^${escaped}$`, 'i');
+	const key = String(pattern || '');
+	let regex = HOST_PATTERN_REGEX_CACHE.get(key);
+	if (regex) return regex;
+	const escaped = key.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+	regex = new RegExp(`^${escaped}$`, 'i');
+	if (HOST_PATTERN_REGEX_CACHE.size >= 256) HOST_PATTERN_REGEX_CACHE.clear();
+	HOST_PATTERN_REGEX_CACHE.set(key, regex);
+	return regex;
 }
 
 function matchesHostPattern(hostname, pattern) {
