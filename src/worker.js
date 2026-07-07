@@ -3171,7 +3171,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
 	let 首字节计时器 = null;
 	if (firstByteTimeoutMs > 0) {
-		首字节计时器 = setTimeout(() => { if (!hasData) { try { reader.cancel() } catch (e) { } } }, firstByteTimeoutMs);
+		首字节计时器 = setTimeout(() => { if (!hasData) cancelReaderQuietly(reader, 'first byte timeout'); }, firstByteTimeoutMs);
 	}
 
 	// Optional post-first-byte idle watchdog: once data is flowing, if the remote goes silent for the
@@ -3183,7 +3183,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	const 重置空闲计时器 = () => {
 		if (空闲超时毫秒 <= 0) return;
 		if (空闲计时器) clearTimeout(空闲计时器);
-		空闲计时器 = setTimeout(() => { try { reader.cancel() } catch (e) { } }, 空闲超时毫秒);
+		空闲计时器 = setTimeout(() => { cancelReaderQuietly(reader, 'idle timeout'); }, 空闲超时毫秒);
 	};
 
 	try {
