@@ -189,6 +189,11 @@ const DEFAULT_DNS_TCP_SERVER = ENGINE_DEFAULTS.DEFAULT_DNS_TCP_SERVER;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
 const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const DNS_RESULT_CACHE = new Map();
+// Wire-format cache for tunneled client DNS queries (forwardataudp -> DoH). Keyed on the whole query
+// EXCEPT the 2-byte transaction ID, so only byte-identical questions share an entry (no wrong-answer
+// risk). A hit skips the DoH fetch() subrequest entirely, which matters on the free plan's shared
+// per-connection budget and cuts first-byte latency on repeat lookups during a browsing session.
+const DNS_WIRE_CACHE = new Map();
 const SHA224_RESULT_CACHE = new Map();
 const MD5MD5_RESULT_CACHE = new Map();
 const WORKER_REQUEST_CONTEXT = new WeakMap();
@@ -2775,6 +2780,36 @@ function 解析DNS_TCP帧(data) {
 // Primary tunneled-DNS path: forward each length-prefixed query over DoH (RFC 8484
 // application/dns-message), returning the response(s) in the same length-prefixed wire format
 // the callers expect. Avoids a fresh TCP handshake per DNS query — lower, more consistent latency.
+// Key = DoH URL + the query bytes with the 2-byte transaction ID zeroed. Only single-question queries
+// (QDCOUNT===1) are cacheable; returns null otherwise. Byte-identical questions => same key => same answer.
+function dns线缓存键(dohUrl, query) {
+	const q = 数据转Uint8Array(query);
+	if (q.byteLength < 12) return null;
+	if (((q[4] << 8) | q[5]) !== 1) return null; // QDCOUNT must be exactly 1
+	let key = dohUrl + '\n';
+	for (let i = 2; i < q.byteLength; i++) key += String.fromCharCode(q[i]);
+	return key;
+}
+function 读取DNS线缓存(key, query) {
+	const cached = DNS_WIRE_CACHE.get(key);
+	if (!cached) return null;
+	if (cached.expiresAt <= Date.now()) { DNS_WIRE_CACHE.delete(key); return null; }
+	DNS_WIRE_CACHE.delete(key); DNS_WIRE_CACHE.set(key, cached); // LRU touch
+	const q = 数据转Uint8Array(query);
+	const out = new Uint8Array(cached.msg);
+	out[0] = q[0]; out[1] = q[1]; // restore the caller's transaction ID into the cached response
+	return out;
+}
+function 写入DNS线缓存(key, msg) {
+	// Only cache a positive answer (NOERROR rcode + >=1 answer record) so a transient failure / NXDOMAIN
+	// / NODATA blip can't be served stale for the TTL. Header: byte3 low nibble = rcode, bytes 6-7 = ANCOUNT.
+	if (msg.byteLength < 12 || (msg[3] & 0x0f) !== 0 || ((msg[6] << 8) | msg[7]) === 0) return;
+	const stored = new Uint8Array(msg);
+	stored[0] = 0; stored[1] = 0;
+	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + DNS_RESULT_CACHE_MIN_TTL_MS });
+	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
+}
+
 async function DNS经DoH转发(requestData, env, timeoutMs) {
 	const frames = 解析DNS_TCP帧(requestData);
 	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
@@ -2785,7 +2820,19 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 	// re-fetches frames still missing, so a partial-batch failure never re-spends subrequests on frames
 	// that already resolved. Matters on the free plan's shared per-connection (50) subrequest budget.
 	const results = new Array(frames.length).fill(null);
+	const 封装响应 = (msg) => {
+		const framed = new Uint8Array(2 + msg.byteLength);
+		framed[0] = (msg.byteLength >>> 8) & 0xff;
+		framed[1] = msg.byteLength & 0xff;
+		framed.set(msg, 2);
+		return framed;
+	};
 	const 查询单帧 = async (dohUrl, query) => {
+		const 缓存键 = dns线缓存键(dohUrl, query);
+		if (缓存键) {
+			const hit = 读取DNS线缓存(缓存键, query);
+			if (hit) return 封装响应(hit);
+		}
 		const resp = await fetchWithTimeout(dohUrl, {
 			method: 'POST',
 			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
@@ -2795,11 +2842,8 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 		const msg = new Uint8Array(await resp.arrayBuffer());
 		if (!msg.byteLength) throw new Error('empty DoH response');
 		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
-		const framed = new Uint8Array(2 + msg.byteLength);
-		framed[0] = (msg.byteLength >>> 8) & 0xff;
-		framed[1] = msg.byteLength & 0xff;
-		framed.set(msg, 2);
-		return framed;
+		if (缓存键) 写入DNS线缓存(缓存键, msg);
+		return 封装响应(msg);
 	};
 	for (const dohUrl of dohUrls) {
 		const 待查询索引 = [];

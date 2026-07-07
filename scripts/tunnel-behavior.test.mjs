@@ -1417,6 +1417,30 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Tunneled DNS wire cache: a repeated identical query (>=12 bytes, single-question) is served from
+	// cache with NO second DoH subrequest — keyed on the query minus its 2-byte transaction ID, and only
+	// positive answers (NOERROR + >=1 answer) are cached.
+	const originalFetch = globalThis.fetch;
+	let dohCalls = 0;
+	const dnsResponse = new Uint8Array([0xab, 0xcd, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04]);
+	globalThis.fetch = async () => { dohCalls++; return new Response(dnsResponse, { status: 200, headers: { 'Content-Type': 'application/dns-message' } }); };
+	const query = [0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01]; // 17-byte single-question query
+	const frame = new Uint8Array([0x00, query.length, ...query]);
+	const sent = [];
+	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
+	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
+	try {
+		await withTestTimeout(forwardataudp(frame, webSocket, new Uint8Array([0, 0]), request), 80, 'DNS wire cache: first query (miss)');
+		assert.equal(dohCalls, 1, 'first query makes exactly one DoH request');
+		await withTestTimeout(forwardataudp(frame, webSocket, new Uint8Array([0, 0]), request), 80, 'DNS wire cache: repeat query (hit)');
+		assert.equal(dohCalls, 1, 'identical repeat query is served from the wire cache with NO extra DoH subrequest');
+		assert.equal(sent.length, 2, 'both queries delivered a response to the client');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
+{
 	assert.equal(getDohLookupUrl({}), 'https://cloudflare-dns.com/dns-query');
 	assert.equal(getDohLookupUrl({ DOH_URL: 'https://dns.google/dns-query' }), 'https://dns.google/dns-query');
 	assert.equal(getDohLookupUrl({ DOH_URL: 'ftp://invalid.example/dns-query' }), 'https://cloudflare-dns.com/dns-query');
