@@ -1,3 +1,4 @@
+import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
 // User-editable defaults.
@@ -889,7 +890,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
 			const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
-			const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
+			const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 			const xhttpBridge = {
 				readyState: WebSocket.OPEN,
 				send(data) {
@@ -947,7 +948,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				if (首包.isUDP) {
 					if (首包.rawData?.byteLength) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文);
+						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, VLESS_UDP上下文);
 						udpRespHeader = null;
 					}
 				} else {
@@ -960,7 +961,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					if (!value || value.byteLength === 0) continue;
 					if (首包.isUDP) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文);
+						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, VLESS_UDP上下文);
 						udpRespHeader = null;
 					} else {
 						if (!(await 写入远端(value))) throw new Error('Remote socket is not ready');
@@ -1168,7 +1169,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
-	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
+	const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
@@ -1332,7 +1333,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request, null, 魏烈思UDP上下文);
+							else await forwardataudp(payload, grpcBridge, null, request, null, VLESS_UDP上下文);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
@@ -1368,7 +1369,7 @@ async function 处理gRPC请求(request, yourUUID) {
 								const rawData = rawClientData;
 								if (isDnsQuery) {
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request, null, 魏烈思UDP上下文);
+									else await forwardataudp(rawData, grpcBridge, null, request, null, VLESS_UDP上下文);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
@@ -1455,7 +1456,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
-	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
+	const VLESS_UDP上下文 = { 缓存: new Uint8Array(0) };
 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
 	let WS上行写入队列 = null;
@@ -1763,7 +1764,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request, null, 魏烈思UDP上下文);
+			return await forwardataudp(chunk, serverSock, null, request, null, VLESS_UDP上下文);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -1814,7 +1815,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request, null, 魏烈思UDP上下文);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, VLESS_UDP上下文);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request);
 		}
@@ -2847,7 +2848,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
 	// messages / stream reads lost its tail and the next chunk's leading bytes were misread as a new
 	// frame's length prefix. The Trojan-UDP path already avoids this via 转发木马UDP数据's own accumulator;
-	// this gives the direct non-Trojan (魏烈思/裸 UDP) path the same protection when a caller supplies a udpContext.
+	// this gives the direct VLESS/plain-UDP path the same protection when a caller supplies a udpContext.
 	let requestData = 数据转Uint8Array(udpChunk);
 	if (udpContext) {
 		requestData = udpContext.缓存?.byteLength ? 拼接字节数据(udpContext.缓存, requestData) : requestData;
@@ -3712,8 +3713,10 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 function 创建请求TCP连接器(request) {
 	const 请求对象 = /** @type {any} */ (request);
 	const fetcher = 请求对象?.fetcher;
-	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
-	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	if (fetcher && typeof fetcher.connect === 'function') {
+		return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	}
+	return (options, init) => init === undefined ? cloudflareConnect(options) : cloudflareConnect(options, init);
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;

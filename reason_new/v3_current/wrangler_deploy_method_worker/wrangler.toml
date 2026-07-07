@@ -15,9 +15,9 @@
 #    the custom-domain route are not listed here, wrangler REMOVES them from the worker.
 #  - Verify name / KV id / route below match YOUR account before the first deploy.
 
-name = "newera2"   # the Worker this build deploys to (e.g. v20251104)
+name = "t-v3"   # FRESH test name — do NOT set this back to "newera" (that worker is the one 1101ing)
 main = "_worker.js"
-compatibility_date = "2026-07-06"        # today-or-earlier only; never a future date
+compatibility_date = "2026-06-30"        # today-or-earlier only; never a future date
 keep_vars = true
 
 # No cron triggers: automated ProxyIP scanning probes many Cloudflare IPs and gets flagged
