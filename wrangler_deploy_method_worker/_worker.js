@@ -396,6 +396,9 @@ export default {
 						return new Response('Redirecting...', { status: 302, headers: { 'Location': '/admin' } });
 					}
 					if (request.method === 'POST') {
+						// Bound the pre-auth login body: a login form is tiny, so reject a declared-huge body
+						// instead of buffering it (cheap guard against a memory-spike POST from the open internet).
+						if (Number(request.headers.get('content-length') || 0) > 4096) return new Response('Payload Too Large', { status: 413 });
 						const formData = await request.text();
 						const params = new URLSearchParams(formData);
 						const 输入密码 = params.get('password');
