@@ -2842,6 +2842,9 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 			body: query,
 		}, timeoutMs);
 		if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
+		// Reject a declared-oversized body before buffering it (a DNS message can't exceed 64KB; a
+		// misbehaving/hostile DoH endpoint shouldn't get to spike isolate memory via arrayBuffer()).
+		if (Number(resp.headers?.get?.('content-length') || 0) > 65535) { try { resp.body?.cancel() } catch (e) { } throw new Error('DoH response too large'); }
 		const msg = new Uint8Array(await resp.arrayBuffer());
 		if (!msg.byteLength) throw new Error('empty DoH response');
 		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
@@ -6308,6 +6311,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		}
 
 
+		if (Number(response.headers?.get?.('content-length') || 0) > 65535) { try { response.body?.cancel() } catch (e) { } log(`[DoH lookup] Declared response too large for ${域名} via ${DoH解析服务}`); return []; }
 		const buf = new Uint8Array(await response.arrayBuffer());
 		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
 		const dv = new DataView(buf.buffer);
