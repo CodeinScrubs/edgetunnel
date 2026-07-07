@@ -44,3 +44,6 @@ log/
 # Stray editor/OS backup copies
 _worker - Copy.js
 * - Copy.*
+
+# 1101 bisection scratch (kept on disk, not tracked)
+reason_new/
