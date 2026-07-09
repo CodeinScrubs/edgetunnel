@@ -1166,6 +1166,26 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Upload-aware watchdog: while the uplink signals activity (client streaming an UPLOAD upstream while
+	// the remote is legitimately silent), the first-byte timer keeps resetting so the upload is NOT killed;
+	// once activity stops, it fires — preserving blackhole recovery. connectStreams exposes the reset via
+	// the shared wrapper (pipeMeta.wrapper.记录上行活动), which the upload queue calls on each upstream write.
+	const wrapper = {};
+	let cancelled = false;
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }) };
+	const p = connectStreams(remoteSocket, webSocket, null, null, 30, { wrapper });
+	assert.equal(typeof wrapper.记录上行活动, 'function', 'connectStreams exposes the uplink-activity reset on the wrapper');
+	let stop = false;
+	const beat = (async () => { while (!stop) { wrapper.记录上行活动?.(); await new Promise(r => setTimeout(r, 10)); } })();
+	await new Promise(r => setTimeout(r, 90));
+	assert.equal(cancelled, false, 'first-byte timer does NOT fire while uplink activity is signaled (upload survives silent downlink)');
+	stop = true; await beat;
+	await withTestTimeout(p, 250, 'first-byte timer fires once uplink activity stops');
+	assert.equal(cancelled, true, 'first-byte timer still fires after uplink activity stops (blackhole recovery preserved)');
+}
+
+{
 	const events = [];
 	const webSocket = {
 		readyState: WebSocket.OPEN,

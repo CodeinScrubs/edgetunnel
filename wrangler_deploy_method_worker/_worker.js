@@ -945,6 +945,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
+				上行活动: () => remoteConnWrapper.记录上行活动?.(),
 				名称: 'XHTTP upload'
 			});
 
@@ -1322,6 +1323,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
+				上行活动: () => remoteConnWrapper.记录上行活动?.(),
 				名称: 'gRPC upload'
 			});
 
@@ -1502,6 +1504,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
+		上行活动: () => remoteConnWrapper.记录上行活动?.(),
 		名称: 'WS upload'
 	});
 
@@ -3000,7 +3003,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 名称 = 'Upload queue' }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 名称 = 'Upload queue' }) {
 	let chunks = [];
 	let head = 0;
 	let queuedBytes = 0;
@@ -3124,6 +3127,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						await writer.write(item.chunk);
 					}
 					已交付远端字节 = true;
+					try { 上行活动?.(); } catch (e) { }
 					settleCompletions(completions);
 				} catch (err) {
 					settleCompletions(completions, err);
@@ -3323,6 +3327,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// one (proxy path) the stream just closes and the client re-dials. Either way it rescues a blackholed
 	// connection instead of hanging. Armed whenever firstByteTimeoutMs > 0 — the caller decides the value
 	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
+	let 管道已结束 = false;
 	let 首字节计时器 = null;
 	if (firstByteTimeoutMs > 0) {
 		首字节计时器 = setTimeout(() => { if (!hasData) cancelReaderQuietly(reader, 'first byte timeout'); }, firstByteTimeoutMs);
@@ -3339,6 +3344,18 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		if (空闲计时器) clearTimeout(空闲计时器);
 		空闲计时器 = setTimeout(() => { cancelReaderQuietly(reader, 'idle timeout'); }, 空闲超时毫秒);
 	};
+
+	// Uplink activity keeps both downlink watchdogs from mis-firing: a connection actively receiving an
+	// UPLOAD (client streaming upstream while the remote is legitimately silent) is neither blackholed
+	// nor idle, so the first-byte and idle timers must not close it. The uplink write path calls this on
+	// every chunk it delivers upstream; it re-arms the timers from "now" so they fire only on genuine
+	// two-way silence (a real blackhole/stall), never mid-upload.
+	const 记录上行活动 = () => {
+		if (管道已结束) return;
+		if (首字节计时器 && !hasData) { clearTimeout(首字节计时器); 首字节计时器 = setTimeout(() => { if (!hasData) cancelReaderQuietly(reader, 'first byte timeout'); }, firstByteTimeoutMs); }
+		重置空闲计时器();
+	};
+	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
 
 	try {
 		if (!useBYOB) {
@@ -3371,6 +3388,8 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		await 下行发送器.flush();
 	} catch (err) { readError = err }
 	finally {
+		管道已结束 = true;
+		if (pipeMeta?.wrapper && pipeMeta.wrapper.记录上行活动 === 记录上行活动) pipeMeta.wrapper.记录上行活动 = null;
 		if (首字节计时器) { try { clearTimeout(首字节计时器) } catch (e) { } }
 		if (空闲计时器) { try { clearTimeout(空闲计时器) } catch (e) { } }
 		try { await reader.cancel() } catch (e) { }
