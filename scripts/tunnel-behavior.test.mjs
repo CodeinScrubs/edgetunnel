@@ -70,6 +70,7 @@ const {
 	readGrpcFrameLength,
 	expandPreferredEndpointVariants,
 	createUploadQueue,
+	getUplinkWriteTimeoutMs,
 	normalizeConfigHost,
 	splitConfigArray,
 	base64SecretEncode,
@@ -673,6 +674,48 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	await queue.等待空();
 	assert.equal(writerCalls, 1, 'upload queue should acquire the writer only when drain writes');
 	assert.deepEqual(writes, [new Uint8Array([1, 2, 3])]);
+}
+
+{
+	// UPLINK_WRITE_TIMEOUT_MS getter: off by default, clamped to [1s, 2min] when enabled.
+	assert.equal(getUplinkWriteTimeoutMs({}), 0, 'uplink write timeout defaults to off');
+	assert.equal(getUplinkWriteTimeoutMs({ UPLINK_WRITE_TIMEOUT_MS: '0' }), 0);
+	assert.equal(getUplinkWriteTimeoutMs({ UPLINK_WRITE_TIMEOUT_MS: '-5' }), 0);
+	assert.equal(getUplinkWriteTimeoutMs({ UPLINK_WRITE_TIMEOUT_MS: '500' }), 1000, 'clamped up to the 1s floor');
+	assert.equal(getUplinkWriteTimeoutMs({ UPLINK_WRITE_TIMEOUT_MS: '30000' }), 30000);
+	assert.equal(getUplinkWriteTimeoutMs({ UPLINK_WRITE_TIMEOUT_MS: '999999' }), 120000, 'clamped down to the 2min cap');
+}
+
+{
+	// Opt-in stuck-writer watchdog: a writer.write() that never settles tears the connection down within the
+	// bound (no 重试连接 provided -> the failed write closes the connection) instead of blocking forever.
+	let closed = false;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { return new Promise(() => { }); } }), // never resolves
+		释放写入器() { },
+		关闭连接() { closed = true; },
+		名称: 'stuck upload',
+		写入超时毫秒: 40,
+	});
+	queue.写入(new Uint8Array([1, 2, 3]));
+	await new Promise(r => setTimeout(r, 120)); // past the 40ms write bound
+	assert.equal(closed, true, 'a wedged writer.write() trips UPLINK_WRITE_TIMEOUT_MS and closes the connection');
+}
+
+{
+	// Default (0 = off): a slow/pending writer.write() is NOT aborted — a live-but-backpressured upload must
+	// never be torn down by this watchdog when it is disabled.
+	let closed = false;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { return new Promise(() => { }); } }), // never resolves
+		释放写入器() { },
+		关闭连接() { closed = true; },
+		名称: 'patient upload',
+		// 写入超时毫秒 omitted -> 0 (off)
+	});
+	queue.写入(new Uint8Array([1, 2, 3]));
+	await new Promise(r => setTimeout(r, 120));
+	assert.equal(closed, false, 'with the timeout off, a pending write is never aborted');
 }
 
 {

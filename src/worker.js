@@ -842,7 +842,8 @@ async function 处理XHTTP请求(request, yourUUID) {
 					closeSocketQuietly(xhttpBridge);
 				},
 				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
-				名称: 'XHTTP upload'
+				名称: 'XHTTP upload',
+				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -1221,7 +1222,8 @@ async function 处理gRPC请求(request, yourUUID) {
 				},
 				关闭连接,
 				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
-				名称: 'gRPC upload'
+				名称: 'gRPC upload',
+				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -1403,7 +1405,8 @@ async function 处理WS请求(request, yourUUID, url) {
 			closeSocketQuietly(serverSock);
 		},
 		上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
-		名称: 'WS upload'
+		名称: 'WS upload',
+		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
@@ -2962,7 +2965,12 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 名称 = 'Upload queue' }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
+	// bare, un-timed write so a legitimately backpressured upload is never aborted.
+	const 执行远端写入 = 写入超时毫秒 > 0
+		? (w, chunk) => withOperationTimeout(w.write(chunk), 写入超时毫秒, `${名称}: remote write timed out`)
+		: (w, chunk) => w.write(chunk);
 	let chunks = [];
 	let head = 0;
 	let queuedBytes = 0;
@@ -3076,14 +3084,14 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				activeCompletions = completions;
 				try {
 					try {
-						await writer.write(item.chunk);
+						await 执行远端写入(writer, item.chunk);
 					} catch (err) {
 						释放写入器?.();
 						if (!item.allowRetry || 已交付远端字节 || typeof 重试连接 !== 'function') throw err;
 						await 重试连接();
 						writer = 获取写入器();
 						if (!writer) throw err;
-						await writer.write(item.chunk);
+						await 执行远端写入(writer, item.chunk);
 					}
 					已交付远端字节 = true;
 					try { 上行活动?.(); } catch (e) { }
@@ -8205,6 +8213,17 @@ function getIdleTimeoutMs(env) {
 	return Math.max(1000, Math.min(600000, Math.round(configured)));
 }
 
+// Optional stuck-writer watchdog for the uplink queue (ms). 0 = disabled (default). A remote writer.write()
+// that never settles (a wedged outbound socket) would otherwise block the upload path forever; when enabled,
+// a write exceeding this bound rejects and the connection is torn down so the client re-dials. Off by default
+// because writer.write() also blocks under legitimate backpressure (a slow-but-alive upload), which this
+// timeout cannot distinguish — enable it only if you actually observe wedged-upload freezes. Clamped [1s,2min].
+function getUplinkWriteTimeoutMs(env) {
+	const configured = Number(env?.UPLINK_WRITE_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return 0;
+	return Math.max(1000, Math.min(120000, Math.round(configured)));
+}
+
 function getDialStaggerMs(env) {
 	const configured = Number(env?.DIAL_STAGGER_MS);
 	if (!Number.isFinite(configured) || configured < 0) return DIAL_STAGGER_MS;
@@ -8699,6 +8718,7 @@ export const __testPerformanceHelpers = {
 	dnsAnswerMinTtlMs: 解析DNS应答最小TTL毫秒,
 	readXhttpFirstPacket: 读取XHTTP首包,
 	createUploadQueue: 创建上行写入队列,
+	getUplinkWriteTimeoutMs,
 	normalizeConfigHost,
 	splitConfigArray: 整理成数组,
 	base64SecretEncode,
