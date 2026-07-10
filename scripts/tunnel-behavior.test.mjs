@@ -1233,6 +1233,52 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// P0.5: a CLIENT-initiated close before the first downlink byte must not be scored as a route failure
+	// (onNoData) nor trigger a ProxyIP fallback dial — the client has already gone away.
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
+			{ wrapper: { 客户端已关闭: true }, onNoData: () => events.push('no-data') }),
+		250, 'client-close pipe settles',
+	);
+	assert.equal(events.includes('no-data'), false, 'a client-initiated close must not record a direct-route failure');
+	assert.equal(events.includes('retry'), false, 'a client-initiated close must not start a ProxyIP fallback dial');
+}
+
+{
+	// Control for the two guards below: a genuine remote no-data close (client still present, nothing sent
+	// beyond the first packet) DOES record the failure and DOES fall back to ProxyIP.
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
+			{ wrapper: {}, onNoData: () => events.push('no-data') }),
+		250, 'no-data pipe settles',
+	);
+	assert.equal(events.includes('no-data'), true, 'a genuine remote no-data close records the direct-route failure');
+	assert.equal(events.includes('retry'), true, 'a genuine remote no-data close falls back to ProxyIP');
+}
+
+{
+	// P0.2: once a LATER uplink chunk has reached the remote (已向远端发送数据), a no-data close must NOT
+	// replay-retry — the fallback can only replay the first packet, so those later bytes would be lost. The
+	// route failure is still recorded (the client is present and the direct route genuinely blackholed).
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
+			{ wrapper: { 已向远端发送数据: true }, onNoData: () => events.push('no-data') }),
+		250, 'later-uplink pipe settles',
+	);
+	assert.equal(events.includes('no-data'), true, 'a blackhole after a later uplink write still records the direct-route failure');
+	assert.equal(events.includes('retry'), false, 'a blackhole after a later uplink write must NOT replay-retry (would lose the later bytes)');
+}
+
+{
 	const events = [];
 	const webSocket = {
 		readyState: WebSocket.OPEN,

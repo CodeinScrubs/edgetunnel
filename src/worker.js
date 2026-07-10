@@ -841,7 +841,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				上行活动: () => remoteConnWrapper.记录上行活动?.(),
+				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
 				名称: 'XHTTP upload'
 			});
 
@@ -891,6 +891,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			}
 		},
 		async cancel() {
+			remoteConnWrapper.客户端已关闭 = true;
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
@@ -1219,7 +1220,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				上行活动: () => remoteConnWrapper.记录上行活动?.(),
+				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
 				名称: 'gRPC upload'
 			});
 
@@ -1293,6 +1294,7 @@ async function 处理gRPC请求(request, yourUUID) {
 			}
 		},
 		async cancel() {
+			remoteConnWrapper.客户端已关闭 = true;
 			释放下行背压();
 			GRPC上行写入队列?.清空();
 			if (远端写入器) {
@@ -1400,7 +1402,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		上行活动: () => remoteConnWrapper.记录上行活动?.(),
+		上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
 		名称: 'WS upload'
 	});
 
@@ -1788,6 +1790,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		入队WS显式传输(event.data);
 	});
 	serverSock.addEventListener('close', () => {
+		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
+		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
+		remoteConnWrapper.客户端已关闭 = true;
 		closeSocketQuietly(serverSock);
 		// Close the outbound remote socket too, so a client disconnect while the remote is silent
 		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
@@ -2557,6 +2562,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		// the retry — the caller then tears the connection down cleanly and the client re-dials. Mirrors the
 		// download path's `!hasData` retry gate. The pre-first-byte case (safe to retry) is unaffected.
 		if (remoteConnWrapper.已向客户端下发数据) throw new Error('[TCP forwarding] Upload retry aborted: downlink data already delivered to client');
+		// A retry re-dials and replays only the original first packet; any later uplink chunk already sent to
+		// the (now-dead) remote can't be reproduced on the new socket, so reconnecting would silently drop it.
+		// Refuse — the caller tears down and the client re-dials cleanly. Also skip retries once the client left.
+		if (remoteConnWrapper.已向远端发送数据) throw new Error('[TCP forwarding] Upload retry aborted: later uplink data already sent to remote');
+		if (remoteConnWrapper.客户端已关闭) throw new Error('[TCP forwarding] Upload retry aborted: client disconnected');
 		return connecttoPry(!已通过代理发送首包);
 	};
 
@@ -3357,8 +3367,15 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
-	if (!hasData) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
-	if (!hasData && retryFunc && !首字节超时触发关闭) {
+	// A client that closed/cancelled before the first downlink byte is not a route failure — don't poison the
+	// direct-route cache (onNoData) and don't spend a ProxyIP fallback dial on a connection the client already
+	// abandoned. And if a later uplink chunk (beyond the replayable first packet) already reached the remote,
+	// a fallback can't reproduce that upstream state (connecttoPry replays only the first packet), so refuse
+	// the retry and let the client re-dial rather than hang with lost bytes.
+	const 客户端已关闭 = pipeMeta?.wrapper?.客户端已关闭 === true;
+	const 后续上行已送达 = pipeMeta?.wrapper?.已向远端发送数据 === true;
+	if (!hasData && !客户端已关闭) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
+	if (!hasData && retryFunc && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
@@ -3368,6 +3385,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			throw retryError;
 		}
 	}
+	if (!hasData) { try { remoteSocket?.close?.() } catch (e) { } }
 	if (readError) {
 		closeSocketQuietly(webSocket);
 		throw readError;
