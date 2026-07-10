@@ -40,6 +40,7 @@ const {
 	openStaggeredCandidates,
 	connectStreams,
 	forwardataudp,
+	dnsAnswerMinTtlMs,
 	socks5Connect,
 	httpConnect,
 	httpsConnect,
@@ -1464,6 +1465,22 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+}
+
+{
+	// DNS wire-cache TTL parsing: a positive answer is cached for its real record TTL (clamped to
+	// [30s, 5min]) instead of a flat 30s, so stable domains aren't re-resolved every 30s. Fail-safe: a
+	// short/malformed message returns the 30s floor. Response: header + question foo.com A IN + one A
+	// answer via a compression pointer, with the TTL varied per case.
+	const mkResp = (ttlBytes) => new Uint8Array([
+		0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,                 // header: NOERROR, QD=1, AN=1
+		3, 0x66, 0x6f, 0x6f, 3, 0x63, 0x6f, 0x6d, 0, 0, 1, 0, 1, // question: foo.com A IN
+		0xc0, 0x0c, 0, 1, 0, 1, ...ttlBytes, 0, 4, 1, 2, 3, 4,   // answer: ptr, A, IN, TTL, rdlen=4, 1.2.3.4
+	]);
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 1, 0x2c])), 300000, 'a 300s record TTL caches for 300s');
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 10])), 30000, 'a below-floor TTL clamps up to the 30s minimum');
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 1, 0x38, 0x80])), 300000, 'an above-cap TTL (80000s) clamps down to the 5min maximum');
+	assert.equal(dnsAnswerMinTtlMs(new Uint8Array([0, 0, 0x81, 0x80, 0, 1])), 30000, 'a truncated/malformed message fails safe to the 30s floor');
 }
 
 {

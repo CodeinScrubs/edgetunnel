@@ -2815,13 +2815,58 @@ function 读取DNS线缓存(key, query) {
 	out[0] = q[0]; out[1] = q[1]; // restore the caller's transaction ID into the cached response
 	return out;
 }
+// Minimum TTL across a DNS response's answer records, so a positive answer can be cached for its real
+// lifetime (clamped to [MIN, MAX]) instead of a flat 30s — far fewer repeat DoH lookups on stable domains
+// during a session (less latency + fewer free-plan subrequests). Fail-safe: any short/compressed-mid-name/
+// malformed record just returns MIN, i.e. the previous fixed-30s behavior — a parse issue can never cache
+// longer than the cap or serve wrong data.
+function 解析DNS应答最小TTL毫秒(msg) {
+	const q = 数据转Uint8Array(msg);
+	if (q.byteLength < 12) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	const qd = (q[4] << 8) | q[5];
+	const an = (q[6] << 8) | q[7];
+	if (qd !== 1 || an < 1) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	let p = 12;
+	// question name: labels ended by a 0 byte; bail on any compression pointer (rare in a question)
+	while (p < q.byteLength && q[p] !== 0) {
+		if ((q[p] & 0xc0) !== 0) return DNS_RESULT_CACHE_MIN_TTL_MS;
+		p += 1 + q[p];
+	}
+	p += 1 + 4; // terminating 0 label + QTYPE + QCLASS
+	let 最小TTL秒 = Infinity;
+	for (let i = 0; i < an; i++) {
+		if (p + 1 > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
+		// answer NAME: a compression pointer (2 bytes) or raw labels ending in 0
+		if ((q[p] & 0xc0) === 0xc0) {
+			p += 2;
+		} else {
+			while (p < q.byteLength && q[p] !== 0) {
+				if ((q[p] & 0xc0) !== 0) return DNS_RESULT_CACHE_MIN_TTL_MS;
+				p += 1 + q[p];
+			}
+			p += 1;
+		}
+		if (p + 10 > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS; // TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+		p += 4; // skip TYPE + CLASS
+		const ttl = ((q[p] << 24) | (q[p + 1] << 16) | (q[p + 2] << 8) | q[p + 3]) >>> 0;
+		p += 4;
+		const rdlen = (q[p] << 8) | q[p + 1];
+		p += 2;
+		if (p + rdlen > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
+		p += rdlen;
+		if (ttl > 0) 最小TTL秒 = Math.min(最小TTL秒, ttl);
+	}
+	if (!Number.isFinite(最小TTL秒)) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	return Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, 最小TTL秒 * 1000));
+}
+
 function 写入DNS线缓存(key, msg) {
 	// Only cache a positive answer (NOERROR rcode + >=1 answer record) so a transient failure / NXDOMAIN
 	// / NODATA blip can't be served stale for the TTL. Header: byte3 low nibble = rcode, bytes 6-7 = ANCOUNT.
 	if (msg.byteLength < 12 || (msg[3] & 0x0f) !== 0 || ((msg[6] << 8) | msg[7]) === 0) return;
 	const stored = new Uint8Array(msg);
 	stored[0] = 0; stored[1] = 0;
-	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + DNS_RESULT_CACHE_MIN_TTL_MS });
+	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + 解析DNS应答最小TTL毫秒(msg) });
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
@@ -8732,6 +8777,7 @@ export const __testPerformanceHelpers = {
 	patchSurgeSubscription: Surge订阅配置文件热补丁,
 	readGrpcFrameLength,
 	parseDnsTcpFrames: 解析DNS_TCP帧,
+	dnsAnswerMinTtlMs: 解析DNS应答最小TTL毫秒,
 	readXhttpFirstPacket: 读取XHTTP首包,
 	createUploadQueue: 创建上行写入队列,
 	normalizeConfigHost,
