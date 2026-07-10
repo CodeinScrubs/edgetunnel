@@ -2550,7 +2550,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
-			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
+			// Only close the client transport when THIS socket is still the current one. A later reconnect
+			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
+			// must not have the stale socket's closed-promise tear down the healthy replacement's client ws.
+			newSocket.closed.catch(() => { }).finally(() => { if (remoteConnWrapper.socket === newSocket) closeSocketQuietly(ws); });
 			// Honor FIRST_BYTE_TIMEOUT_MS on the proxy path too (opt-in; 0 = off by default). There is no
 			// fallback here (retryFunc=null), so a fired timeout just CLOSES the stream — it never replays
 			// the first packet from the worker — turning a blackholed relay (connects, then sends nothing)
@@ -2774,9 +2777,10 @@ function 解析DNS应答最小TTL毫秒(msg) {
 		p += 2;
 		if (p + rdlen > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
 		p += rdlen;
-		if (ttl > 0) 最小TTL秒 = Math.min(最小TTL秒, ttl);
+		最小TTL秒 = Math.min(最小TTL秒, ttl); // include TTL 0 in the minimum (RRSet TTL is the record minimum)
 	}
 	if (!Number.isFinite(最小TTL秒)) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	if (最小TTL秒 <= 0) return 0; // RFC 1035: a TTL-0 answer is for the current transaction only — must not be cached
 	return Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, 最小TTL秒 * 1000));
 }
 
@@ -2784,9 +2788,11 @@ function 写入DNS线缓存(key, msg) {
 	// Only cache a positive answer (NOERROR rcode + >=1 answer record) so a transient failure / NXDOMAIN
 	// / NODATA blip can't be served stale for the TTL. Header: byte3 low nibble = rcode, bytes 6-7 = ANCOUNT.
 	if (msg.byteLength < 12 || (msg[3] & 0x0f) !== 0 || ((msg[6] << 8) | msg[7]) === 0) return;
+	const ttlMs = 解析DNS应答最小TTL毫秒(msg);
+	if (ttlMs <= 0) return; // TTL-0 answer (e.g. per-query CDN rotation) — must not be cached
 	const stored = new Uint8Array(msg);
 	stored[0] = 0; stored[1] = 0;
-	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + 解析DNS应答最小TTL毫秒(msg) });
+	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + ttlMs });
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
@@ -2883,6 +2889,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		const consumedBytes = completeFrames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
 		udpContext.缓存 = requestData.subarray(consumedBytes);
 		if (!completeFrames.length) return; // no complete frame yet; wait for the rest to arrive
+		requestData = requestData.subarray(0, consumedBytes); // forward only complete frames; the tail waits in 缓存 (never write a partial frame to the DNS-over-TCP fallback)
 	}
 	const requestBytes = requestData.byteLength;
 	try {

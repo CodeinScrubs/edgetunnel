@@ -1634,6 +1634,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 10])), 30000, 'a below-floor TTL clamps up to the 30s minimum');
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 1, 0x38, 0x80])), 300000, 'an above-cap TTL (80000s) clamps down to the 5min maximum');
 	assert.equal(dnsAnswerMinTtlMs(new Uint8Array([0, 0, 0x81, 0x80, 0, 1])), 30000, 'a truncated/malformed message fails safe to the 30s floor');
+	// RFC 1035: a TTL-0 answer (a well-formed response, distinct from malformed) must NOT be cached -> 0,
+	// which 写入DNS线缓存 treats as "skip caching" (vs the 30s fail-safe for malformed input above).
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 0])), 0, 'a TTL-0 answer returns 0 (do not cache), not the 30s floor');
 }
 
 {
