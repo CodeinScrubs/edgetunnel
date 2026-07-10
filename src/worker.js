@@ -2340,7 +2340,6 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	const 已有首包数据 = 有效数据长度(rawData) > 0;
 	const 配置首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
-	const 首字节超时毫秒 = 已有首包数据 ? 0 : 配置首字节超时毫秒;
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'} | Forced: ${forceProxyForHost ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
@@ -3263,7 +3262,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
 	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
-	const 标记首字节 = () => { if (hasData) return; hasData = true; if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
+	const 标记首字节 = () => { if (hasData) return; hasData = true; if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; } if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env);
@@ -3307,8 +3306,16 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// two-way silence (a real blackhole/stall), never mid-upload.
 	const 记录上行活动 = () => {
 		if (管道已结束) return;
-		if (首字节计时器 && !hasData) { clearTimeout(首字节计时器); 首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs); }
-		重置空闲计时器();
+		// Before the first downlink byte, uplink activity re-arms the FIRST-BYTE watchdog (an upload with a
+		// still-silent downlink is not a blackhole). Only AFTER the first byte does uplink activity re-arm the
+		// IDLE watchdog. The idle timer must never arm pre-first-byte, or an IDLE_TIMEOUT_MS smaller than
+		// FIRST_BYTE_TIMEOUT_MS would fire before the first-byte deadline and cut the connection early.
+		if (hasData) {
+			重置空闲计时器();
+		} else if (首字节计时器) {
+			clearTimeout(首字节计时器);
+			首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs);
+		}
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
 

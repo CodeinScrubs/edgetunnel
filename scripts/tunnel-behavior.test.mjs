@@ -1217,6 +1217,22 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Idle-before-first-byte: an uplink write BEFORE the first downlink byte must not arm the idle watchdog
+	// (only the first-byte watchdog governs pre-response). With IDLE_TIMEOUT_MS (1000, clamped min) below
+	// FIRST_BYTE_TIMEOUT_MS (2500), the old code closed at ~1000ms; now the connection survives past it.
+	let cancelled = false, ctrl = null;
+	const wrapper = {};
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { ctrl = c; }, cancel() { cancelled = true; } }) };
+	const p = connectStreams(remoteSocket, webSocket, null, null, 2500, { env: { IDLE_TIMEOUT_MS: '1000' }, wrapper });
+	wrapper.记录上行活动?.(); // one uplink write, before any downlink byte
+	await new Promise(r => setTimeout(r, 1300)); // past the 1000ms idle deadline, well before the 2500ms first-byte one
+	assert.equal(cancelled, false, 'a pre-first-byte uplink write does NOT arm the idle timer (survives past IDLE_TIMEOUT_MS)');
+	try { ctrl.close(); } catch (e) { } // end the pipe so its promise resolves
+	await withTestTimeout(p, 250, 'pipe ends cleanly after the remote closes');
+}
+
+{
 	const events = [];
 	const webSocket = {
 		readyState: WebSocket.OPEN,
