@@ -1186,6 +1186,36 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Direct-path close-only first-byte timeout: when the first packet carried data (首字节超时仅关闭=true),
+	// a blackhole (first-byte TIMEOUT) must CLOSE the stream WITHOUT replaying the (non-idempotent) first
+	// packet — while a socket close/EOF may still fall back. This asserts the timeout path is close-only.
+	const events = [];
+	let cancelled = false;
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { events.push('client-close'); this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		250, 'close-only first-byte timeout for a data-carrying first packet',
+	);
+	assert.equal(cancelled, true, 'first-byte timeout cancels the blackholed read');
+	assert.equal(events.includes('no-data'), true, 'onNoData fires so the direct route is recorded as failed');
+	assert.equal(events.includes('retry'), false, 'close-only mode does NOT replay the first packet on a timeout');
+	assert.equal(events.includes('client-close'), true, 'close-only mode closes the client so it re-dials');
+}
+
+{
+	// ...but in close-only mode, a socket CLOSE (not a timeout) with no data must STILL fall back to ProxyIP.
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		250, 'close-only mode still falls back on a socket close',
+	);
+	assert.equal(events.includes('retry'), true, 'a socket close (not a timeout) still falls back to ProxyIP even in close-only mode');
+}
+
+{
 	const events = [];
 	const webSocket = {
 		readyState: WebSocket.OPEN,

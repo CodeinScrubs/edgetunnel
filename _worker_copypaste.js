@@ -2682,11 +2682,20 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP forwarding] Trying direct connection to: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
-			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader, async () => {
-				if (remoteConnWrapper.socket !== initialSocket) return;
-				recordDirectRouteFailure(直连路由键);
-				await connecttoPry();
-			}, 首字节超时毫秒, { env, wrapper: remoteConnWrapper, onFirstByte: () => recordDirectRouteOk(直连路由键) });
+			// First-byte watchdog on the direct path. When the first packet carries NO data it may safely
+			// replay to ProxyIP (retryFunc). When it DOES carry data, replay is unsafe (non-idempotent
+			// first packet) — but we still arm a CLOSE-ONLY timeout so a blackholed direct connection (connect
+			// ok, first packet sent, remote never responds) is torn down and the client re-dials, instead of
+			// hanging forever (the idle watchdog can't help — it only arms after the first byte). Upload-safe:
+			// the watchdog now resets on uplink activity, so an in-progress upload with a silent downlink is
+			// not killed. Both cases record the direct-route failure via onNoData (once, before any retry).
+			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader,
+				async () => {
+					if (remoteConnWrapper.socket !== initialSocket) return;
+					await connecttoPry();
+				},
+				配置首字节超时毫秒,
+				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: 已有首包数据, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -3327,9 +3336,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// connection instead of hanging. Armed whenever firstByteTimeoutMs > 0 — the caller decides the value
 	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
 	let 管道已结束 = false;
+	// When the caller sends a data-carrying first packet on the direct path, replaying it is unsafe — so a
+	// first-byte TIMEOUT must close-only (no retry) while a socket close/EOF may still fall back to ProxyIP.
+	// This flag records that the read ended via the timeout, so the retry gate below skips replay in that case.
+	const 首字节超时仅关闭 = pipeMeta?.首字节超时仅关闭 === true;
+	let 首字节超时触发关闭 = false;
 	let 首字节计时器 = null;
 	if (firstByteTimeoutMs > 0) {
-		首字节计时器 = setTimeout(() => { if (!hasData) cancelReaderQuietly(reader, 'first byte timeout'); }, firstByteTimeoutMs);
+		首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs);
 	}
 
 	// Optional post-first-byte idle watchdog: once data is flowing, if the remote goes silent for the
@@ -3351,7 +3365,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// two-way silence (a real blackhole/stall), never mid-upload.
 	const 记录上行活动 = () => {
 		if (管道已结束) return;
-		if (首字节计时器 && !hasData) { clearTimeout(首字节计时器); 首字节计时器 = setTimeout(() => { if (!hasData) cancelReaderQuietly(reader, 'first byte timeout'); }, firstByteTimeoutMs); }
+		if (首字节计时器 && !hasData) { clearTimeout(首字节计时器); 首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs); }
 		重置空闲计时器();
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
@@ -3395,7 +3409,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { reader.releaseLock() } catch (e) { }
 	}
 	if (!hasData) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
-	if (!hasData && retryFunc) {
+	if (!hasData && retryFunc && !首字节超时触发关闭) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
