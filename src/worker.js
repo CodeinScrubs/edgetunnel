@@ -789,8 +789,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 	};
 	return new Response(new ReadableStream({
 		pull() { 释放下行背压(); },
-		async start(controller) {
+		start(controller) {
 			下行控制器 = controller;
+			// Detached tunnel task so start() returns immediately — otherwise pull() never fires and the
+			// downlink backpressure release (释放下行背压) deadlocks at the response HWM. Same fix + rationale
+			// as the gRPC handler above; see the downlink-backpressure repro in tunnel-behavior.test.mjs.
+			void (async () => {
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
 			const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -890,6 +894,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				释放下行背压();
 				try { reader.releaseLock() } catch (e) { }
 			}
+			})().catch(err => { log(`[XHTTP tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;
@@ -1105,8 +1110,14 @@ async function 处理gRPC请求(request, yourUUID) {
 
 	return new Response(new ReadableStream({
 		pull() { 释放下行背压(); },
-		async start(controller) {
+		start(controller) {
 			下行控制器 = controller;
+			// Run the whole tunnel in a DETACHED task so start() returns immediately. Per the WHATWG Streams
+			// spec, pull() is NOT called until start()'s promise settles; with the read loop inside an async
+			// start(), pull() never fires, so 释放下行背压() (the only downlink backpressure release) never runs
+			// and the download deadlocks the moment the response queue fills at the HWM (~256KB). See the
+			// "downlink backpressure must not deadlock" repro in scripts/tunnel-behavior.test.mjs.
+			void (async () => {
 			let 已关闭 = false;
 			let 已清理 = false;
 			let 发送队列 = [];
@@ -1294,6 +1305,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				释放远端写入器();
 				关闭连接();
 			}
+			})().catch(err => { log(`[gRPC tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;

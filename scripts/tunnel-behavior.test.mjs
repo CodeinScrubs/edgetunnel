@@ -1276,6 +1276,54 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Downlink backpressure must not deadlock: the gRPC/XHTTP handlers pump the whole tunnel through a
+	// Response ReadableStream whose downlink backpressure is released ONLY by pull(). Per the WHATWG Streams
+	// spec, pull() is not called until start()'s promise settles — so the tunnel loop must run in a DETACHED
+	// task (start() returns immediately), NOT inside an async start(). This replicates the handlers' exact
+	// 释放下行背压 / 等待下行可写 / pull handshake and proves the detached form drains under a slow consumer
+	// while the async-start form stalls at the HWM. Guards against regressing back to `async start`.
+	const HWM = 4096, CHUNK = 1024, N = 40;
+	const makeStream = (detached) => {
+		let 下行控制器 = null, 下行拉取等待者 = [];
+		const 释放下行背压 = () => { const w = 下行拉取等待者; 下行拉取等待者 = []; for (const r of w) r(); };
+		const 等待下行可写 = () => {
+			const c = 下行控制器;
+			if (!c || typeof c.desiredSize !== 'number' || c.desiredSize > 0) return undefined;
+			return new Promise(resolve => 下行拉取等待者.push(resolve));
+		};
+		const 运行 = async (controller) => {
+			for (let i = 0; i < N; i++) { controller.enqueue(new Uint8Array(CHUNK)); await 等待下行可写(); }
+			controller.close();
+		};
+		return new ReadableStream({
+			start(controller) {
+				下行控制器 = controller;
+				if (detached) { void 运行(controller).catch(() => { }); return; }
+				return 运行(controller); // buggy: start()'s promise stays pending -> pull() never fires
+			},
+			pull() { 释放下行背压(); },
+		}, new ByteLengthQueuingStrategy({ highWaterMark: HWM }));
+	};
+	const drain = async (stream, budgetMs) => {
+		const reader = stream.getReader();
+		const TIMEOUT = Symbol('t');
+		let got = 0;
+		while (true) {
+			const res = await Promise.race([reader.read(), new Promise(r => setTimeout(() => r(TIMEOUT), budgetMs))]);
+			if (res === TIMEOUT) { try { reader.cancel(); } catch (e) { } return { drained: false, got }; }
+			if (res.done) return { drained: true, got };
+			got++;
+			await new Promise(r => setTimeout(r, 2)); // slow consumer -> queue fills past the HWM
+		}
+	};
+	const fixed = await drain(makeStream(true), 300);
+	assert.equal(fixed.drained, true, 'detached-task downlink drains fully past the HWM under a slow consumer');
+	assert.equal(fixed.got, N, 'detached-task downlink delivers every chunk');
+	const buggy = await drain(makeStream(false), 300);
+	assert.equal(buggy.drained, false, 'async-start downlink deadlocks at the HWM (pull() never fires) — the bug this fix prevents');
+}
+
+{
 	// P0.5: a CLIENT-initiated close before the first downlink byte must not be scored as a route failure
 	// (onNoData) nor trigger a ProxyIP fallback dial — the client has already gone away.
 	const events = [];
