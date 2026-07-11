@@ -739,6 +739,24 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// In-flight write marks delivery ambiguous immediately: 写入开始 fires BEFORE writer.write() resolves,
+	// so a remote EOF while a later chunk is still writing won't let the no-data fallback replay.
+	let startedWhilePending = false, resolved = false, release = null;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { return new Promise(r => { release = () => { resolved = true; r(); }; }); } }),
+		释放写入器() { },
+		关闭连接() { },
+		写入开始: () => { startedWhilePending = !resolved; },
+		名称: 'in-flight upload',
+	});
+	queue.写入(new Uint8Array([1, 2, 3]));
+	await new Promise(r => setTimeout(r, 20)); // the write is now pending (unresolved)
+	assert.equal(startedWhilePending, true, '写入开始 fires before the write resolves (delivery ambiguous while in-flight)');
+	assert.equal(resolved, false, 'the write is still pending at this point');
+	try { release?.(); } catch (e) { }
+}
+
+{
 	assert.equal(getDialStaggerMs({}), 90);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '0' }), 0);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '37.6' }), 38);
@@ -1924,6 +1942,27 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 
 	const offResp = await handleGrpcRequest({ body: makeBody(), env: {}, cf: {}, headers: { get: () => null }, fetcher: { connect: () => makeRemote() } }, uuid);
 	assert.equal(contains789(await collectReadableStream(offResp.body, 2000)), false, 'default (flag off) closes on request-body EOF — the late response is not delivered (proven-working behavior)');
+}
+
+{
+	// Protocol detection: a first packet whose bytes 56-57 coincidentally equal CRLF must still be routed
+	// by UUID authentication (not misclassified and rejected by the CRLF heuristic). Host 't' => 24-byte
+	// header, so absolute offset 56 is rawData[32]; place CRLF there. It must still connect to the target.
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const rawData = new Uint8Array(40);
+	rawData[19] = 0x0d; rawData[20] = 0x0a; // 'target.example' => 37-byte header; abs offset 56 = rawData[19]
+	let connectedHost = null;
+	const socket = {
+		opened: Promise.resolve(),
+		readable: new ReadableStream({ start(c) { c.enqueue(new Uint8Array([0xbb])); c.close(); } }),
+		writable: new WritableStream({ write() { } }),
+		closed: Promise.resolve(),
+		close() { },
+	};
+	const body = new ReadableStream({ start(controller) { controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, rawData))); controller.close(); } });
+	const response = await handleGrpcRequest({ body, env: {}, cf: {}, headers: { get: () => null }, fetcher: { connect(addr) { connectedHost = addr.hostname; return socket; } } }, uuid);
+	await collectReadableStream(response.body, 1500);
+	assert.equal(connectedHost, 'target.example', 'a first packet with CRLF at bytes 56-57 is authenticated by UUID and connects to the target (not misrouted by the CRLF heuristic)');
 }
 
 {

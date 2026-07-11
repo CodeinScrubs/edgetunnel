@@ -845,7 +845,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
 				名称: 'XHTTP upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1232,7 +1232,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
 				名称: 'gRPC upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1246,7 +1246,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				let 正常结束 = false;
 				while (true) {
 					const { done, value } = await reader.read();
-					if (done) { 正常结束 = true; break; }
+					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
 					const parsedFrames = parseGrpcFrameChunk(pending, 当前块);
@@ -1261,7 +1261,11 @@ async function 处理gRPC请求(request, yourUUID) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
 							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							if (判断是否是木马 === null) {
+								// Authenticate 魏烈思 by UUID first; only fall to the 木马 CRLF heuristic when it isn't ours.
+								const 是魏烈思 = 首包bytes.byteLength >= 18 && UUID字节匹配(首包bytes, 1, yourUUID);
+								判断是否是木马 = !是魏烈思 && 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							}
 							if (判断是否是木马) {
 								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
@@ -1304,11 +1308,15 @@ async function 处理gRPC请求(request, yourUUID) {
 				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
 				if (正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
 					释放远端写入器();
+					let 半关闭写入器 = null;
 					try {
-						const 半关闭写入器 = remoteConnWrapper.socket.writable.getWriter();
-						try { await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { remoteConnWrapper.socket?.close() } catch (e) { } }); }
-						finally { try { 半关闭写入器.releaseLock() } catch (e) { } }
-					} catch (e) { }
+						半关闭写入器 = remoteConnWrapper.socket.writable.getWriter();
+						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { remoteConnWrapper.socket?.close() } catch (e) { } });
+					} catch (e) {
+						// On ANY half-close failure (immediate reject or timeout), close the socket so the downstream
+						// read side ends and the awaited pipePromise below can't hang on a peer that never EOFs.
+						try { remoteConnWrapper.socket?.close() } catch (e2) { }
+					} finally { try { 半关闭写入器?.releaseLock() } catch (e) { } }
 					if (remoteConnWrapper.pipePromise) { try { await remoteConnWrapper.pipePromise } catch (e) { } }
 				}
 			} catch (err) {
@@ -1429,7 +1437,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		上行活动: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.记录上行活动?.(); },
+		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
 		名称: 'WS upload',
 		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
@@ -2601,7 +2609,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
 			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
 			// must not have the stale socket's closed-promise tear down the healthy replacement's client ws.
-			newSocket.closed.catch(() => { }).finally(() => { if (remoteConnWrapper.socket === newSocket) closeSocketQuietly(ws); });
+			// connectStreams (pipeRemoteToClient) is the SOLE owner of client-transport closure — it flushes the
+			// final grain buffer before closing. A second closer here (on socket.closed) raced that flush and
+			// could drop the final response bytes; just observe the close, never close the client from here.
+			newSocket.closed.catch(() => { });
 			// Honor FIRST_BYTE_TIMEOUT_MS on the proxy path too (opt-in; 0 = off by default). There is no
 			// fallback here (retryFunc=null), so a fired timeout just CLOSES the stream — it never replays
 			// the first packet from the worker — turning a blackholed relay (connects, then sends nothing)
@@ -3040,7 +3051,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -3157,6 +3168,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 				const completions = item.completions || null;
 				activeCompletions = completions;
+				// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
+				// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
+				// first packet while later bytes may already be on the wire.
+				try { 写入开始?.(); } catch (e) { }
 				try {
 					try {
 						await 执行远端写入(writer, item.chunk);
