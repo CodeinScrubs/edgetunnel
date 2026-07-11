@@ -1836,6 +1836,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		收尾WS显式传输();
 	});
 	serverSock.addEventListener('error', (err) => {
+		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
+		// doesn't score the route as failed or spend a ProxyIP fallback dial on an already-dead client.
+		remoteConnWrapper.客户端已关闭 = true;
 		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		处理WS显式传输错误(err);
 	});
