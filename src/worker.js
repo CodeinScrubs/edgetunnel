@@ -2660,6 +2660,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				throw err;
 			}
 			recordDirectRouteFailure(直连路由键);
+			// connectDirect() writes the first packet internally, so this failure may be a WRITE failure that
+			// already (partially) delivered rawData. Replaying a non-replay-safe first packet to ProxyIP could
+			// re-send non-idempotent data, so only fall back when the first packet is empty or a standalone
+			// ClientHello; otherwise close and let the client re-dial. (Unchanged for the common ClientHello case.)
+			if (!可重放首包) { closeSocketQuietly(ws); throw err; }
 			await connecttoPry();
 		}
 	}
@@ -3139,11 +3144,12 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						await 执行远端写入(writer, item.chunk);
 					} catch (err) {
 						释放写入器?.();
-						if (!item.allowRetry || 已交付远端字节 || typeof 重试连接 !== 'function') throw err;
-						await 重试连接();
-						writer = 获取写入器();
-						if (!writer) throw err;
-						await 执行远端写入(writer, item.chunk);
+						// Delivery is UNCERTAIN once writer.write() was invoked — a rejected write does not prove
+						// zero bytes reached the remote. Never resend this chunk on a fresh socket (that could
+						// duplicate or corrupt a non-idempotent stream); close and let the client re-dial. The only
+						// replay-safe fallback is BEFORE any application write (connectStreams' no-data retry gate
+						// + the ClientHello classifier), never here.
+						throw err;
 					}
 					已交付远端字节 = true;
 					try { 上行活动?.(); } catch (e) { }

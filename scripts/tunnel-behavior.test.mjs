@@ -720,6 +720,25 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Post-write retry removed: once writer.write() has been invoked, a rejection must NOT reconnect and
+	// resend the chunk on a fresh socket (delivery is uncertain — that could duplicate/corrupt the stream).
+	// It closes the connection so the client re-dials; 重试连接 must never be invoked from the queue.
+	let closed = false, retried = false, writes = 0;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { writes++; return Promise.reject(new Error('boom')); } }),
+		释放写入器() { },
+		重试连接: async () => { retried = true; },
+		关闭连接() { closed = true; },
+		名称: 'no-retry upload',
+	});
+	queue.写入(new Uint8Array([1, 2, 3]));
+	await new Promise(r => setTimeout(r, 30));
+	assert.equal(writes, 1, 'a failed write is attempted exactly once — never resent on a fresh socket');
+	assert.equal(retried, false, 'a post-write failure must NOT trigger reconnect/replay');
+	assert.equal(closed, true, 'a post-write failure closes the connection so the client re-dials');
+}
+
+{
 	assert.equal(getDialStaggerMs({}), 90);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '0' }), 0);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '37.6' }), 38);
