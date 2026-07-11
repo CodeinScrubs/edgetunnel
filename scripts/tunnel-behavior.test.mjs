@@ -1892,6 +1892,41 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF=1): a response that arrives AFTER the client's
+	// request-body EOF must still be delivered, not truncated. The mock origin sends its late reply [7,8,9]
+	// only once it receives the upstream FIN (writable.close()) — which happens ONLY on the half-close path;
+	// a full socket.close() (the default teardown) ends the readable with no reply.
+	const uuid = '11111111-1111-4111-8111-111111111111';
+	const clientHello = new Uint8Array([0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd]);
+	const makeRemote = () => {
+		let rc = null;
+		return {
+			opened: Promise.resolve(),
+			readable: new ReadableStream({ start(c) { rc = c; } }),
+			writable: new WritableStream({ write() { }, close() { try { rc?.enqueue(new Uint8Array([7, 8, 9])); rc?.close(); } catch (e) { } } }),
+			closed: new Promise(() => { }),
+			close() { try { rc?.close() } catch (e) { } }, // full close ends the readable with no late reply
+		};
+	};
+	const makeBody = () => new ReadableStream({
+		start(controller) {
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'target.example', 443, clientHello)));
+			controller.close(); // request body EOFs right after the first frame
+		},
+	});
+	const contains789 = (bytes) => {
+		for (let i = 0; i + 2 < bytes.byteLength; i++) if (bytes[i] === 7 && bytes[i + 1] === 8 && bytes[i + 2] === 9) return true;
+		return false;
+	};
+
+	const onResp = await handleGrpcRequest({ body: makeBody(), env: { GRPC_HALF_CLOSE_ON_EOF: '1' }, cf: {}, headers: { get: () => null }, fetcher: { connect: () => makeRemote() } }, uuid);
+	assert.equal(contains789(await collectReadableStream(onResp.body, 2000)), true, 'GRPC_HALF_CLOSE_ON_EOF=1 delivers a response that arrives after request-body EOF');
+
+	const offResp = await handleGrpcRequest({ body: makeBody(), env: {}, cf: {}, headers: { get: () => null }, fetcher: { connect: () => makeRemote() } }, uuid);
+	assert.equal(contains789(await collectReadableStream(offResp.body, 2000)), false, 'default (flag off) closes on request-body EOF — the late response is not delivered (proven-working behavior)');
+}
+
+{
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	let requestBodyCanceled = false;
 	const socket = {

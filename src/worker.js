@@ -1243,9 +1243,10 @@ async function 处理gRPC请求(request, yourUUID) {
 
 			try {
 				let pending = new Uint8Array(0);
+				let 正常结束 = false;
 				while (true) {
 					const { done, value } = await reader.read();
-					if (done) break;
+					if (done) { 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
 					const parsedFrames = parseGrpcFrameChunk(pending, 当前块);
@@ -1298,6 +1299,18 @@ async function 处理gRPC请求(request, yourUUID) {
 					刷新发送队列();
 				}
 				await 上行写入队列.等待空();
+				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
+				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
+				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
+				if (正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
+					释放远端写入器();
+					try {
+						const 半关闭写入器 = remoteConnWrapper.socket.writable.getWriter();
+						try { await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { remoteConnWrapper.socket?.close() } catch (e) { } }); }
+						finally { try { 半关闭写入器.releaseLock() } catch (e) { } }
+					} catch (e) { }
+					if (remoteConnWrapper.pipePromise) { try { await remoteConnWrapper.pipePromise } catch (e) { } }
+				}
 			} catch (err) {
 				log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
 			} finally {
@@ -2489,13 +2502,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
 				}
-				let socket = null, candidate = null;
+				let socket = null, candidate = null, 已尝试写入首包 = false;
 				try {
 					log(`[ProxyIP connection] Trying ${候选列表.length} concurrent paths: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
 					const 开始时间 = performance.now();
 					const 连接结果 = await 并发打开候选连接(候选列表);
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
+					已尝试写入首包 = 有效数据长度(data) > 0;
 					await 写入首包(socket, data);
 					const 成功候选 = candidate, 成功开始时间 = 开始时间;
 					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
@@ -2507,6 +2521,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					try { socket?.close?.() } catch (e) { }
 					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null, Date.now(), host, yourUUID);
 					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null, Date.now(), host, yourUUID);
+					// If the first-packet WRITE was attempted (socket opened, then 写入首包 rejected), delivery is
+					// uncertain — replaying a non-replay-safe packet to the next candidate or the direct fallback
+					// could re-send non-idempotent data. Abort. A pre-write dial failure is safe to keep rotating.
+					if (已尝试写入首包 && !可重放首包) { closeSocketQuietly(ws); throw err; }
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -2652,7 +2670,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					await connecttoPry();
 				},
 				配置首字节超时毫秒,
-				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: 已有首包数据, 可重放首包: 可重放首包, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
+				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: !可重放首包, 可重放首包: 可重放首包, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -8296,6 +8314,16 @@ function getUplinkWriteTimeoutMs(env) {
 	const configured = Number(env?.UPLINK_WRITE_TIMEOUT_MS);
 	if (!Number.isFinite(configured) || configured <= 0) return 0;
 	return Math.max(1000, Math.min(120000, Math.round(configured)));
+}
+
+// Opt-in gRPC duplex half-close (default OFF). When enabled, a NORMAL request-body EOF half-closes only the
+// UPSTREAM writable (sends FIN so the origin knows the upload finished) and keeps reading the downstream
+// response to completion, instead of closing the whole remote socket. This is the correct bidirectional gRPC
+// lifecycle, but it is off by default because xray "gun" keeps the stream open until teardown (so the current
+// full-close never truncates it), and this changes teardown on the primary transport. Enable it only if a
+// client half-closes its request stream mid-response (a response cut off right after an upload finishes).
+function isGrpcHalfCloseOnEof(env) {
+	return ['1', 'true', 'yes', 'on'].includes(String(env?.GRPC_HALF_CLOSE_ON_EOF || '').trim().toLowerCase());
 }
 
 function getDialStaggerMs(env) {
