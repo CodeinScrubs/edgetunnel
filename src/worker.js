@@ -2064,7 +2064,9 @@ function encodeGrpcDataFrame(payload) {
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
-	const grpcLen = ((data[1] << 24) >>> 0) | (data[2] << 16) | (data[3] << 8) | data[4];
+	// Unsigned 32-bit big-endian length. Plain arithmetic (not `<<`/`|`, which produce a SIGNED int32 — a
+	// top-byte >= 0x80 would go negative and slip past the size cap below on a malformed/hostile frame).
+	const grpcLen = data[1] * 0x1000000 + data[2] * 0x10000 + data[3] * 0x100 + data[4];
 	if (grpcLen > GRPC_MAX_FRAME_PAYLOAD_BYTES) throw new Error(`gRPC frame too large: ${grpcLen}B`);
 	return grpcLen;
 }
@@ -2345,6 +2347,25 @@ async function openStaggeredCandidates(candidates, openCandidate, options = {}) 
 	});
 }
 
+// A first packet is safe for the worker to replay to a ProxyIP relay (direct→ProxyIP fallback) ONLY when it
+// is exactly one standalone TLS ClientHello record and nothing else. That is idempotent (a fresh handshake
+// each time) and is the common censorship-recovery case in Iran: direct accepts TCP, gets the ClientHello,
+// then the SNI is RST — replaying it through ProxyIP recovers within the same connection. Anything else
+// (plaintext HTTP, a POST, a second TLS record, TLS 1.3 0-RTT early data, an unknown protocol) must NOT be
+// replayed — it could be non-idempotent — so those close and let the client re-dial instead.
+function 是可重放的TLS首包(dataInput) {
+	const data = 数据转Uint8Array(dataInput);
+	if (data.byteLength < 9) return false;
+	if (data[0] !== 0x16) return false;            // TLS handshake record
+	if (data[1] !== 0x03) return false;            // record-layer major version 3
+	const 记录长度 = (data[3] << 8) | data[4];
+	if (记录长度 < 4 || 记录长度 > 18432) return false;
+	if (data.byteLength !== 5 + 记录长度) return false; // exactly one record — no trailing record / 0-RTT data
+	if (data[5] !== 0x01) return false;            // handshake message type = ClientHello
+	const 握手长度 = data[6] * 0x10000 + data[7] * 0x100 + data[8];
+	return 握手长度 + 4 === 记录长度;               // the ClientHello spans the whole record
+}
+
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
 	validateTunnelTarget(host, portNum);
 	const { env, ctx } = getWorkerRequestContext(request);
@@ -2359,6 +2380,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	const 已有首包数据 = 有效数据长度(rawData) > 0;
+	// The direct→ProxyIP fallback replays the first packet. That is only replay-safe when the first packet is
+	// empty (nothing to replay) or a standalone TLS ClientHello (idempotent). For any other data-carrying
+	// first packet, a socket-close/EOF must NOT trigger a replay — close and let the client re-dial instead.
+	const 可重放首包 = !已有首包数据 || 是可重放的TLS首包(rawData);
 	const 配置首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'} | Forced: ${forceProxyForHost ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
@@ -2549,7 +2574,12 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await connectProxyIP(proxyFallbackHost, Number(proxyFallbackEndpoint.port) || 443, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
+			// Install the new socket BEFORE tearing down any previous one, so the previous socket's own pipe
+			// sees itself as stale (wrapper.socket !== its socket) and won't close the shared client. Closing the
+			// old socket here also prevents a leak when a reconnect replaces a still-open (blackholed) socket.
+			const 旧远端Socket = remoteConnWrapper.socket;
 			remoteConnWrapper.socket = newSocket;
+			if (旧远端Socket && 旧远端Socket !== newSocket) { try { 旧远端Socket.close?.() } catch (e) { } }
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
 			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
 			// must not have the stale socket's closed-promise tear down the healthy replacement's client ws.
@@ -2585,6 +2615,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		// Refuse — the caller tears down and the client re-dials cleanly. Also skip retries once the client left.
 		if (remoteConnWrapper.已向远端发送数据) throw new Error('[TCP forwarding] Upload retry aborted: later uplink data already sent to remote');
 		if (remoteConnWrapper.客户端已关闭) throw new Error('[TCP forwarding] Upload retry aborted: client disconnected');
+		// The retry replays the original first packet; only do that when it is replay-safe (empty or a
+		// standalone TLS ClientHello). Otherwise reconnecting could re-send non-idempotent application data.
+		if (!可重放首包) throw new Error('[TCP forwarding] Upload retry aborted: first packet is not a replay-safe TLS ClientHello');
 		return connecttoPry(!已通过代理发送首包);
 	};
 
@@ -2619,7 +2652,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					await connecttoPry();
 				},
 				配置首字节超时毫秒,
-				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: 已有首包数据, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
+				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: 已有首包数据, 可重放首包: 可重放首包, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -3356,11 +3389,20 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
 
+	// A reconnect can install a DIFFERENT socket in the wrapper while this pipe is still draining its (now
+	// superseded) socket. Such a stale pipe must not forward bytes to — or close — the shared client, nor
+	// score route health; that all belongs to the pipe that owns the current socket. Reconnects only happen
+	// pre-first-byte (retry is refused once downlink data reached the client), so a stale pipe never has
+	// buffered output to lose. Socket identity is a safe generation proxy because connecttoPry installs the
+	// replacement BEFORE closing the old socket — there is no window where a superseded pipe still looks current.
+	const 仍为当前管道 = () => !(pipeMeta?.wrapper && pipeMeta.wrapper.socket && pipeMeta.wrapper.socket !== remoteSocket);
+
 	try {
 		if (!useBYOB) {
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
+				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
 				await 下行发送器.发送(value);
@@ -3371,6 +3413,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			while (true) {
 				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
 				if (done) break;
+				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
 				if (value.byteLength >= downlinkGrainBytes) {
@@ -3394,6 +3437,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
+	// A stale pipe (a reconnect installed a different socket) must not touch the shared client transport or
+	// route health — connecttoPry already closed its socket; just exit and let the current pipe own teardown.
+	if (!仍为当前管道()) { try { remoteSocket?.close?.() } catch (e) { } return; }
 	// A client that closed/cancelled before the first downlink byte is not a route failure — don't poison the
 	// direct-route cache (onNoData) and don't spend a ProxyIP fallback dial on a connection the client already
 	// abandoned. And if a later uplink chunk (beyond the replayable first packet) already reached the remote,
@@ -3402,7 +3448,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	const 客户端已关闭 = pipeMeta?.wrapper?.客户端已关闭 === true;
 	const 后续上行已送达 = pipeMeta?.wrapper?.已向远端发送数据 === true;
 	if (!hasData && !客户端已关闭) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
-	if (!hasData && retryFunc && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达) {
+	// 可重放首包 === false means the first packet carried non-idempotent data (not empty, not a lone TLS
+	// ClientHello) — replaying it on a fallback is unsafe, so close instead of retrying.
+	if (!hasData && retryFunc && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达 && pipeMeta?.可重放首包 !== false) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
@@ -6247,8 +6295,9 @@ function readDohCache(cacheKey, now = Date.now()) {
 function writeDohCache(cacheKey, answers, now = Date.now()) {
 	const ttlValues = (answers || [])
 		.map(answer => Number(answer?.TTL))
-		.filter(ttl => Number.isFinite(ttl) && ttl > 0)
+		.filter(ttl => Number.isFinite(ttl) && ttl >= 0) // include TTL 0 so an all-0 answer isn't floored to 30s
 		.map(ttl => ttl * 1000);
+	if (ttlValues.length && Math.min(...ttlValues) <= 0) return; // RFC 1035: a TTL-0 answer must not be cached
 	const dnsTtlMs = ttlValues.length ? Math.min(...ttlValues) : DNS_RESULT_CACHE_MIN_TTL_MS;
 	const ttlMs = Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs));
 	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
@@ -8738,6 +8787,7 @@ export const __testPerformanceHelpers = {
 	readXhttpFirstPacket: 读取XHTTP首包,
 	createUploadQueue: 创建上行写入队列,
 	getUplinkWriteTimeoutMs,
+	isReplayableTlsFirstPacket: 是可重放的TLS首包,
 	normalizeConfigHost,
 	splitConfigArray: 整理成数组,
 	base64SecretEncode,

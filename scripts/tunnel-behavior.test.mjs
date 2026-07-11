@@ -71,6 +71,7 @@ const {
 	expandPreferredEndpointVariants,
 	createUploadQueue,
 	getUplinkWriteTimeoutMs,
+	isReplayableTlsFirstPacket,
 	normalizeConfigHost,
 	splitConfigArray,
 	base64SecretEncode,
@@ -1370,6 +1371,56 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Replay-safe first-packet classifier: only an empty packet or a single standalone TLS ClientHello record
+	// may be replayed to a ProxyIP fallback. Everything else is treated as possibly non-idempotent.
+	const clientHello = new Uint8Array([0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd]);
+	assert.equal(isReplayableTlsFirstPacket(clientHello), true, 'a standalone TLS ClientHello record is replay-safe');
+	assert.equal(isReplayableTlsFirstPacket(new Uint8Array([0x47, 0x45, 0x54, 0x20, 0x2f])), false, 'a plaintext HTTP request is not replay-safe');
+	// ClientHello followed by a second record (e.g. TLS 1.3 0-RTT early data) must not be replayed.
+	assert.equal(isReplayableTlsFirstPacket(new Uint8Array([...clientHello, 0x17, 0x03, 0x03, 0x00, 0x01, 0x00])), false, 'a ClientHello with a trailing record is not replay-safe');
+	assert.equal(isReplayableTlsFirstPacket(new Uint8Array([0x16, 0x03])), false, 'a too-short packet is not replay-safe');
+}
+
+{
+	// The connectStreams retry is refused when the first packet is not replay-safe (可重放首包 === false):
+	// on a no-data close it must close, not replay-fallback. onNoData still records the route failure.
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
+			{ wrapper: {}, 可重放首包: false, onNoData: () => events.push('no-data') }),
+		250, 'non-replayable pipe settles',
+	);
+	assert.equal(events.includes('no-data'), true, 'a non-replayable first packet still records the direct-route failure');
+	assert.equal(events.includes('retry'), false, 'a non-replayable first packet must NOT replay-fallback (close and let the client re-dial)');
+}
+
+{
+	// Stale-pipeline guard: once the wrapper points at a DIFFERENT socket (a reconnect installed a
+	// replacement), this pipe is stale and must not run onNoData/retry or close the shared client ws.
+	const events = [];
+	let wsClosed = false;
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { wsClosed = true; this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	const wrapper = { socket: { /* a different, newer socket */ } };
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
+			{ wrapper, onNoData: () => events.push('no-data') }),
+		250, 'stale pipe settles',
+	);
+	assert.equal(events.length, 0, 'a stale pipe must not fire onNoData or retry');
+	assert.equal(wsClosed, false, 'a stale pipe must not close the shared client transport (the current pipe owns it)');
+}
+
+{
+	// gRPC frame-length must be parsed as UNSIGNED: a header whose top length byte is >= 0x80 previously went
+	// negative and slipped past the size cap. It must now be rejected as too large.
+	assert.throws(() => readGrpcFrameLength(new Uint8Array([0, 0x80, 0, 0, 0])), /gRPC frame too large/, 'a 0x80 top length byte is rejected, not read as a negative length');
+	assert.equal(readGrpcFrameLength(new Uint8Array([0, 0, 0, 0x10, 0x00])), 0x1000, 'a normal length parses correctly');
+}
+
+{
 	const events = [];
 	const webSocket = {
 		readyState: WebSocket.OPEN,
@@ -1883,7 +1934,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		const tunnel = await createTunnelContext(fakeRequest(), { PROXYIP: `${proxyIp}:443`, PRELOAD_RACE_DIAL: '0' });
 		const body = new ReadableStream({
 			start(controller) {
-				controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, targetHost, 443, new Uint8Array([0xaa]))));
+				// First packet is a standalone TLS ClientHello (0x16 0x03 0x01 … type 0x01) — replay-safe, so the
+				// direct→ProxyIP fallback is allowed to replay it (the censorship-recovery path).
+				controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, targetHost, 443, new Uint8Array([0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd]))));
 				controller.close();
 			},
 		});
