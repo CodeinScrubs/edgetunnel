@@ -1307,17 +1307,22 @@ async function 处理gRPC请求(request, yourUUID) {
 				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
 				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
 				if (正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
+					// Capture the EXACT socket + pipe up front: a concurrent reconnect can swap remoteConnWrapper.socket
+					// while we're half-closing, and re-reading the mutable property could close the REPLACEMENT socket or
+					// await the wrong pipe. Operate only on the socket whose upload just ended.
+					const 半关闭Socket = remoteConnWrapper.socket;
+					const 半关闭Pipe = remoteConnWrapper.pipePromise;
 					释放远端写入器();
 					let 半关闭写入器 = null;
 					try {
-						半关闭写入器 = remoteConnWrapper.socket.writable.getWriter();
-						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { remoteConnWrapper.socket?.close() } catch (e) { } });
+						半关闭写入器 = 半关闭Socket.writable.getWriter();
+						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { 半关闭Socket.close() } catch (e) { } });
 					} catch (e) {
-						// On ANY half-close failure (immediate reject or timeout), close the socket so the downstream
-						// read side ends and the awaited pipePromise below can't hang on a peer that never EOFs.
-						try { remoteConnWrapper.socket?.close() } catch (e2) { }
+						// On ANY half-close failure (immediate reject or timeout), close THIS socket so the downstream
+						// read side ends and the awaited pipe below can't hang on a peer that never EOFs.
+						try { 半关闭Socket.close() } catch (e2) { }
 					} finally { try { 半关闭写入器?.releaseLock() } catch (e) { } }
-					if (remoteConnWrapper.pipePromise) { try { await remoteConnWrapper.pipePromise } catch (e) { } }
+					if (半关闭Pipe) { try { await 半关闭Pipe } catch (e) { } }
 				}
 			} catch (err) {
 				log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
@@ -1722,7 +1727,10 @@ async function 处理WS请求(request, yourUUID, url) {
 			else {
 				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 				const bytes = 当前块字节;
-				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? 'trojan' : 'vless';
+				// Authenticate the 魏烈思 UUID first; only fall to the 木马 CRLF heuristic when it isn't ours
+				// (a 魏烈思 packet whose bytes 56-57 coincidentally equal CRLF must not be misrouted to 木马).
+				const 是魏烈思 = bytes.byteLength >= 18 && UUID字节匹配(bytes, 1, yourUUID);
+				判断协议类型 = (!是魏烈思 && bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a) ? 'trojan' : 'vless';
 			}
 			判断是否是木马 = 判断协议类型 === 'trojan';
 			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
@@ -2085,9 +2093,11 @@ function encodeGrpcDataFrame(payload) {
 	return frame;
 }
 
+const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf field; cap adversarial ones
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
+	if (data[0] !== 0) throw new Error(`unsupported gRPC compression flag: ${data[0]}`);
 	// Unsigned 32-bit big-endian length. Plain arithmetic (not `<<`/`|`, which produce a SIGNED int32 — a
 	// top-byte >= 0x80 would go negative and slip past the size cap below on a malformed/hostile frame).
 	const grpcLen = data[1] * 0x1000000 + data[2] * 0x10000 + data[3] * 0x100 + data[4];
@@ -2101,7 +2111,9 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 	if (data[0] !== 0x0a) return [data];
 	const payloads = [];
 	let offset = 0;
+	let fieldCount = 0;
 	while (offset < data.byteLength) {
+		if (++fieldCount > GRPC_MAX_FIELDS_PER_FRAME) throw new Error('gRPC frame has too many protobuf fields');
 		if (data[offset] !== 0x0a) throw new Error('Invalid gRPC protobuf wrapper: expected data field');
 		const { value: length, nextOffset } = readGrpcVarint(data, offset + 1);
 		const end = nextOffset + length;

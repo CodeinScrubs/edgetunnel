@@ -1455,6 +1455,15 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// negative and slipped past the size cap. It must now be rejected as too large.
 	assert.throws(() => readGrpcFrameLength(new Uint8Array([0, 0x80, 0, 0, 0])), /gRPC frame too large/, 'a 0x80 top length byte is rejected, not read as a negative length');
 	assert.equal(readGrpcFrameLength(new Uint8Array([0, 0, 0, 0x10, 0x00])), 0x1000, 'a normal length parses correctly');
+	// gRPC framing is parsed BEFORE UUID auth, so these are pre-auth guards: reject a nonzero compression
+	// flag, and cap protobuf fields per frame (a hostile many-tiny-fields frame otherwise burns parser CPU).
+	assert.throws(() => readGrpcFrameLength(new Uint8Array([1, 0, 0, 0, 1])), /compression flag/, 'a nonzero gRPC compression flag is rejected');
+	assert.deepEqual(unwrapGrpcMessagePayloads(new Uint8Array([0x0a, 0x02, 0xaa, 0xbb])).map(p => [...p]), [[0xaa, 0xbb]], 'a normal single-field frame unwraps');
+	{
+		const tooManyFields = new Uint8Array(4097 * 2);
+		for (let i = 0; i < 4097; i++) tooManyFields[i * 2] = 0x0a; // 4097 zero-length protobuf fields
+		assert.throws(() => unwrapGrpcMessagePayloads(tooManyFields), /too many protobuf fields/, 'a frame exceeding the per-frame field cap is rejected');
+	}
 }
 
 {
