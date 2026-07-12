@@ -893,8 +893,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 	};
 	return new Response(new ReadableStream({
 		pull() { 释放下行背压(); },
-		async start(controller) {
+		start(controller) {
 			下行控制器 = controller;
+			// Detached tunnel task so start() returns immediately — otherwise pull() never fires and the
+			// downlink backpressure release (释放下行背压) deadlocks at the response HWM. Same fix + rationale
+			// as the gRPC handler above; see the downlink-backpressure repro in tunnel-behavior.test.mjs.
+			void (async () => {
 			let 已关闭 = false;
 			let udpRespHeader = 首包.respHeader;
 			const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -945,8 +949,9 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				上行活动: () => remoteConnWrapper.记录上行活动?.(),
-				名称: 'XHTTP upload'
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+				名称: 'XHTTP upload',
+				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -986,6 +991,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				}
 			} catch (err) {
 				log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
+				try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
 				上行写入队列.清空();
@@ -993,8 +999,10 @@ async function 处理XHTTP请求(request, yourUUID) {
 				释放下行背压();
 				try { reader.releaseLock() } catch (e) { }
 			}
+			})().catch(err => { log(`[XHTTP tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
+			remoteConnWrapper.客户端已关闭 = true;
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
@@ -1207,8 +1215,14 @@ async function 处理gRPC请求(request, yourUUID) {
 
 	return new Response(new ReadableStream({
 		pull() { 释放下行背压(); },
-		async start(controller) {
+		start(controller) {
 			下行控制器 = controller;
+			// Run the whole tunnel in a DETACHED task so start() returns immediately. Per the WHATWG Streams
+			// spec, pull() is NOT called until start()'s promise settles; with the read loop inside an async
+			// start(), pull() never fires, so 释放下行背压() (the only downlink backpressure release) never runs
+			// and the download deadlocks the moment the response queue fills at the HWM (~256KB). See the
+			// "downlink backpressure must not deadlock" repro in scripts/tunnel-behavior.test.mjs.
+			void (async () => {
 			let 已关闭 = false;
 			let 已清理 = false;
 			let 发送队列 = [];
@@ -1323,8 +1337,9 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				上行活动: () => remoteConnWrapper.记录上行活动?.(),
-				名称: 'gRPC upload'
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+				名称: 'gRPC upload',
+				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 
 			const 写入远端 = async (payload, allowRetry = true) => {
@@ -1333,9 +1348,10 @@ async function 处理gRPC请求(request, yourUUID) {
 
 			try {
 				let pending = new Uint8Array(0);
+				let 正常结束 = false;
 				while (true) {
 					const { done, value } = await reader.read();
-					if (done) break;
+					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
 					const parsedFrames = parseGrpcFrameChunk(pending, 当前块);
@@ -1350,7 +1366,11 @@ async function 处理gRPC请求(request, yourUUID) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
 							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							if (判断是否是木马 === null) {
+								// Authenticate 魏烈思 by UUID first; only fall to the 木马 CRLF heuristic when it isn't ours.
+								const 是魏烈思 = 首包bytes.byteLength >= 18 && UUID字节匹配(首包bytes, 1, yourUUID);
+								判断是否是木马 = !是魏烈思 && 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							}
 							if (判断是否是木马) {
 								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
 								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
@@ -1388,6 +1408,27 @@ async function 处理gRPC请求(request, yourUUID) {
 					刷新发送队列();
 				}
 				await 上行写入队列.等待空();
+				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
+				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
+				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
+				if (正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
+					// Capture the EXACT socket + pipe up front: a concurrent reconnect can swap remoteConnWrapper.socket
+					// while we're half-closing, and re-reading the mutable property could close the REPLACEMENT socket or
+					// await the wrong pipe. Operate only on the socket whose upload just ended.
+					const 半关闭Socket = remoteConnWrapper.socket;
+					const 半关闭Pipe = remoteConnWrapper.pipePromise;
+					释放远端写入器();
+					let 半关闭写入器 = null;
+					try {
+						半关闭写入器 = 半关闭Socket.writable.getWriter();
+						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { 半关闭Socket.close() } catch (e) { } });
+					} catch (e) {
+						// On ANY half-close failure (immediate reject or timeout), close THIS socket so the downstream
+						// read side ends and the awaited pipe below can't hang on a peer that never EOFs.
+						try { 半关闭Socket.close() } catch (e2) { }
+					} finally { try { 半关闭写入器?.releaseLock() } catch (e) { } }
+					if (半关闭Pipe) { try { await 半关闭Pipe } catch (e) { } }
+				}
 			} catch (err) {
 				log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
 			} finally {
@@ -1395,8 +1436,10 @@ async function 处理gRPC请求(request, yourUUID) {
 				释放远端写入器();
 				关闭连接();
 			}
+			})().catch(err => { log(`[gRPC tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
+			remoteConnWrapper.客户端已关闭 = true;
 			释放下行背压();
 			GRPC上行写入队列?.清空();
 			if (远端写入器) {
@@ -1504,8 +1547,9 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		上行活动: () => remoteConnWrapper.记录上行活动?.(),
-		名称: 'WS upload'
+		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+		名称: 'WS upload',
+		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
@@ -1788,7 +1832,10 @@ async function 处理WS请求(request, yourUUID, url) {
 			else {
 				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 				const bytes = 当前块字节;
-				判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? 'trojan' : 'vless';
+				// Authenticate the 魏烈思 UUID first; only fall to the 木马 CRLF heuristic when it isn't ours
+				// (a 魏烈思 packet whose bytes 56-57 coincidentally equal CRLF must not be misrouted to 木马).
+				const 是魏烈思 = bytes.byteLength >= 18 && UUID字节匹配(bytes, 1, yourUUID);
+				判断协议类型 = (!是魏烈思 && bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a) ? 'trojan' : 'vless';
 			}
 			判断是否是木马 = 判断协议类型 === 'trojan';
 			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
@@ -1846,6 +1893,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		上行写入队列.清空();
 		释放远端写入器();
+		try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream directly, not only via the serverSock close cascade
 		closeSocketQuietly(serverSock);
 	};
 
@@ -1892,6 +1940,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		入队WS显式传输(event.data);
 	});
 	serverSock.addEventListener('close', () => {
+		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
+		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
+		remoteConnWrapper.客户端已关闭 = true;
 		closeSocketQuietly(serverSock);
 		// Close the outbound remote socket too, so a client disconnect while the remote is silent
 		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
@@ -1899,6 +1950,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		收尾WS显式传输();
 	});
 	serverSock.addEventListener('error', (err) => {
+		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
+		// doesn't score the route as failed or spend a ProxyIP fallback dial on an already-dead client.
+		remoteConnWrapper.客户端已关闭 = true;
 		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		处理WS显式传输错误(err);
 	});
@@ -1973,6 +2027,7 @@ function 解析木马请求(buffer, passwordPlainText) {
 	const portIndex = addressIndex + addressLength;
 	if (data.byteLength < portIndex + 4) return { hasError: true, message: "invalid S5 request data" };
 	const portRemote = (data[portIndex] << 8) | data[portIndex + 1];
+	if (data[portIndex + 2] !== 0x0d || data[portIndex + 3] !== 0x0a) return { hasError: true, message: "invalid S5 delimiter" };
 
 	return {
 		hasError: false,
@@ -2112,43 +2167,49 @@ function encodeGrpcVarint(value) {
 }
 
 function readGrpcVarint(data, offset = 0) {
-	let value = 0, shift = 0;
-	for (let i = offset; i < data.byteLength; i++) {
-		const current = data[i];
-		value |= (current & 0x7f) << shift;
-		if ((current & 0x80) === 0) return { value: value >>> 0, nextOffset: i + 1 };
-		shift += 7;
-		if (shift > 35) break;
+	let value = 0;
+	for (let index = 0; index < 5; index++) {
+		const position = offset + index;
+		if (position >= data.byteLength) throw new Error('Invalid gRPC protobuf wrapper: truncated varint length');
+		const byte = data[position];
+		if (index === 4 && (byte & 0xf0) !== 0) throw new Error('Invalid gRPC protobuf wrapper: varint length exceeds uint32');
+		value += (byte & 0x7f) * 2 ** (index * 7); // arithmetic, not `<<` (which wraps at 32 bits)
+		if ((byte & 0x80) === 0) return { value, nextOffset: position + 1 };
 	}
-	throw new Error('Invalid gRPC protobuf wrapper: bad varint length');
+	throw new Error('Invalid gRPC protobuf wrapper: varint length too long');
 }
 
-function encodeGrpcMessagePayload(payload) {
+// Single-allocation gRPC downlink frame: write the header + protobuf field + payload into ONE buffer.
+// Byte-identical to the old two-step (encodeGrpcMessagePayload then copy into the frame) but saves the
+// intermediate message allocation + a second copy of the payload on every downstream frame.
+function encodeGrpcDataFrame(payload) {
 	const chunk = 数据转Uint8Array(payload);
 	const lenBytes = encodeGrpcVarint(chunk.byteLength);
-	const message = new Uint8Array(1 + lenBytes.byteLength + chunk.byteLength);
-	message[0] = 0x0a;
-	message.set(lenBytes, 1);
-	message.set(chunk, 1 + lenBytes.byteLength);
-	return message;
-}
-
-function encodeGrpcDataFrame(payload) {
-	const message = encodeGrpcMessagePayload(payload);
-	const frame = new Uint8Array(5 + message.byteLength);
+	const messageLength = 1 + lenBytes.byteLength + chunk.byteLength;
+	const frame = new Uint8Array(5 + messageLength);
 	frame[0] = 0;
-	frame[1] = (message.byteLength >>> 24) & 0xff;
-	frame[2] = (message.byteLength >>> 16) & 0xff;
-	frame[3] = (message.byteLength >>> 8) & 0xff;
-	frame[4] = message.byteLength & 0xff;
-	frame.set(message, 5);
+	frame[1] = (messageLength >>> 24) & 0xff;
+	frame[2] = (messageLength >>> 16) & 0xff;
+	frame[3] = (messageLength >>> 8) & 0xff;
+	frame[4] = messageLength & 0xff;
+	frame[5] = 0x0a;
+	frame.set(lenBytes, 6);
+	frame.set(chunk, 6 + lenBytes.byteLength);
 	return frame;
 }
 
+const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf field; cap adversarial ones
+// A single read chunk holds a handful of frames for real xray "gun" traffic (bulk data rides in few large
+// frames). Reject a pathological flood of tiny/empty 5-byte frames in one chunk — reachable BEFORE UUID auth
+// by a path-knowing peer — so the O(frames) unwrap loop can't burn the whole 10ms CPU budget as a cheap DoS.
+const GRPC_MAX_FRAMES_PER_CHUNK = 16384;
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
-	const grpcLen = ((data[1] << 24) >>> 0) | (data[2] << 16) | (data[3] << 8) | data[4];
+	if (data[0] !== 0) throw new Error(`unsupported gRPC compression flag: ${data[0]}`);
+	// Unsigned 32-bit big-endian length. Plain arithmetic (not `<<`/`|`, which produce a SIGNED int32 — a
+	// top-byte >= 0x80 would go negative and slip past the size cap below on a malformed/hostile frame).
+	const grpcLen = data[1] * 0x1000000 + data[2] * 0x10000 + data[3] * 0x100 + data[4];
 	if (grpcLen > GRPC_MAX_FRAME_PAYLOAD_BYTES) throw new Error(`gRPC frame too large: ${grpcLen}B`);
 	return grpcLen;
 }
@@ -2159,7 +2220,9 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 	if (data[0] !== 0x0a) return [data];
 	const payloads = [];
 	let offset = 0;
+	let fieldCount = 0;
 	while (offset < data.byteLength) {
+		if (++fieldCount > GRPC_MAX_FIELDS_PER_FRAME) throw new Error('gRPC frame has too many protobuf fields');
 		if (data[offset] !== 0x0a) throw new Error('Invalid gRPC protobuf wrapper: expected data field');
 		const { value: length, nextOffset } = readGrpcVarint(data, offset + 1);
 		const end = nextOffset + length;
@@ -2196,7 +2259,9 @@ function parseGrpcFrameChunk(pending, chunk) {
 	}
 	const payloads = [];
 	let offset = 0;
+	let frameCount = 0;
 	while (merged.byteLength - offset >= 5) {
+		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
 		const frameHeader = merged.subarray(offset, offset + 5);
 		const grpcLen = readGrpcFrameLength(frameHeader);
 		const frameSize = 5 + grpcLen;
@@ -2429,6 +2494,25 @@ async function openStaggeredCandidates(candidates, openCandidate, options = {}) 
 	});
 }
 
+// A first packet is safe for the worker to replay to a ProxyIP relay (direct→ProxyIP fallback) ONLY when it
+// is exactly one standalone TLS ClientHello record and nothing else. That is idempotent (a fresh handshake
+// each time) and is the common censorship-recovery case in Iran: direct accepts TCP, gets the ClientHello,
+// then the SNI is RST — replaying it through ProxyIP recovers within the same connection. Anything else
+// (plaintext HTTP, a POST, a second TLS record, TLS 1.3 0-RTT early data, an unknown protocol) must NOT be
+// replayed — it could be non-idempotent — so those close and let the client re-dial instead.
+function 是可重放的TLS首包(dataInput) {
+	const data = 数据转Uint8Array(dataInput);
+	if (data.byteLength < 9) return false;
+	if (data[0] !== 0x16) return false;            // TLS handshake record
+	if (data[1] !== 0x03) return false;            // record-layer major version 3
+	const 记录长度 = (data[3] << 8) | data[4];
+	if (记录长度 < 4 || 记录长度 > 18432) return false;
+	if (data.byteLength !== 5 + 记录长度) return false; // exactly one record — no trailing record / 0-RTT data
+	if (data[5] !== 0x01) return false;            // handshake message type = ClientHello
+	const 握手长度 = data[6] * 0x10000 + data[7] * 0x100 + data[8];
+	return 握手长度 + 4 === 记录长度;               // the ClientHello spans the whole record
+}
+
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
 	validateTunnelTarget(host, portNum);
 	const { env, ctx } = getWorkerRequestContext(request);
@@ -2443,8 +2527,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	const 已有首包数据 = 有效数据长度(rawData) > 0;
+	// The direct→ProxyIP fallback replays the first packet. That is only replay-safe when the first packet is
+	// empty (nothing to replay) or a standalone TLS ClientHello (idempotent). For any other data-carrying
+	// first packet, a socket-close/EOF must NOT trigger a replay — close and let the client re-dial instead.
+	const 可重放首包 = !已有首包数据 || 是可重放的TLS首包(rawData);
 	const 配置首字节超时毫秒 = Math.max(0, Math.min(10000, Number(env?.FIRST_BYTE_TIMEOUT_MS) || 0));
-	const 首字节超时毫秒 = 已有首包数据 ? 0 : 配置首字节超时毫秒;
 	log(`[TCP forwarding] Target: ${host}:${portNum} | ProxyIP: ${proxyIP} | ProxyIP fallback: ${proxyFallbackEnabled ? 'yes' : 'no'} | Proxy type: ${proxyType || 'proxyip'} | Global: ${proxyGlobalEnabled ? 'yes' : 'no'} | Forced: ${forceProxyForHost ? 'yes' : 'no'}`);
 	const 连接超时毫秒 = getProxyConnectTimeoutMs(env);
 	const proxyAddressForConnect = { ...parsedProxyAddress, timeoutMs: 连接超时毫秒, dohLookupUrl: getDohLookupUrl(env) };
@@ -2549,13 +2636,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
 				}
-				let socket = null, candidate = null;
+				let socket = null, candidate = null, 已尝试写入首包 = false;
 				try {
 					log(`[ProxyIP connection] Trying ${候选列表.length} concurrent paths: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
 					const 开始时间 = performance.now();
 					const 连接结果 = await 并发打开候选连接(候选列表);
 					socket = 连接结果.socket;
 					candidate = 连接结果.candidate;
+					已尝试写入首包 = 有效数据长度(data) > 0;
 					await 写入首包(socket, data);
 					const 成功候选 = candidate, 成功开始时间 = 开始时间;
 					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
@@ -2567,6 +2655,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					try { socket?.close?.() } catch (e) { }
 					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null, Date.now(), host, yourUUID);
 					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null, Date.now(), host, yourUUID);
+					// If the first-packet WRITE was attempted (socket opened, then 写入首包 rejected), delivery is
+					// uncertain — replaying a non-replay-safe packet to the next candidate or the direct fallback
+					// could re-send non-idempotent data. Abort. A pre-write dial failure is safe to keep rotating.
+					if (已尝试写入首包 && !可重放首包) { closeSocketQuietly(ws); throw err; }
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -2634,8 +2726,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				newSocket = await connectProxyIP(proxyFallbackHost, Number(proxyFallbackEndpoint.port) || 443, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
+			// Install the new socket BEFORE tearing down any previous one, so the previous socket's own pipe
+			// sees itself as stale (wrapper.socket !== its socket) and won't close the shared client. Closing the
+			// old socket here also prevents a leak when a reconnect replaces a still-open (blackholed) socket.
+			const 旧远端Socket = remoteConnWrapper.socket;
 			remoteConnWrapper.socket = newSocket;
-			newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
+			if (旧远端Socket && 旧远端Socket !== newSocket) { try { 旧远端Socket.close?.() } catch (e) { } }
+			// Only close the client transport when THIS socket is still the current one. A later reconnect
+			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
+			// must not have the stale socket's closed-promise tear down the healthy replacement's client ws.
+			// connectStreams (pipeRemoteToClient) is the SOLE owner of client-transport closure — it flushes the
+			// final grain buffer before closing. A second closer here (on socket.closed) raced that flush and
+			// could drop the final response bytes; just observe the close, never close the client from here.
+			newSocket.closed.catch(() => { });
 			// Honor FIRST_BYTE_TIMEOUT_MS on the proxy path too (opt-in; 0 = off by default). There is no
 			// fallback here (retryFunc=null), so a fired timeout just CLOSES the stream — it never replays
 			// the first packet from the worker — turning a blackholed relay (connects, then sends nothing)
@@ -2662,6 +2765,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		// the retry — the caller then tears the connection down cleanly and the client re-dials. Mirrors the
 		// download path's `!hasData` retry gate. The pre-first-byte case (safe to retry) is unaffected.
 		if (remoteConnWrapper.已向客户端下发数据) throw new Error('[TCP forwarding] Upload retry aborted: downlink data already delivered to client');
+		// A retry re-dials and replays only the original first packet; any later uplink chunk already sent to
+		// the (now-dead) remote can't be reproduced on the new socket, so reconnecting would silently drop it.
+		// Refuse — the caller tears down and the client re-dials cleanly. Also skip retries once the client left.
+		if (remoteConnWrapper.已向远端发送数据) throw new Error('[TCP forwarding] Upload retry aborted: later uplink data already sent to remote');
+		if (remoteConnWrapper.客户端已关闭) throw new Error('[TCP forwarding] Upload retry aborted: client disconnected');
+		// The retry replays the original first packet; only do that when it is replay-safe (empty or a
+		// standalone TLS ClientHello). Otherwise reconnecting could re-send non-idempotent application data.
+		if (!可重放首包) throw new Error('[TCP forwarding] Upload retry aborted: first packet is not a replay-safe TLS ClientHello');
 		return connecttoPry(!已通过代理发送首包);
 	};
 
@@ -2696,7 +2807,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					await connecttoPry();
 				},
 				配置首字节超时毫秒,
-				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: 已有首包数据, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
+				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: !可重放首包, 可重放首包: 可重放首包, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
@@ -2704,6 +2815,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				throw err;
 			}
 			recordDirectRouteFailure(直连路由键);
+			// connectDirect() writes the first packet internally, so this failure may be a WRITE failure that
+			// already (partially) delivered rawData. Replaying a non-replay-safe first packet to ProxyIP could
+			// re-send non-idempotent data, so only fall back when the first packet is empty or a standalone
+			// ClientHello; otherwise close and let the client re-dial. (Unchanged for the common ClientHello case.)
+			if (!可重放首包) { closeSocketQuietly(ws); throw err; }
 			await connecttoPry();
 		}
 	}
@@ -2854,9 +2970,10 @@ function 解析DNS应答最小TTL毫秒(msg) {
 		p += 2;
 		if (p + rdlen > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
 		p += rdlen;
-		if (ttl > 0) 最小TTL秒 = Math.min(最小TTL秒, ttl);
+		最小TTL秒 = Math.min(最小TTL秒, ttl); // include TTL 0 in the minimum (RRSet TTL is the record minimum)
 	}
 	if (!Number.isFinite(最小TTL秒)) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	if (最小TTL秒 <= 0) return 0; // RFC 1035: a TTL-0 answer is for the current transaction only — must not be cached
 	return Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, 最小TTL秒 * 1000));
 }
 
@@ -2864,9 +2981,11 @@ function 写入DNS线缓存(key, msg) {
 	// Only cache a positive answer (NOERROR rcode + >=1 answer record) so a transient failure / NXDOMAIN
 	// / NODATA blip can't be served stale for the TTL. Header: byte3 low nibble = rcode, bytes 6-7 = ANCOUNT.
 	if (msg.byteLength < 12 || (msg[3] & 0x0f) !== 0 || ((msg[6] << 8) | msg[7]) === 0) return;
+	const ttlMs = 解析DNS应答最小TTL毫秒(msg);
+	if (ttlMs <= 0) return; // TTL-0 answer (e.g. per-query CDN rotation) — must not be cached
 	const stored = new Uint8Array(msg);
 	stored[0] = 0; stored[1] = 0;
-	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + 解析DNS应答最小TTL毫秒(msg) });
+	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + ttlMs });
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
@@ -2963,6 +3082,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		const consumedBytes = completeFrames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
 		udpContext.缓存 = requestData.subarray(consumedBytes);
 		if (!completeFrames.length) return; // no complete frame yet; wait for the rest to arrive
+		requestData = requestData.subarray(0, consumedBytes); // forward only complete frames; the tail waits in 缓存 (never write a partial frame to the DNS-over-TCP fallback)
 	}
 	const requestBytes = requestData.byteLength;
 	try {
@@ -3057,10 +3177,19 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 名称 = 'Upload queue' }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
+	// bare, un-timed write so a legitimately backpressured upload is never aborted.
+	const 执行远端写入 = 写入超时毫秒 > 0
+		? (w, chunk) => withOperationTimeout(w.write(chunk), 写入超时毫秒, `${名称}: remote write timed out`)
+		: (w, chunk) => w.write(chunk);
 	let chunks = [];
 	let head = 0;
 	let queuedBytes = 0;
+	// Bytes handed to an in-flight remote write but not yet acknowledged. bundle() drops these from
+	// queuedBytes the moment it forms a write, yet the backing memory is still retained until write()
+	// resolves — so admission must count them too, or a slow remote lets retained memory reach ~2x the cap.
+	let inFlightBytes = 0;
 	let draining = false;
 	let closed = false;
 	let bundleBuffer = null;
@@ -3165,20 +3294,26 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				if (closed) break;
 				const item = bundle();
 				if (!item) break;
+				inFlightBytes += item.chunk.byteLength;
 				let writer = 获取写入器();
 				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 				const completions = item.completions || null;
 				activeCompletions = completions;
+				// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
+				// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
+				// first packet while later bytes may already be on the wire.
+				try { 写入开始?.(); } catch (e) { }
 				try {
 					try {
-						await writer.write(item.chunk);
+						await 执行远端写入(writer, item.chunk);
 					} catch (err) {
 						释放写入器?.();
-						if (!item.allowRetry || 已交付远端字节 || typeof 重试连接 !== 'function') throw err;
-						await 重试连接();
-						writer = 获取写入器();
-						if (!writer) throw err;
-						await writer.write(item.chunk);
+						// Delivery is UNCERTAIN once writer.write() was invoked — a rejected write does not prove
+						// zero bytes reached the remote. Never resend this chunk on a fresh socket (that could
+						// duplicate or corrupt a non-idempotent stream); close and let the client re-dial. The only
+						// replay-safe fallback is BEFORE any application write (connectStreams' no-data retry gate
+						// + the ClientHello classifier), never here.
+						throw err;
 					}
 					已交付远端字节 = true;
 					try { 上行活动?.(); } catch (e) { }
@@ -3187,6 +3322,8 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 					settleCompletions(completions, err);
 					throw err;
 				} finally {
+					inFlightBytes -= item.chunk.byteLength;
+					if (inFlightBytes < 0) inFlightBytes = 0;
 					if (activeCompletions === completions) activeCompletions = null;
 				}
 			}
@@ -3209,9 +3346,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 		if (!chunk.byteLength) return true;
 		const nextBytes = queuedBytes + chunk.byteLength;
 		const nextItems = chunks.length - head + 1;
-		if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		const retainedBytes = nextBytes + inFlightBytes;
+		if (retainedBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
 			closed = true;
-			const err = Object.assign(new Error(`${名称}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+			const err = Object.assign(new Error(`${名称}: upload queue overflow (${retainedBytes}B/${nextItems})`), { isQueueOverflow: true });
 			clear(err);
 			log(`[${名称}] Queue limit exceeded; closing connection`);
 			try { 关闭连接?.(err) } catch (_) { }
@@ -3367,7 +3505,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
 	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
-	const 标记首字节 = () => { if (hasData) return; hasData = true; if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
+	const 标记首字节 = () => { if (hasData) return; hasData = true; if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; } if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env);
@@ -3411,16 +3549,33 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// two-way silence (a real blackhole/stall), never mid-upload.
 	const 记录上行活动 = () => {
 		if (管道已结束) return;
-		if (首字节计时器 && !hasData) { clearTimeout(首字节计时器); 首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs); }
-		重置空闲计时器();
+		// Before the first downlink byte, uplink activity re-arms the FIRST-BYTE watchdog (an upload with a
+		// still-silent downlink is not a blackhole). Only AFTER the first byte does uplink activity re-arm the
+		// IDLE watchdog. The idle timer must never arm pre-first-byte, or an IDLE_TIMEOUT_MS smaller than
+		// FIRST_BYTE_TIMEOUT_MS would fire before the first-byte deadline and cut the connection early.
+		if (hasData) {
+			重置空闲计时器();
+		} else if (首字节计时器) {
+			clearTimeout(首字节计时器);
+			首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs);
+		}
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
+
+	// A reconnect can install a DIFFERENT socket in the wrapper while this pipe is still draining its (now
+	// superseded) socket. Such a stale pipe must not forward bytes to — or close — the shared client, nor
+	// score route health; that all belongs to the pipe that owns the current socket. Reconnects only happen
+	// pre-first-byte (retry is refused once downlink data reached the client), so a stale pipe never has
+	// buffered output to lose. Socket identity is a safe generation proxy because connecttoPry installs the
+	// replacement BEFORE closing the old socket — there is no window where a superseded pipe still looks current.
+	const 仍为当前管道 = () => !(pipeMeta?.wrapper && pipeMeta.wrapper.socket && pipeMeta.wrapper.socket !== remoteSocket);
 
 	try {
 		if (!useBYOB) {
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
+				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
 				await 下行发送器.发送(value);
@@ -3431,6 +3586,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			while (true) {
 				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
 				if (done) break;
+				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
 				if (value.byteLength >= downlinkGrainBytes) {
@@ -3454,8 +3610,20 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		try { await reader.cancel() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
-	if (!hasData) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
-	if (!hasData && retryFunc && !首字节超时触发关闭) {
+	// A stale pipe (a reconnect installed a different socket) must not touch the shared client transport or
+	// route health — connecttoPry already closed its socket; just exit and let the current pipe own teardown.
+	if (!仍为当前管道()) { try { remoteSocket?.close?.() } catch (e) { } return; }
+	// A client that closed/cancelled before the first downlink byte is not a route failure — don't poison the
+	// direct-route cache (onNoData) and don't spend a ProxyIP fallback dial on a connection the client already
+	// abandoned. And if a later uplink chunk (beyond the replayable first packet) already reached the remote,
+	// a fallback can't reproduce that upstream state (connecttoPry replays only the first packet), so refuse
+	// the retry and let the client re-dial rather than hang with lost bytes.
+	const 客户端已关闭 = pipeMeta?.wrapper?.客户端已关闭 === true;
+	const 后续上行已送达 = pipeMeta?.wrapper?.已向远端发送数据 === true;
+	if (!hasData && !客户端已关闭) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
+	// 可重放首包 === false means the first packet carried non-idempotent data (not empty, not a lone TLS
+	// ClientHello) — replaying it on a fallback is unsafe, so close instead of retrying.
+	if (!hasData && retryFunc && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达 && pipeMeta?.可重放首包 !== false) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
@@ -3465,6 +3633,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			throw retryError;
 		}
 	}
+	if (!hasData) { try { remoteSocket?.close?.() } catch (e) { } }
 	if (readError) {
 		closeSocketQuietly(webSocket);
 		throw readError;
@@ -6301,8 +6470,9 @@ function readDohCache(cacheKey, now = Date.now()) {
 function writeDohCache(cacheKey, answers, now = Date.now()) {
 	const ttlValues = (answers || [])
 		.map(answer => Number(answer?.TTL))
-		.filter(ttl => Number.isFinite(ttl) && ttl > 0)
+		.filter(ttl => Number.isFinite(ttl) && ttl >= 0) // include TTL 0 so an all-0 answer isn't floored to 30s
 		.map(ttl => ttl * 1000);
+	if (ttlValues.length && Math.min(...ttlValues) <= 0) return; // RFC 1035: a TTL-0 answer must not be cached
 	const dnsTtlMs = ttlValues.length ? Math.min(...ttlValues) : DNS_RESULT_CACHE_MIN_TTL_MS;
 	const ttlMs = Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs));
 	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
@@ -8286,6 +8456,27 @@ function getIdleTimeoutMs(env) {
 	return Math.max(1000, Math.min(600000, Math.round(configured)));
 }
 
+// Optional stuck-writer watchdog for the uplink queue (ms). 0 = disabled (default). A remote writer.write()
+// that never settles (a wedged outbound socket) would otherwise block the upload path forever; when enabled,
+// a write exceeding this bound rejects and the connection is torn down so the client re-dials. Off by default
+// because writer.write() also blocks under legitimate backpressure (a slow-but-alive upload), which this
+// timeout cannot distinguish — enable it only if you actually observe wedged-upload freezes. Clamped [1s,2min].
+function getUplinkWriteTimeoutMs(env) {
+	const configured = Number(env?.UPLINK_WRITE_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return 0;
+	return Math.max(1000, Math.min(120000, Math.round(configured)));
+}
+
+// Opt-in gRPC duplex half-close (default OFF). When enabled, a NORMAL request-body EOF half-closes only the
+// UPSTREAM writable (sends FIN so the origin knows the upload finished) and keeps reading the downstream
+// response to completion, instead of closing the whole remote socket. This is the correct bidirectional gRPC
+// lifecycle, but it is off by default because xray "gun" keeps the stream open until teardown (so the current
+// full-close never truncates it), and this changes teardown on the primary transport. Enable it only if a
+// client half-closes its request stream mid-response (a response cut off right after an upload finishes).
+function isGrpcHalfCloseOnEof(env) {
+	return ['1', 'true', 'yes', 'on'].includes(String(env?.GRPC_HALF_CLOSE_ON_EOF || '').trim().toLowerCase());
+}
+
 function getDialStaggerMs(env) {
 	const configured = Number(env?.DIAL_STAGGER_MS);
 	if (!Number.isFinite(configured) || configured < 0) return DIAL_STAGGER_MS;
@@ -8780,6 +8971,8 @@ export const __testPerformanceHelpers = {
 	dnsAnswerMinTtlMs: 解析DNS应答最小TTL毫秒,
 	readXhttpFirstPacket: 读取XHTTP首包,
 	createUploadQueue: 创建上行写入队列,
+	getUplinkWriteTimeoutMs,
+	isReplayableTlsFirstPacket: 是可重放的TLS首包,
 	normalizeConfigHost,
 	splitConfigArray: 整理成数组,
 	base64SecretEncode,

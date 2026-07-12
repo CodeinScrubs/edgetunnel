@@ -2095,6 +2095,10 @@ function encodeGrpcDataFrame(payload) {
 }
 
 const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf field; cap adversarial ones
+// A single read chunk holds a handful of frames for real xray "gun" traffic (bulk data rides in few large
+// frames). Reject a pathological flood of tiny/empty 5-byte frames in one chunk — reachable BEFORE UUID auth
+// by a path-knowing peer — so the O(frames) unwrap loop can't burn the whole 10ms CPU budget as a cheap DoS.
+const GRPC_MAX_FRAMES_PER_CHUNK = 16384;
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
@@ -2151,7 +2155,9 @@ function parseGrpcFrameChunk(pending, chunk) {
 	}
 	const payloads = [];
 	let offset = 0;
+	let frameCount = 0;
 	while (merged.byteLength - offset >= 5) {
+		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
 		const frameHeader = merged.subarray(offset, offset + 5);
 		const grpcLen = readGrpcFrameLength(frameHeader);
 		const frameSize = 5 + grpcLen;
@@ -3076,6 +3082,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	let chunks = [];
 	let head = 0;
 	let queuedBytes = 0;
+	// Bytes handed to an in-flight remote write but not yet acknowledged. bundle() drops these from
+	// queuedBytes the moment it forms a write, yet the backing memory is still retained until write()
+	// resolves — so admission must count them too, or a slow remote lets retained memory reach ~2x the cap.
+	let inFlightBytes = 0;
 	let draining = false;
 	let closed = false;
 	let bundleBuffer = null;
@@ -3180,6 +3190,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				if (closed) break;
 				const item = bundle();
 				if (!item) break;
+				inFlightBytes += item.chunk.byteLength;
 				let writer = 获取写入器();
 				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 				const completions = item.completions || null;
@@ -3207,6 +3218,8 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 					settleCompletions(completions, err);
 					throw err;
 				} finally {
+					inFlightBytes -= item.chunk.byteLength;
+					if (inFlightBytes < 0) inFlightBytes = 0;
 					if (activeCompletions === completions) activeCompletions = null;
 				}
 			}
@@ -3229,9 +3242,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 		if (!chunk.byteLength) return true;
 		const nextBytes = queuedBytes + chunk.byteLength;
 		const nextItems = chunks.length - head + 1;
-		if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		const retainedBytes = nextBytes + inFlightBytes;
+		if (retainedBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
 			closed = true;
-			const err = Object.assign(new Error(`${名称}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+			const err = Object.assign(new Error(`${名称}: upload queue overflow (${retainedBytes}B/${nextItems})`), { isQueueOverflow: true });
 			clear(err);
 			log(`[${名称}] Queue limit exceeded; closing connection`);
 			try { 关闭连接?.(err) } catch (_) { }

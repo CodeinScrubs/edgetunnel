@@ -757,6 +757,45 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// In-flight write bytes count toward the queue cap. bundle() clears a chunk from queuedBytes the moment
+	// it forms a write, but the backing memory is still retained until writer.write() resolves — so a new
+	// chunk that would push retained bytes past UPLINK_QUEUE_MAX_BYTES must be rejected while the prior write
+	// is still pending, or a slow remote lets memory reach ~2x the cap.
+	const MAX = 16 * 1024 * 1024; // UPLINK_QUEUE_MAX_BYTES
+	let closed = false;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { return new Promise(() => { }); } }), // never resolves -> stays in-flight
+		释放写入器() { },
+		关闭连接() { closed = true; },
+		名称: 'in-flight accounting',
+	});
+	assert.equal(queue.写入(new Uint8Array(MAX)), true, 'a chunk at exactly the cap is admitted');
+	await new Promise(r => setTimeout(r, 20)); // drain picks it up; write() blocks -> inFlightBytes = MAX
+	assert.throws(() => queue.写入(new Uint8Array(1)), /upload queue overflow/, 'one more byte while a cap-sized write is in-flight overflows (in-flight bytes are counted)');
+	assert.equal(closed, true, 'the in-flight-accounted overflow closes the connection');
+}
+
+{
+	// inFlightBytes is released when a write settles: after a near-cap write completes, the queue admits
+	// another near-cap chunk — the accounting must not leak and cause a phantom overflow.
+	const MAX = 16 * 1024 * 1024; // UPLINK_QUEUE_MAX_BYTES
+	let releaseWrite = null, closed = false;
+	const queue = createUploadQueue({
+		获取写入器: () => ({ write() { return new Promise(r => { releaseWrite = r; }); } }),
+		释放写入器() { },
+		关闭连接() { closed = true; },
+		名称: 'in-flight release',
+	});
+	queue.写入(new Uint8Array(MAX - 1));
+	await new Promise(r => setTimeout(r, 20)); // in-flight -> inFlightBytes = MAX - 1
+	releaseWrite(); // settles -> inFlightBytes back to 0
+	await queue.等待空();
+	assert.doesNotThrow(() => queue.写入(new Uint8Array(MAX - 1)), 'after the in-flight write settles, a fresh near-cap chunk is admitted (no accounting leak)');
+	assert.equal(closed, false, 'no phantom overflow after the prior write drained');
+	try { releaseWrite?.(); } catch (e) { }
+}
+
+{
 	assert.equal(getDialStaggerMs({}), 90);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '0' }), 0);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '37.6' }), 38);
@@ -1471,6 +1510,16 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// protobuf field-1 tag 0x0a, varint length, then the payload.
 	assert.deepEqual([...encodeGrpcDataFrame(new Uint8Array([0xaa, 0xbb]))], [0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, 0xaa, 0xbb], 'encodeGrpcDataFrame emits the exact expected frame bytes');
 	assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), encodeGrpcDataFrame(new Uint8Array([1, 2, 3, 4, 5]))).payloads.map(p => [...p]), [[1, 2, 3, 4, 5]], 'encode/parse round-trips the payload');
+	{
+		// Per-chunk frame cap (pre-auth CPU-DoS guard): a single read chunk stuffed with a huge number of
+		// empty 5-byte frames must be rejected before the O(frames) unwrap loop can burn the CPU budget. Real
+		// xray "gun" traffic carries a handful of frames per chunk (bulk data rides in few large frames).
+		const flood = new Uint8Array((16384 + 1) * 5); // 16385 empty frames -> one past GRPC_MAX_FRAMES_PER_CHUNK
+		assert.throws(() => parseGrpcFrameChunk(new Uint8Array(0), flood), /too many frames/, 'a chunk exceeding the per-chunk frame cap is rejected');
+		// A large-but-legal count of empty frames still parses (cap is generous, never bites real traffic).
+		const okay = new Uint8Array(1024 * 5); // 1024 empty frames -> well under the cap
+		assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), okay).payloads, [], '1024 empty frames parse to no payloads without tripping the cap');
+	}
 }
 
 {
