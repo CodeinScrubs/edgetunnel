@@ -79,6 +79,8 @@ const {
 	updateTraceRatePeaks,
 	formatByteCount,
 	getUplinkWriteTimeoutMs,
+	getDirectFirstByteTimeoutMs,
+	getProxyFirstByteTimeoutMs,
 	isReplayableTlsFirstPacket,
 	normalizeConfigHost,
 	splitConfigArray,
@@ -696,6 +698,19 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Split first-byte timeouts: both default OFF; a shared FIRST_BYTE_TIMEOUT_MS sets both; per-route vars
+	// override; values clamp to [1s, 15s].
+	assert.equal(getDirectFirstByteTimeoutMs({}), 0, 'direct first-byte timeout defaults off');
+	assert.equal(getProxyFirstByteTimeoutMs({}), 0, 'proxy first-byte timeout defaults off');
+	assert.equal(getDirectFirstByteTimeoutMs({ FIRST_BYTE_TIMEOUT_MS: '4000' }), 4000, 'shared value applies to direct');
+	assert.equal(getProxyFirstByteTimeoutMs({ FIRST_BYTE_TIMEOUT_MS: '4000' }), 4000, 'shared value applies to proxy');
+	assert.equal(getDirectFirstByteTimeoutMs({ FIRST_BYTE_TIMEOUT_MS: '4000', DIRECT_FIRST_BYTE_TIMEOUT_MS: '3000' }), 3000, 'per-route var overrides the shared one');
+	assert.equal(getProxyFirstByteTimeoutMs({ FIRST_BYTE_TIMEOUT_MS: '4000', PROXY_FIRST_BYTE_TIMEOUT_MS: '5000' }), 5000, 'per-route proxy override');
+	assert.equal(getDirectFirstByteTimeoutMs({ DIRECT_FIRST_BYTE_TIMEOUT_MS: '200' }), 1000, 'clamped up to the 1s floor');
+	assert.equal(getProxyFirstByteTimeoutMs({ PROXY_FIRST_BYTE_TIMEOUT_MS: '99999' }), 15000, 'clamped down to the 15s cap');
+}
+
+{
 	// Opt-in stuck-writer watchdog: a writer.write() that never settles tears the connection down within the
 	// bound (no 重试连接 provided -> the failed write closes the connection) instead of blocking forever.
 	let closed = false;
@@ -1303,9 +1318,11 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		},
 	};
 
+	// 请求已发送: true = the client sent a request (e.g. ClientHello); a first-byte timeout is then a real
+	// blackhole and must fall over. (A no-request preconnect would NOT retry — covered by a separate test.)
 	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, async () => {
 		events.push('retry-start');
-	}, 10), 250, 'first-byte fallback closes stale remote socket');
+	}, 10, { wrapper: { 请求已发送: true } }), 250, 'first-byte fallback closes stale remote socket');
 
 	assert.equal(events.includes('remote-close'), true, 'first-byte fallback should close the stale direct socket');
 	assert.equal(events.includes('retry-start'), true, 'first-byte fallback should still run the retry callback');
@@ -1349,12 +1366,30 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		}),
 	};
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, null, 30, { onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, null, 30, { wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }),
 		250, 'proxy-path first-byte timeout closes a blackholed relay',
 	);
 	assert.equal(cancelled, true, 'first-byte timeout cancels the read even without a retryFunc (proxy path)');
 	assert.equal(events.includes('no-data'), true, 'blackholed proxy relay fires onNoData for endpoint health scoring');
 	assert.equal(events.includes('client-close'), true, 'blackholed proxy relay closes the client so it re-dials');
+}
+
+{
+	// No-request PRECONNECT: the client opened the tunnel + sent the target header but never sent a request
+	// (请求已发送 stays false). When the remote cleanly closes with no data, this must NOT poison the direct
+	// route (onNoData) nor spend a ProxyIP fallback — a preconnect is not a blackhole. (Live capture showed
+	// these idle-closing at 30–43s and mis-triggering fallbacks that pushed real loads onto the slow proxy.)
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }), close() { events.push('remote-close'); } };
+	const wrapper = {}; // 请求已发送 is falsy -> a no-request preconnect
+	await withTestTimeout(
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0, { wrapper, onNoData: () => events.push('no-data') }),
+		250, 'no-request preconnect closes without poisoning the route',
+	);
+	assert.equal(events.includes('no-data'), false, 'a no-request preconnect must NOT fire onNoData (no direct-route cache poison)');
+	assert.equal(events.includes('retry'), false, 'a no-request preconnect must NOT fall back to ProxyIP');
+	assert.equal(wrapper.closeHint, 'no_request_idle', 'a no-request clean close is classified no_request_idle');
 }
 
 {
@@ -1386,7 +1421,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { events.push('client-close'); this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }) };
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
 		250, 'close-only first-byte timeout for a data-carrying first packet',
 	);
 	assert.equal(cancelled, true, 'first-byte timeout cancels the blackholed read');
@@ -1401,7 +1436,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
 		250, 'close-only mode still falls back on a socket close',
 	);
 	assert.equal(events.includes('retry'), true, 'a socket close (not a timeout) still falls back to ProxyIP even in close-only mode');
@@ -1494,7 +1529,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: {}, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }),
 		250, 'no-data pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a genuine remote no-data close records the direct-route failure');
@@ -1510,7 +1545,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: { 已向远端发送数据: true }, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 已向远端发送数据: true, 请求已发送: true }, onNoData: () => events.push('no-data') }),
 		250, 'later-uplink pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a blackhole after a later uplink write still records the direct-route failure');
@@ -1536,7 +1571,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: {}, 可重放首包: false, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 请求已发送: true }, 可重放首包: false, onNoData: () => events.push('no-data') }),
 		250, 'non-replayable pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a non-replayable first packet still records the direct-route failure');
