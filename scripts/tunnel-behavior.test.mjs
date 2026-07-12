@@ -1467,6 +1467,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// An overlong (6-byte) protobuf varint length must be rejected, not silently mis-parsed by a 32-bit
 	// wrapping shift (`<< 35` == `<< 3`).
 	assert.throws(() => unwrapGrpcMessagePayloads(new Uint8Array([0x0a, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00])), /exceeds uint32|too long/, 'an overlong protobuf varint length is rejected');
+	// Single-allocation encoder must emit the exact gRPC wire format: 5-byte length-prefixed header,
+	// protobuf field-1 tag 0x0a, varint length, then the payload.
+	assert.deepEqual([...encodeGrpcDataFrame(new Uint8Array([0xaa, 0xbb]))], [0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, 0xaa, 0xbb], 'encodeGrpcDataFrame emits the exact expected frame bytes');
+	assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), encodeGrpcDataFrame(new Uint8Array([1, 2, 3, 4, 5]))).payloads.map(p => [...p]), [[1, 2, 3, 4, 5]], 'encode/parse round-trips the payload');
 }
 
 {

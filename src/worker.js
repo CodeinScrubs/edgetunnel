@@ -2075,25 +2075,22 @@ function readGrpcVarint(data, offset = 0) {
 	throw new Error('Invalid gRPC protobuf wrapper: varint length too long');
 }
 
-function encodeGrpcMessagePayload(payload) {
+// Single-allocation gRPC downlink frame: write the header + protobuf field + payload into ONE buffer.
+// Byte-identical to the old two-step (encodeGrpcMessagePayload then copy into the frame) but saves the
+// intermediate message allocation + a second copy of the payload on every downstream frame.
+function encodeGrpcDataFrame(payload) {
 	const chunk = 数据转Uint8Array(payload);
 	const lenBytes = encodeGrpcVarint(chunk.byteLength);
-	const message = new Uint8Array(1 + lenBytes.byteLength + chunk.byteLength);
-	message[0] = 0x0a;
-	message.set(lenBytes, 1);
-	message.set(chunk, 1 + lenBytes.byteLength);
-	return message;
-}
-
-function encodeGrpcDataFrame(payload) {
-	const message = encodeGrpcMessagePayload(payload);
-	const frame = new Uint8Array(5 + message.byteLength);
+	const messageLength = 1 + lenBytes.byteLength + chunk.byteLength;
+	const frame = new Uint8Array(5 + messageLength);
 	frame[0] = 0;
-	frame[1] = (message.byteLength >>> 24) & 0xff;
-	frame[2] = (message.byteLength >>> 16) & 0xff;
-	frame[3] = (message.byteLength >>> 8) & 0xff;
-	frame[4] = message.byteLength & 0xff;
-	frame.set(message, 5);
+	frame[1] = (messageLength >>> 24) & 0xff;
+	frame[2] = (messageLength >>> 16) & 0xff;
+	frame[3] = (messageLength >>> 8) & 0xff;
+	frame[4] = messageLength & 0xff;
+	frame[5] = 0x0a;
+	frame.set(lenBytes, 6);
+	frame.set(chunk, 6 + lenBytes.byteLength);
 	return frame;
 }
 
