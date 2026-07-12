@@ -74,6 +74,8 @@ const {
 	traceDownlink,
 	traceFirstByte,
 	traceClose,
+	classifyClose,
+	isStreamCancellation,
 	formatByteCount,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket,
@@ -824,6 +826,24 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// Close classification (the P0 telemetry fix): a normal gRPC stream cancellation must NOT be recorded as a
+	// tunnel error. The prior tracer fired 追踪关闭(...,'error') unconditionally, so all 40 "Stream was cancelled"
+	// closes in the captured log were mislabeled reason=error, making the error rate meaningless.
+	assert.equal(isStreamCancellation(new Error('Stream was cancelled.')), true, '"Stream was cancelled." is a cancellation');
+	assert.equal(isStreamCancellation(new Error('The ReadableStream was canceled.')), true);
+	assert.equal(isStreamCancellation(Object.assign(new Error('x'), { name: 'AbortError' })), true, 'AbortError is a cancellation');
+	assert.equal(isStreamCancellation(new Error('connection reset')), false, 'a real error is not a cancellation');
+	assert.equal(isStreamCancellation(null), false);
+	// classifyClose maps context -> {reason, expected}. A cancellation is EXPECTED (not an error).
+	assert.deepEqual(classifyClose({}, new Error('Stream was cancelled.')), { reason: 'runtime_cancel', expected: true }, 'a stream cancel classifies as expected runtime_cancel, not error');
+	assert.deepEqual(classifyClose({ 客户端已关闭: true }, new Error('boom')), { reason: 'client_cancel', expected: true }, 'a client-closed connection classifies as expected client_cancel');
+	assert.deepEqual(classifyClose({ closeHint: 'remote_eof' }, null), { reason: 'remote_eof', expected: true }, 'an explicit close hint wins');
+	assert.deepEqual(classifyClose({}, Object.assign(new Error('overflow'), { isQueueOverflow: true })), { reason: 'queue_overflow', expected: false }, 'a queue overflow is a real (unexpected) close');
+	assert.deepEqual(classifyClose({}, new Error('connection reset by peer')), { reason: 'error', expected: false }, 'a genuine error stays reason=error/unexpected');
+	assert.deepEqual(classifyClose({}, null), { reason: 'eof', expected: true }, 'a clean end with no error is eof/expected');
+}
+
+{
 	assert.equal(getDialStaggerMs({}), 90);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '0' }), 0);
 	assert.equal(getDialStaggerMs({ DIAL_STAGGER_MS: '37.6' }), 38);
@@ -1539,14 +1559,18 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual([...encodeGrpcDataFrame(new Uint8Array([0xaa, 0xbb]))], [0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, 0xaa, 0xbb], 'encodeGrpcDataFrame emits the exact expected frame bytes');
 	assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), encodeGrpcDataFrame(new Uint8Array([1, 2, 3, 4, 5]))).payloads.map(p => [...p]), [[1, 2, 3, 4, 5]], 'encode/parse round-trips the payload');
 	{
-		// Per-chunk frame cap (pre-auth CPU-DoS guard): a single read chunk stuffed with a huge number of
-		// empty 5-byte frames must be rejected before the O(frames) unwrap loop can burn the CPU budget. Real
-		// xray "gun" traffic carries a handful of frames per chunk (bulk data rides in few large frames).
-		const flood = new Uint8Array((16384 + 1) * 5); // 16385 empty frames -> one past GRPC_MAX_FRAMES_PER_CHUNK
-		assert.throws(() => parseGrpcFrameChunk(new Uint8Array(0), flood), /too many frames/, 'a chunk exceeding the per-chunk frame cap is rejected');
-		// A large-but-legal count of empty frames still parses (cap is generous, never bites real traffic).
-		const okay = new Uint8Array(1024 * 5); // 1024 empty frames -> well under the cap
-		assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), okay).payloads, [], '1024 empty frames parse to no payloads without tripping the cap');
+		// Per-chunk frame caps (pre-auth CPU-DoS guards). Real xray "gun" traffic carries a handful of frames
+		// per chunk (bulk data rides in few large frames), so both caps are far above legitimate use.
+		// (a) empty (zero-payload) 5-byte frames — the cheapest flood — are capped tight.
+		const emptyFlood = new Uint8Array(65 * 5); // 65 all-zero frames -> one past GRPC_MAX_EMPTY_FRAMES_PER_CHUNK (64)
+		assert.throws(() => parseGrpcFrameChunk(new Uint8Array(0), emptyFlood), /too many empty frames/, 'an empty-frame flood is rejected');
+		const emptyOk = new Uint8Array(64 * 5); // exactly at the empty cap
+		assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), emptyOk).payloads, [], '64 empty frames (at the cap) still parse to no payloads');
+		// (b) total frames per chunk (incl. tiny non-empty ones) are capped (4096).
+		const one = encodeGrpcDataFrame(new Uint8Array([7])); // one valid single-field frame
+		const many = new Uint8Array(one.byteLength * 4097);
+		for (let i = 0; i < 4097; i++) many.set(one, i * one.byteLength);
+		assert.throws(() => parseGrpcFrameChunk(new Uint8Array(0), many), /too many frames/, 'a chunk exceeding the total per-chunk frame cap is rejected');
 	}
 }
 

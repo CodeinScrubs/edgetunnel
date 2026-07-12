@@ -131,28 +131,35 @@ from a Worker (Error 1034) and use a relay called a **ProxyIP**.
 | **`ENABLE_KV_LOG`** (alias `KV_LOG`) | off | Logs requests to KV (visible in the admin "operation log"). | Turn on briefly to inspect usage, then off (it consumes KV writes). `OFF_LOG=1` force-disables. |
 | **`LOG_TTL_DAYS`** / **`LOG_TTL_SECONDS`** | 7 days | How long log entries live. | Lower to save KV. |
 | **`LOG_READ_LIMIT`** | 500 (max 1000) | Max log rows the panel reads at once. | Cosmetic. |
-| **`DEBUG`** | off | Verbose routing logs **plus structured per-connection telemetry** (`[conn <id>]` lines) for every tunnel connection, visible via `npx wrangler tail`. See below. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
+| **`DEBUG`** | off | Verbose routing logs **plus structured JSON per-connection telemetry** (one object per event) for every tunnel connection, visible via `npx wrangler tail`. See below. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
+| **`DEBUG_STAT_INTERVAL_MS`** | 15000 | Heartbeat (`stat`) interval, clamped 5 s–5 min. Raise it (e.g. 30000) if hundreds of connections make the tail too noisy. | Leave default for a single user. |
 
 ### Reading the DEBUG connection telemetry
 
-With `DEBUG=1`, every tunnel connection (gRPC / WS / XHTTP) emits a compact, greppable trace you (or an AI) can analyze to find slow dials, bad routes, blackholes, stalls, and throughput ceilings. Each line is prefixed `[conn <id>]` (a short per-connection id) with an UPPERCASE event verb:
+With `DEBUG=1`, every tunnel connection (gRPC / WS / XHTTP) emits **structured JSON objects** — one per event — so an AI (or `jq`) can parse them without guessing units. Every event carries `ev` (event name), `conn` (a globally-unique id from CF-Ray), `t` (epoch ms) and `tr` (transport). All byte fields are **raw integers**; all rates are **bytes/second** (`*_bps`).
 
-| Event | Meaning | Key fields |
+| `ev` | When | Key fields |
 |---|---|---|
-| `OPEN` | connection accepted | `transport` (grpc/ws/xhttp), `ip`, `colo` |
-| `ROUTE` | which upstream route was chosen | `direct` \| `proxyip` \| `socks5`/`http`/… , `dialMs` (connect latency), `target` |
-| `FIRST-BYTE` | remote returned its first byte | `ttfb=<ms>` (time-to-first-byte from OPEN) — the single best "instant-feel" metric |
-| `STAT` | heartbeat every 15 s while open | `up`/`down` bytes+chunks, `rate` (current down/s), `retries` — **surfaces a long-lived gRPC "gun" connection even if `wrangler tail` attached after it started** |
-| `RETRY` | a fallback/re-dial happened | folded into `ROUTE` (a route change bumps `retries`) |
-| `CLOSE` | connection ended | `reason` (eof / error / client-cancel / client-close), `durMs`, `avg_down` (avg throughput), final byte totals |
+| `open` | connection accepted | `colo`, `country`, `asn`, `proto` (HTTP/2 etc.), `rtt_ms` (client↔Cloudflare RTT), `edge_bps` (edge delivery rate), `ip` |
+| `route` | upstream route chosen | `route` (`direct`/`proxyip`/…), `endpoint` (winning ProxyIP), `dial_ms`, `target`, `port` |
+| `dial_fail` | a dial attempt failed | `route`, `ms`, `err` |
+| `fallback` | direct→ProxyIP (or re-dial) | `from`, `to`, `n` (fallback count) |
+| `first_byte` | remote's first byte | `ttfb_ms` (open→first-byte — the best "instant-feel" metric), `route` |
+| `stat` | heartbeat while open | `up_b`/`down_b` (bytes), `up_bps`/`down_bps` (this interval), `peak_down_bps`, `fallbacks` — **surfaces a long-lived gRPC "gun" connection even if the tail attached mid-stream** |
+| `dns` | a tunneled DNS query resolved | `up_b`, `down_b`, `resolver` (`doh`/`tcp`), `latency_ms` |
+| `close` | connection ended | `reason` + **`expected`** (see below), `dur_ms`, `route`, `ttfb_ms`, `up_b`/`down_b`, `life_down_bps` (lifetime avg), `active_down_bps` (avg over active transfer only), `peak_down_bps`, `dial_attempts`/`dial_failures`/`fallbacks`, and `q_max_*` upload-queue high-water marks |
+
+**`reason`/`expected` — the important fix:** a normal browser/gRPC cancellation ("Stream was cancelled.") is now `reason:"runtime_cancel", expected:true`, **not** an error. Only count a close as a genuine failure when `expected:false` (e.g. `reason:"error"`, `queue_overflow`). The previous build mislabeled every cancellation as `error`, making the error rate meaningless.
 
 **How to capture a good trace (important — this is why an earlier attempt showed nothing):**
 
-1. Set `DEBUG=1`, then **start `npx wrangler tail <worker-name>` FIRST** and leave it running.
-2. **Reconnect the client** (toggle the VPN off→on in v2rayN/xray). A gRPC "gun" connection is one long-lived POST — if the tail attaches *after* the client is already connected, the `OPEN`/`ROUTE`/`FIRST-BYTE` lines already fired and you'll only see the 15 s `STAT` heartbeats (or nothing until the next connection). Reconnecting forces a fresh invocation the tail can see from the start.
-3. Browse/stream for a minute so `STAT` heartbeats and `CLOSE` summaries accumulate, then turn `DEBUG` back off.
+1. Set `DEBUG=1`, then **start `npx wrangler tail <worker-name> --format json > tail.jsonl` FIRST** and leave it running (JSON capture is far easier to analyze than pretty terminal output).
+2. **Reconnect the client** (toggle the VPN off→on in v2rayN/xray). A gRPC "gun" connection is one long-lived POST — if the tail attaches *after* the client is already connected, the `open`/`route`/`first_byte` events already fired and you'll only see `stat` heartbeats. Reconnecting forces a fresh invocation the tail sees from the start.
+3. Browse/stream for a minute so `stat` heartbeats and `close` summaries accumulate, then turn `DEBUG` back off.
 
-**What the numbers tell you:** high `ttfb` or `dialMs` → slow dial (try a different `PROXYIP`, or `DIAL_STAGGER_MS`); lots of `direct→proxyip` `ROUTE` changes / `retries` → direct route is being censored (expected in Iran; ProxyIP is doing its job); `CLOSE reason=error` bursts → resets worth investigating; low `avg_down` on big downloads → a throughput knob to tune (`DOWNLINK_BACKPRESSURE_HWM_BYTES`, `DOWNLINK_GRAIN_PACKET_BYTES`). Paste a batch of these lines to an AI and it can reason about concrete tuning changes.
+**What the numbers tell you:** high `ttfb_ms`/`dial_ms` with low `rtt_ms` → slow *upstream* dial (try a different `PROXYIP`); high `rtt_ms` → the client↔Cloudflare leg is the bottleneck, not the Worker; many `fallback` events → direct is being censored (expected in Iran — ProxyIP is doing its job); `close` with `expected:false` → real resets worth investigating; low `active_down_bps` on big downloads → a throughput knob to tune; non-zero `q_max_*` near the caps → the upload queue is the limiter. Paste a batch of these JSON lines to an AI and it can reason about concrete tuning changes.
+
+**Privacy note:** these logs contain your client IP and every destination host/IP. They're your own single-user traffic, but if you paste them to an external AI, be aware you're sharing your browsing destinations.
 
 ---
 

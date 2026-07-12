@@ -751,7 +751,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 	}
 
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-	remoteConnWrapper.追踪 = 创建连接追踪器('xhttp', request);
+	remoteConnWrapper.追踪 = 创建连接追踪器('xhttp', request, getWorkerRequestContext(request)?.env);
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	const responseHeaders = new Headers({
@@ -850,6 +850,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				名称: 'XHTTP upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
+			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
 			const 写入远端 = async (payload, allowRetry = true) => {
 				return 上行写入队列.写入并等待(payload, allowRetry);
@@ -859,7 +860,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				if (首包.isUDP) {
 					if (首包.rawData?.byteLength) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文);
+						else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 						udpRespHeader = null;
 					}
 				} else {
@@ -872,7 +873,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					if (!value || value.byteLength === 0) continue;
 					if (首包.isUDP) {
 						if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request);
-						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文);
+						else await forwardataudp(value, xhttpBridge, udpRespHeader, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 						udpRespHeader = null;
 					} else {
 						if (!(await 写入远端(value))) throw new Error('Remote socket is not ready');
@@ -887,22 +888,22 @@ async function 处理XHTTP请求(request, yourUUID) {
 					}
 				}
 			} catch (err) {
-				log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
-				追踪关闭(remoteConnWrapper.追踪, 'error');
+				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
 				try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
-				追踪关闭(remoteConnWrapper.追踪, 'eof');
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
 				释放远端写入器();
 				释放下行背压();
 				try { reader.releaseLock() } catch (e) { }
 			}
-			})().catch(err => { log(`[XHTTP tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
+			})().catch(err => { if (!是流取消错误(err)) log(`[XHTTP tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;
-			追踪关闭(remoteConnWrapper.追踪, 'client-cancel');
+			追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
@@ -1084,7 +1085,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-	remoteConnWrapper.追踪 = 创建连接追踪器('grpc', request);
+	remoteConnWrapper.追踪 = 创建连接追踪器('grpc', request, getWorkerRequestContext(request)?.env);
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1242,6 +1243,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				名称: 'gRPC upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
+			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
 			const 写入远端 = async (payload, allowRetry = true) => {
 				return 上行写入队列.写入并等待(payload, allowRetry);
@@ -1260,7 +1262,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-							else await forwardataudp(payload, grpcBridge, null, request, null, 魏烈思UDP上下文);
+							else await forwardataudp(payload, grpcBridge, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 							continue;
 						}
 						if (remoteConnWrapper.socket) {
@@ -1300,7 +1302,7 @@ async function 处理gRPC请求(request, yourUUID) {
 								const rawData = rawClientData;
 								if (isDnsQuery) {
 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request, null, 魏烈思UDP上下文);
+									else await forwardataudp(rawData, grpcBridge, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 								}
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
@@ -1331,19 +1333,21 @@ async function 处理gRPC请求(request, yourUUID) {
 					if (半关闭Pipe) { try { await 半关闭Pipe } catch (e) { } }
 				}
 			} catch (err) {
-				log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
-				追踪关闭(remoteConnWrapper.追踪, 'error');
+				// A client-initiated stream cancellation ("Stream was cancelled.") is a normal gRPC lifecycle
+				// event, not a tunnel failure — don't log it at error level or record it as reason=error.
+				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
 			} finally {
-				追踪关闭(remoteConnWrapper.追踪, 'eof');
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
 				释放远端写入器();
 				关闭连接();
 			}
-			})().catch(err => { log(`[gRPC tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
+			})().catch(err => { if (!是流取消错误(err)) log(`[gRPC tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;
-			追踪关闭(remoteConnWrapper.追踪, 'client-cancel');
+			追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 			释放下行背压();
 			GRPC上行写入队列?.清空();
 			if (远端写入器) {
@@ -1410,7 +1414,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
 	catch (_) { serverSock.accept() }
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-	remoteConnWrapper.追踪 = 创建连接追踪器('ws', request);
+	remoteConnWrapper.追踪 = 创建连接追踪器('ws', request, getWorkerRequestContext(request)?.env);
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1456,6 +1460,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		名称: 'WS upload',
 		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
+	if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
 	const 写入远端 = async (chunk, allowRetry = true) => {
 		return 上行写入队列.写入并等待(chunk, allowRetry);
@@ -1724,7 +1729,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (判断协议类型 === null && !isDnsQuery && 有效数据长度(chunk) === 0) return;
 		if (isDnsQuery) {
 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-			return await forwardataudp(chunk, serverSock, null, request, null, 魏烈思UDP上下文);
+			return await forwardataudp(chunk, serverSock, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 		}
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
@@ -1778,7 +1783,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			const rawData = rawClientData;
 			if (isDnsQuery) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-				return forwardataudp(rawData, serverSock, respHeader, request, null, 魏烈思UDP上下文);
+				return forwardataudp(rawData, serverSock, respHeader, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
 			}
 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request);
 		}
@@ -1848,7 +1853,8 @@ async function 处理WS请求(request, yourUUID, url) {
 		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
 		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
 		remoteConnWrapper.客户端已关闭 = true;
-		追踪关闭(remoteConnWrapper.追踪, 'client-close');
+		remoteConnWrapper.closeHint = 'client_close';
+		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 		closeSocketQuietly(serverSock);
 		// Close the outbound remote socket too, so a client disconnect while the remote is silent
 		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
@@ -1859,7 +1865,8 @@ async function 处理WS请求(request, yourUUID, url) {
 		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
 		// doesn't score the route as failed or spend a ProxyIP fallback dial on an already-dead client.
 		remoteConnWrapper.客户端已关闭 = true;
-		追踪关闭(remoteConnWrapper.追踪, 'error');
+		remoteConnWrapper.closeHint = 'client_ws_error';
+		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err?.error || err);
 		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		处理WS显式传输错误(err);
 	});
@@ -2109,7 +2116,10 @@ const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf 
 // A single read chunk holds a handful of frames for real xray "gun" traffic (bulk data rides in few large
 // frames). Reject a pathological flood of tiny/empty 5-byte frames in one chunk — reachable BEFORE UUID auth
 // by a path-knowing peer — so the O(frames) unwrap loop can't burn the whole 10ms CPU budget as a cheap DoS.
-const GRPC_MAX_FRAMES_PER_CHUNK = 16384;
+const GRPC_MAX_FRAMES_PER_CHUNK = 4096;
+// Empty (zero-payload) 5-byte frames carry no tunnel data and are the cheapest flood to generate, so cap them
+// far tighter than total frames. Real xray "gun" traffic sends essentially none in a chunk.
+const GRPC_MAX_EMPTY_FRAMES_PER_CHUNK = 64;
 function readGrpcFrameLength(frameHeader) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
@@ -2166,13 +2176,14 @@ function parseGrpcFrameChunk(pending, chunk) {
 	}
 	const payloads = [];
 	let offset = 0;
-	let frameCount = 0;
+	let frameCount = 0, emptyFrameCount = 0;
 	while (merged.byteLength - offset >= 5) {
 		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
 		const frameHeader = merged.subarray(offset, offset + 5);
 		const grpcLen = readGrpcFrameLength(frameHeader);
 		const frameSize = 5 + grpcLen;
 		if (merged.byteLength - offset < frameSize) break;
+		if (grpcLen === 0 && ++emptyFrameCount > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many empty frames');
 		const grpcPayload = merged.subarray(offset + 5, offset + frameSize);
 		if (grpcPayload.byteLength) payloads.push(...unwrapGrpcMessagePayloads(grpcPayload));
 		offset += frameSize;
@@ -2472,8 +2483,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function 写入首包(remoteSock, data) {
 		if (有效数据长度(data) <= 0) return;
+		const bytes = 数据转Uint8Array(data);
 		const writer = remoteSock.writable.getWriter();
-		try { await writer.write(数据转Uint8Array(data)) }
+		try { await writer.write(bytes); 追踪初始写入(remoteConnWrapper?.追踪, bytes.byteLength); }
 		finally { try { writer.releaseLock() } catch (e) { } }
 	}
 
@@ -2558,6 +2570,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
 					remoteConnWrapper.反代无数据回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
+					if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.endpoint = `${candidate.hostname}:${candidate.port}`; // correlate the winning endpoint to this connection's route event
 					setProxyEndpointCursor(proxyIP, host, candidate.index, 所有反代数组.length);
 					return socket;
 				} catch (err) {
@@ -2590,6 +2603,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		const 本次首包数据 = 本次发送首包 ? rawData : null;
 
 		const 当前连接任务 = (async () => {
+			追踪拨号尝试(remoteConnWrapper.追踪);
 			remoteConnWrapper.反代首字节回调 = null;
 			remoteConnWrapper.反代无数据回调 = null;
 			let newSocket;
@@ -2702,6 +2716,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	} else {
 		try {
 			log(`[TCP forwarding] Trying direct connection to: ${host}:${portNum}`);
+			追踪拨号尝试(remoteConnWrapper.追踪);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
 			追踪记录路由(remoteConnWrapper.追踪, 'direct', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
@@ -2715,12 +2730,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			remoteConnWrapper.pipePromise = pipeRemoteToClient(initialSocket, ws, respHeader,
 				async () => {
 					if (remoteConnWrapper.socket !== initialSocket) return;
+					追踪回退(remoteConnWrapper.追踪, 'direct', proxyType || 'proxyip'); // direct connected then blackholed → ProxyIP
 					await connecttoPry();
 				},
 				配置首字节超时毫秒,
 				{ env, wrapper: remoteConnWrapper, 首字节超时仅关闭: !可重放首包, 可重放首包: 可重放首包, onFirstByte: () => recordDirectRouteOk(直连路由键), onNoData: () => { if (remoteConnWrapper.socket === initialSocket) recordDirectRouteFailure(直连路由键); } });
 		} catch (err) {
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
+			追踪拨号失败(remoteConnWrapper.追踪, 'direct', 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null, err);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
 				closeSocketQuietly(ws);
 				throw err;
@@ -2731,6 +2748,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// re-send non-idempotent data, so only fall back when the first packet is empty or a standalone
 			// ClientHello; otherwise close and let the client re-dial. (Unchanged for the common ClientHello case.)
 			if (!可重放首包) { closeSocketQuietly(ws); throw err; }
+			追踪回退(remoteConnWrapper.追踪, 'direct', proxyType || 'proxyip'); // direct dial/first-write failed → ProxyIP
 			await connecttoPry();
 		}
 	}
@@ -2980,7 +2998,7 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 	}
 }
 
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null) {
+async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
 	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
 	// messages / stream reads lost its tail and the next chunk's leading bytes were misread as a new
@@ -2996,6 +3014,8 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		requestData = requestData.subarray(0, consumedBytes); // forward only complete frames; the tail waits in 缓存 (never write a partial frame to the DNS-over-TCP fallback)
 	}
 	const requestBytes = requestData.byteLength;
+	const dnsStart = 追踪 ? Date.now() : 0;
+	let dnsResolver = null;
 	try {
 		const { env } = getWorkerRequestContext(request);
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
@@ -3008,20 +3028,21 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		const 隧道DNS优先TCP = ['1', 'true'].includes(String(env?.DNS_TUNNEL_TCP_FIRST || '').toLowerCase());
 		if (隧道DNS优先TCP) {
 			try {
-				rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
 			} catch (tcpError) {
 				log(`[UDP forwarding] DNS-over-TCP failed (${tcpError?.message || tcpError}); falling back to DoH`);
-				rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
 			}
 		} else {
 			try {
-				rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
 			} catch (dohError) {
 				log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
-				rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
 			}
 		}
 		if (!rawResponse || !rawResponse.byteLength) return;
+		追踪DNS(追踪, requestBytes, rawResponse.byteLength, { resolver: dnsResolver, latency_ms: dnsStart ? Date.now() - dnsStart : null });
 		log(`[UDP forwarding] DNS response: ${rawResponse.byteLength}B`);
 		const wrappedResult = 响应封装器 ? await 响应封装器(rawResponse) : rawResponse;
 		const fragments = Array.isArray(wrappedResult) ? wrappedResult : [wrappedResult];
@@ -3101,6 +3122,9 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	// queuedBytes the moment it forms a write, yet the backing memory is still retained until write()
 	// resolves — so admission must count them too, or a slow remote lets retained memory reach ~2x the cap.
 	let inFlightBytes = 0;
+	// DEBUG-only high-water marks surfaced in the connection's close event — lets an AI see whether the
+	// upload queue / write latency is a bottleneck before anyone tunes UPLINK_QUEUE_MAX_BYTES / bundle size.
+	const 统计 = 调试日志打印 ? { maxQueuedBytes: 0, maxInFlightBytes: 0, maxItems: 0, maxWriteMs: 0, overflowCount: 0 } : null;
 	let draining = false;
 	let closed = false;
 	let bundleBuffer = null;
@@ -3207,6 +3231,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				if (!item) break;
 				inFlightBytes += item.chunk.byteLength;
 				if (统计上行) 统计上行(item.chunk.byteLength);
+				if (统计 && inFlightBytes > 统计.maxInFlightBytes) 统计.maxInFlightBytes = inFlightBytes;
 				let writer = 获取写入器();
 				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 				const completions = item.completions || null;
@@ -3215,9 +3240,11 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
 				// first packet while later bytes may already be on the wire.
 				try { 写入开始?.(); } catch (e) { }
+				const 写入开始时刻 = 统计 ? Date.now() : 0;
 				try {
 					try {
 						await 执行远端写入(writer, item.chunk);
+						if (统计) { const wms = Date.now() - 写入开始时刻; if (wms > 统计.maxWriteMs) 统计.maxWriteMs = wms; }
 					} catch (err) {
 						释放写入器?.();
 						// Delivery is UNCERTAIN once writer.write() was invoked — a rejected write does not prove
@@ -3261,12 +3288,14 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 		const retainedBytes = nextBytes + inFlightBytes;
 		if (retainedBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
 			closed = true;
+			if (统计) 统计.overflowCount++;
 			const err = Object.assign(new Error(`${名称}: upload queue overflow (${retainedBytes}B/${nextItems})`), { isQueueOverflow: true });
 			clear(err);
 			log(`[${名称}] Queue limit exceeded; closing connection`);
 			try { 关闭连接?.(err) } catch (_) { }
 			throw err;
 		}
+		if (统计) { if (nextBytes > 统计.maxQueuedBytes) 统计.maxQueuedBytes = nextBytes; if (nextItems > 统计.maxItems) 统计.maxItems = nextItems; }
 		let completionPromise = null;
 		let completions = null;
 		if (waitForFlush) {
@@ -3280,6 +3309,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	};
 
 	return {
+		获取统计: 统计 ? () => ({ ...统计, queuedBytes, inFlightBytes }) : null,
 		写入(data, allowRetry = true) {
 			return enqueue(data, allowRetry, false);
 		},
@@ -3408,7 +3438,9 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 
 function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	return connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs, pipeMeta).catch(error => {
-		log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
+		// A stream cancellation (client cancel / our own cleanup) is normal teardown, not a pipe failure — don't
+		// emit it as noise (the prior build logged 30 such lines for one browsing session).
+		if (!是流取消错误(error) && !(pipeMeta?.wrapper?.客户端已关闭)) log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
 		closeSocketQuietly(webSocket);
 	});
 }
@@ -5406,66 +5438,156 @@ function debugError(...args) {
 }
 
 // ── Connection tracer (DEBUG-only telemetry) ──────────────────────────────────────────────────────
-// When DEBUG is on, each tunnel connection gets a lightweight tracer that emits structured, greppable
-// log lines an AI (or a human) can analyze to find slow dials, bad routes, blackholes, stalls, and
-// throughput ceilings. When DEBUG is off, 创建连接追踪器 returns null and every 追踪* helper is a cheap
-// no-op — zero string-building, zero timers, negligible per-chunk cost. Lines are prefixed `[conn <id>]`
-// with an UPPERCASE event verb so they filter cleanly: OPEN / ROUTE / FIRST-BYTE / STAT / RETRY / CLOSE.
+// When DEBUG is on, each tunnel connection gets a tracer that emits STRUCTURED JSON events (one object per
+// console.log, so `wrangler tail --format json` / Workers Logs index the fields and an AI can parse them
+// without guessing units). When DEBUG is off, 创建连接追踪器 returns null and every 追踪* helper is a cheap
+// no-op — no objects built, no timers, negligible per-chunk cost.
+// Events (field `ev`): open · route · dial_fail · fallback · first_byte · stat · dns · close.
+// Byte fields are raw integers (bytes / bytes-per-second); the analysis tool formats, not the Worker.
 let 连接追踪序号 = 0;
-const 连接追踪心跳毫秒 = 15000; // periodic STAT so a long-lived (e.g. gRPC "gun") connection is visible even if the tail attaches mid-stream
+const 连接追踪心跳毫秒默认 = 15000; // periodic `stat` so a long-lived (gRPC "gun") connection stays visible even if the tail attaches mid-stream
 function 格式化字节数(n) {
+	// Retained for the test suite / any human-readable callers; the tracer itself emits raw integers.
 	if (!Number.isFinite(n) || n < 0) return '0B';
-	if (n < 1024) return `${n}B`;
+	if (n < 1024) return `${Math.round(n)}B`;
 	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
 	if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)}MB`;
 	return `${(n / (1024 * 1024 * 1024)).toFixed(2)}GB`;
 }
-function 创建连接追踪器(transport, request = null) {
+function 追踪错误名(err) {
+	if (err == null) return null;
+	const m = String(err.message || err);
+	return m.length > 100 ? m.slice(0, 100) : m;
+}
+function 是流取消错误(err) {
+	// A client/runtime stream cancellation (normal lifecycle) — NOT a tunnel failure. The prior tracer mislabeled
+	// every one of these as reason=error because the gRPC catch fired 追踪关闭(...,'error') unconditionally.
+	if (!err) return false;
+	if (err.name === 'AbortError') return true;
+	const m = String(err.message || err).toLowerCase();
+	return m.includes('stream was cancelled') || m.includes('stream was canceled') || m.includes('readablestream was canceled') || m.includes('readablestream was cancelled');
+}
+const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'client_cancel', 'client_close', 'client_ws_error', 'runtime_cancel', 'idle_timeout']);
+function 分类关闭原因(wrapper, err) {
+	if (wrapper?.closeHint) return { reason: wrapper.closeHint, expected: 预期关闭原因集.has(wrapper.closeHint) };
+	if (wrapper?.客户端已关闭) return { reason: 'client_cancel', expected: true };
+	if (是流取消错误(err)) return { reason: 'runtime_cancel', expected: true };
+	if (err?.isQueueOverflow) return { reason: 'queue_overflow', expected: false };
+	if (err) return { reason: 'error', expected: false };
+	return { reason: 'eof', expected: true };
+}
+function 追踪发射(s, ev, fields) {
+	// One structured object per line = machine-parseable. Gated on 调试日志打印 (a tracer only exists under
+	// DEBUG anyway; this belt-and-suspenders keeps it silent if DEBUG is off or in unit tests).
+	if (!调试日志打印) return;
+	try { console.log({ ev, conn: s.id, t: Date.now(), tr: s.transport, ...fields }); } catch (e) { }
+}
+function 创建连接追踪器(transport, request = null, env = null) {
 	if (!调试日志打印) return null;
-	const id = ((连接追踪序号 = (连接追踪序号 + 1) & 0xffffff)).toString(36);
-	const ip = request?.headers?.get?.('CF-Connecting-IP') || '?';
-	const colo = request?.cf?.colo || '?';
+	const cf = request?.cf || {};
+	const ray = request?.headers?.get?.('CF-Ray') || '';
+	// Globally-unique id: CF-Ray is unique per request (so per connection); fall back to a module counter only
+	// off-platform (tests). Fixes cross-isolate collisions where two connections both logged as `[conn 1]`.
+	const id = ray ? ray.split('-')[0] : ('x' + ((连接追踪序号 = (连接追踪序号 + 1) & 0xffffff)).toString(36));
+	const 心跳毫秒 = Math.max(5000, Math.min(300000, Number(env?.DEBUG_STAT_INTERVAL_MS) || 连接追踪心跳毫秒默认));
 	const t0 = Date.now();
 	const s = {
-		id, transport, t0, ip, colo,
-		target: null, route: 'pending', endpoint: null, dialMs: null, ttfbMs: null,
-		bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, retries: 0, lastStatBytes: 0,
-		closed: false, hb: null,
+		id, transport, t0,
+		target: null, port: null, route: 'pending', endpoint: null, dialMs: null, ttfbMs: null,
+		bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, initialWriteBytes: 0,
+		dialAttempts: 0, dialFailures: 0, fallbacks: 0,
+		lastStatUp: 0, lastStatDown: 0, peakUpBps: 0, peakDownBps: 0,
+		firstActivityAt: 0, lastActivityAt: 0,
+		closeHint: null, closed: false, hb: null, 队列统计: null,
 	};
-	log(`[conn ${id}] OPEN transport=${transport} ip=${ip} colo=${colo}`);
+	追踪发射(s, 'open', {
+		ip: request?.headers?.get?.('CF-Connecting-IP') || null,
+		colo: cf.colo || null, country: cf.country || null, asn: cf.asn || null,
+		proto: cf.httpProtocol || null,
+		rtt_ms: cf.clientTcpRtt ?? cf.clientQuicRtt ?? null,
+		edge_bps: cf.edgeL4?.deliveryRate ?? null,
+	});
 	try {
 		s.hb = setInterval(() => {
 			if (s.closed) { try { clearInterval(s.hb) } catch (e) { } return; }
-			const dt = (Date.now() - t0) / 1000;
-			const 增量 = s.bytesDown - s.lastStatBytes;
-			s.lastStatBytes = s.bytesDown;
-			const rate = 增量 > 0 ? `${格式化字节数(增量 / 连接追踪心跳毫秒 * 1000)}/s` : 'idle';
-			log(`[conn ${id}] STAT t=${dt.toFixed(0)}s route=${s.route} target=${s.target || '?'} ttfb=${s.ttfbMs == null ? '-' : s.ttfbMs + 'ms'} up=${格式化字节数(s.bytesUp)}/${s.chunksUp}ch down=${格式化字节数(s.bytesDown)}/${s.chunksDown}ch rate=${rate} retries=${s.retries}`);
-		}, 连接追踪心跳毫秒);
+			const upD = s.bytesUp - s.lastStatUp, downD = s.bytesDown - s.lastStatDown;
+			s.lastStatUp = s.bytesUp; s.lastStatDown = s.bytesDown;
+			const upBps = Math.round(upD * 1000 / 心跳毫秒), downBps = Math.round(downD * 1000 / 心跳毫秒);
+			if (upBps > s.peakUpBps) s.peakUpBps = upBps;
+			if (downBps > s.peakDownBps) s.peakDownBps = downBps;
+			// Skip a fully-idle heartbeat once a route exists, so an idle DoT/API/DNS connection doesn't flood the tail.
+			if (!upD && !downD && s.route !== 'pending') return;
+			追踪发射(s, 'stat', {
+				secs: Math.round((Date.now() - t0) / 1000), route: s.route, target: s.target, port: s.port,
+				up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown,
+				up_bps: upBps, down_bps: downBps, peak_down_bps: s.peakDownBps, fallbacks: s.fallbacks,
+			});
+		}, 心跳毫秒);
 	} catch (e) { }
 	return s;
 }
-function 追踪记录目标(s, host, port) { if (s && !s.target) s.target = `${host}:${port}`; }
+function 追踪记录目标(s, host, port) { if (s && !s.target) { s.target = host; s.port = Number(port) || null; } }
 function 追踪记录路由(s, route, endpoint, dialMs) {
 	if (!s) return;
-	if (s.route !== 'pending' && s.route !== route) s.retries++; // a route change after one was chosen = a fallback/re-dial
-	s.route = route; s.endpoint = endpoint || null; if (dialMs != null) s.dialMs = dialMs;
-	log(`[conn ${s.id}] ROUTE ${route}${endpoint ? ' endpoint=' + endpoint : ''}${dialMs != null ? ' dialMs=' + dialMs : ''} target=${s.target || '?'}`);
+	s.route = route; if (endpoint) s.endpoint = endpoint; if (dialMs != null) s.dialMs = dialMs;
+	追踪发射(s, 'route', { route, endpoint: endpoint || s.endpoint || null, dial_ms: dialMs ?? null, target: s.target, port: s.port });
+}
+function 追踪拨号尝试(s) { if (s) s.dialAttempts++; }
+function 追踪拨号失败(s, route, ms, err) {
+	if (!s) return;
+	s.dialFailures++;
+	追踪发射(s, 'dial_fail', { route, ms: ms ?? null, err: 追踪错误名(err), target: s.target, port: s.port });
+}
+function 追踪回退(s, from, to) {
+	if (!s) return;
+	s.fallbacks++;
+	追踪发射(s, 'fallback', { from, to, n: s.fallbacks, target: s.target, port: s.port });
 }
 function 追踪首字节(s) {
 	if (!s || s.ttfbMs != null) return;
 	s.ttfbMs = Math.round(Date.now() - s.t0);
-	log(`[conn ${s.id}] FIRST-BYTE ttfb=${s.ttfbMs}ms route=${s.route} target=${s.target || '?'}`);
+	追踪发射(s, 'first_byte', { ttfb_ms: s.ttfbMs, route: s.route, target: s.target, port: s.port });
 }
-function 追踪上行(s, n) { if (s && n > 0) { s.bytesUp += n; s.chunksUp++; } }
-function 追踪下行(s, n) { if (s && n > 0) { s.bytesDown += n; s.chunksDown++; } }
-function 追踪关闭(s, reason) {
+function 追踪活动时间(s) {
+	const now = Date.now();
+	if (!s.firstActivityAt) s.firstActivityAt = now;
+	s.lastActivityAt = now;
+}
+function 追踪上行(s, n) { if (s && n > 0) { s.bytesUp += n; s.chunksUp++; 追踪活动时间(s); } }
+function 追踪下行(s, n) { if (s && n > 0) { s.bytesDown += n; s.chunksDown++; 追踪活动时间(s); } }
+function 追踪初始写入(s, n) { if (s && n > 0) { s.initialWriteBytes += n; s.bytesUp += n; 追踪活动时间(s); } }
+function 追踪DNS(s, upBytes, downBytes, meta) {
+	if (!s) return;
+	s.route = 'dns'; if (!s.target) { s.target = 'dns'; s.port = 53; }
+	if (upBytes > 0) { s.bytesUp += upBytes; s.chunksUp++; }
+	if (downBytes > 0) { s.bytesDown += downBytes; s.chunksDown++; 追踪首字节(s); }
+	追踪活动时间(s);
+	追踪发射(s, 'dns', { up_b: upBytes || 0, down_b: downBytes || 0, ...(meta || {}) });
+}
+function 追踪关闭(s, reasonOrWrapper, err) {
 	if (!s || s.closed) return;
+	// Accept an explicit reason string OR a wrapper to classify. The wrapper form lets each teardown site pass
+	// its context (closeHint / 客户端已关闭 / error) and get correct expected-vs-error classification, so a
+	// normal "Stream was cancelled" no longer counts as an error.
+	let reason, expected;
+	if (typeof reasonOrWrapper === 'string') { reason = reasonOrWrapper; expected = 预期关闭原因集.has(reason); }
+	else { const c = 分类关闭原因(reasonOrWrapper, err); reason = c.reason; expected = c.expected; }
 	s.closed = true;
 	if (s.hb) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; }
-	const dt = Math.round(Date.now() - s.t0);
-	const rate = dt > 0 ? `${格式化字节数(s.bytesDown / dt * 1000)}/s` : '-';
-	log(`[conn ${s.id}] CLOSE reason=${reason || '?'} durMs=${dt} route=${s.route} target=${s.target || '?'} ttfb=${s.ttfbMs == null ? '-' : s.ttfbMs + 'ms'} up=${格式化字节数(s.bytesUp)}/${s.chunksUp}ch down=${格式化字节数(s.bytesDown)}/${s.chunksDown}ch avg_down=${rate} retries=${s.retries}`);
+	const dur = Math.round(Date.now() - s.t0);
+	const activeMs = s.lastActivityAt && s.firstActivityAt ? Math.max(1, s.lastActivityAt - s.firstActivityAt) : 0;
+	let q = null;
+	try { q = s.队列统计 ? s.队列统计() : null; } catch (e) { }
+	追踪发射(s, 'close', {
+		reason, expected, dur_ms: dur, route: s.route, target: s.target, port: s.port,
+		ttfb_ms: s.ttfbMs, dial_ms: s.dialMs,
+		up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown, init_write_b: s.initialWriteBytes,
+		life_down_bps: dur > 0 ? Math.round(s.bytesDown * 1000 / dur) : 0,
+		active_down_bps: activeMs > 0 ? Math.round(s.bytesDown * 1000 / activeMs) : 0,
+		peak_down_bps: s.peakDownBps, peak_up_bps: s.peakUpBps,
+		dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
+		...(q ? { q_max_bytes: q.maxQueuedBytes, q_max_inflight: q.maxInFlightBytes, q_max_items: q.maxItems, q_max_write_ms: q.maxWriteMs, q_overflow: q.overflowCount } : {}),
+	});
 }
 
 function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
@@ -8953,6 +9075,10 @@ export const __testPerformanceHelpers = {
 	traceFirstByte: 追踪首字节,
 	traceRoute: 追踪记录路由,
 	traceClose: 追踪关闭,
+	traceFallback: 追踪回退,
+	traceDns: 追踪DNS,
+	classifyClose: 分类关闭原因,
+	isStreamCancellation: 是流取消错误,
 	formatByteCount: 格式化字节数,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket: 是可重放的TLS首包,
