@@ -2,7 +2,7 @@ import { ENGINE_DEFAULTS, applyUserConfigDefaults } from './core/config.js';
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
 const Version = '2026-06-01 15:49:39';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
-let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false;
+let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
 // env.HOST is a static per-deployment env var, so its parsed form is memoized here instead of
 // re-parsed on every request (realistically holds one entry; the size guard is just defensive).
@@ -249,6 +249,10 @@ export default {
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
 		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
+		// DEBUG_LEGACY_TEXT=0 silences the verbose human-readable `log()` lines while keeping the structured
+		// tracer events. The two together doubled tail volume and pushed wrangler tail into sampling mode (which
+		// drops messages) — structured-only mode roughly halves output and CPU. Warnings/errors still print.
+		抑制旧文本日志 = 调试日志打印 && ['0', 'false', 'off'].includes(String(env.DEBUG_LEGACY_TEXT ?? '').toLowerCase());
 		workerRequestContext.tunnel = await createTunnelContext(request, env);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || 'unknown-ip';
 		// Tunnel path gate: when a non-root PATH is set, only requests under that path may enter the
@@ -752,6 +756,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	remoteConnWrapper.追踪 = 创建连接追踪器('xhttp', request, getWorkerRequestContext(request)?.env);
+	绑定请求中止(request, remoteConnWrapper);
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	const responseHeaders = new Headers({
@@ -846,7 +851,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1086,6 +1091,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	remoteConnWrapper.追踪 = 创建连接追踪器('grpc', request, getWorkerRequestContext(request)?.env);
+	绑定请求中止(request, remoteConnWrapper);
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1164,11 +1170,19 @@ async function 处理gRPC请求(request, yourUUID) {
 					刷新定时器 = null;
 				}
 				if ((!force && 已关闭) || 队列字节数 === 0) return;
-				const out = new Uint8Array(队列字节数);
-				let offset = 0;
-				for (const item of 发送队列) {
-					out.set(item, offset);
-					offset += item.byteLength;
+				// Single-frame fast path (the common case): 发送队列[0] is already a complete gRPC frame from
+				// encodeGrpcDataFrame, so enqueue it directly — skip allocating a merge buffer and copying the
+				// whole payload a second time. CPU on multi-MB gRPC downloads correlates with per-chunk copies.
+				let out;
+				if (发送队列.length === 1) {
+					out = 发送队列[0];
+				} else {
+					out = new Uint8Array(队列字节数);
+					let offset = 0;
+					for (const item of 发送队列) {
+						out.set(item, offset);
+						offset += item.byteLength;
+					}
 				}
 				发送队列 = [];
 				队列字节数 = 0;
@@ -1239,7 +1253,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1415,6 +1429,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	catch (_) { serverSock.accept() }
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	remoteConnWrapper.追踪 = 创建连接追踪器('ws', request, getWorkerRequestContext(request)?.env);
+	绑定请求中止(request, remoteConnWrapper);
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1456,7 +1471,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
 		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
@@ -2998,6 +3013,11 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 	}
 }
 
+// Bound tunneled-DNS reassembly: a zero-length or oversized length prefix makes 解析DNS_TCP帧 consume nothing,
+// so without a cap a malformed stream grows the retained tail without limit (repro: 20×64KiB of zero-prefix →
+// ~1.3MiB). Reject the malformed frame and drop the buffer instead.
+const DNS_QUERY_MAX_BYTES = 4096;
+const DNS_REASSEMBLY_MAX_BYTES = 128 * 1024;
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
 	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
@@ -3007,6 +3027,11 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	let requestData = 数据转Uint8Array(udpChunk);
 	if (udpContext) {
 		requestData = udpContext.缓存?.byteLength ? 拼接字节数据(udpContext.缓存, requestData) : requestData;
+		if (requestData.byteLength >= 2) {
+			const 声明长度 = (requestData[0] << 8) | requestData[1];
+			if (声明长度 === 0 || 声明长度 > DNS_QUERY_MAX_BYTES) { udpContext.缓存 = new Uint8Array(0); throw new Error(`invalid tunneled DNS frame length: ${声明长度}`); }
+		}
+		if (requestData.byteLength > DNS_REASSEMBLY_MAX_BYTES) { udpContext.缓存 = new Uint8Array(0); throw new Error('tunneled DNS reassembly limit exceeded'); }
 		const completeFrames = 解析DNS_TCP帧(requestData);
 		const consumedBytes = completeFrames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
 		udpContext.缓存 = requestData.subarray(consumedBytes);
@@ -3109,7 +3134,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -3261,6 +3286,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 					settleCompletions(completions, err);
 					throw err;
 				} finally {
+					try { 写入结束?.(); } catch (e) { }
 					inFlightBytes -= item.chunk.byteLength;
 					if (inFlightBytes < 0) inFlightBytes = 0;
 					if (activeCompletions === completions) activeCompletions = null;
@@ -3470,10 +3496,20 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// This flag records that the read ended via the timeout, so the retry gate below skips replay in that case.
 	const 首字节超时仅关闭 = pipeMeta?.首字节超时仅关闭 === true;
 	let 首字节超时触发关闭 = false;
+	// A backpressured in-flight uplink write means the client is actively sending — a silent downlink then is
+	// NOT a blackhole/stall, so neither watchdog may fire while a write is outstanding. 上行活动 only re-arms on
+	// write COMPLETION, so a single write slower than the timeout window would otherwise trip the watchdog
+	// mid-upload (the reason FIRST_BYTE_TIMEOUT_MS was unsafe to enable). The queue tracks 活跃写入数 on the wrapper.
+	const 上传进行中 = () => ((pipeMeta?.wrapper?.活跃写入数 | 0) > 0);
 	let 首字节计时器 = null;
-	if (firstByteTimeoutMs > 0) {
-		首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs);
-	}
+	const 首字节超时回调 = () => {
+		if (hasData) return;
+		if (上传进行中()) { 首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs); return; }
+		if (首字节超时仅关闭) 首字节超时触发关闭 = true;
+		if (pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = 'first_byte_timeout';
+		cancelReaderQuietly(reader, 'first byte timeout');
+	};
+	if (firstByteTimeoutMs > 0) 首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs);
 
 	// Optional post-first-byte idle watchdog: once data is flowing, if the remote goes silent for the
 	// configured window (a mid-stream stall on a flaky relay), cancel the read so the stream ends and the
@@ -3481,10 +3517,15 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// after the first byte (hasData), so it never retries/replays — it just ends the stream like a normal EOF.
 	const 空闲超时毫秒 = getIdleTimeoutMs(pipeMeta?.env);
 	let 空闲计时器 = null;
+	const 空闲超时回调 = () => {
+		if (上传进行中()) { 空闲计时器 = setTimeout(空闲超时回调, 空闲超时毫秒); return; }
+		if (pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = 'idle_timeout';
+		cancelReaderQuietly(reader, 'idle timeout');
+	};
 	const 重置空闲计时器 = () => {
 		if (空闲超时毫秒 <= 0) return;
 		if (空闲计时器) clearTimeout(空闲计时器);
-		空闲计时器 = setTimeout(() => { cancelReaderQuietly(reader, 'idle timeout'); }, 空闲超时毫秒);
+		空闲计时器 = setTimeout(空闲超时回调, 空闲超时毫秒);
 	};
 
 	// Uplink activity keeps both downlink watchdogs from mis-firing: a connection actively receiving an
@@ -3502,7 +3543,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			重置空闲计时器();
 		} else if (首字节计时器) {
 			clearTimeout(首字节计时器);
-			首字节计时器 = setTimeout(() => { if (!hasData) { if (首字节超时仅关闭) 首字节超时触发关闭 = true; cancelReaderQuietly(reader, 'first byte timeout'); } }, firstByteTimeoutMs);
+			首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs);
 		}
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
@@ -3551,6 +3592,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	} catch (err) { readError = err }
 	finally {
 		管道已结束 = true;
+		// Record WHY the downlink ended so the close event is specific (remote_eof / …_no_data) instead of a
+		// generic runtime_cancel — only on a clean loop end with no more-specific hint already set.
+		if (!readError && pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = hasData ? 'remote_eof' : 'remote_eof_no_data';
 		if (pipeMeta?.wrapper && pipeMeta.wrapper.记录上行活动 === 记录上行活动) pipeMeta.wrapper.记录上行活动 = null;
 		if (首字节计时器) { try { clearTimeout(首字节计时器) } catch (e) { } }
 		if (空闲计时器) { try { clearTimeout(空闲计时器) } catch (e) { } }
@@ -5426,7 +5470,7 @@ function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优�
 }
 
 function log(...args) {
-	if (调试日志打印) console.log(...args);
+	if (调试日志打印 && !抑制旧文本日志) console.log(...args);
 }
 
 function debugWarn(...args) {
@@ -5467,7 +5511,9 @@ function 是流取消错误(err) {
 	const m = String(err.message || err).toLowerCase();
 	return m.includes('stream was cancelled') || m.includes('stream was canceled') || m.includes('readablestream was canceled') || m.includes('readablestream was cancelled');
 }
-const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'client_cancel', 'client_close', 'client_ws_error', 'runtime_cancel', 'idle_timeout']);
+// `expected:true` means a normal lifecycle end, NOT a tunnel fault. first_byte_timeout is deliberately absent
+// (a fired first-byte watchdog = a blackholed route worth surfacing), as are error / queue_overflow.
+const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'remote_eof_no_data', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel', 'idle_timeout']);
 function 分类关闭原因(wrapper, err) {
 	if (wrapper?.closeHint) return { reason: wrapper.closeHint, expected: 预期关闭原因集.has(wrapper.closeHint) };
 	if (wrapper?.客户端已关闭) return { reason: 'client_cancel', expected: true };
@@ -5496,7 +5542,7 @@ function 创建连接追踪器(transport, request = null, env = null) {
 		target: null, port: null, route: 'pending', endpoint: null, dialMs: null, ttfbMs: null,
 		bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, initialWriteBytes: 0,
 		dialAttempts: 0, dialFailures: 0, fallbacks: 0,
-		lastStatUp: 0, lastStatDown: 0, peakUpBps: 0, peakDownBps: 0,
+		lastStatUp: 0, lastStatDown: 0, lastStatAt: t0, peakUpBps: 0, peakDownBps: 0,
 		firstActivityAt: 0, lastActivityAt: 0,
 		closeHint: null, closed: false, hb: null, 队列统计: null,
 	};
@@ -5510,21 +5556,36 @@ function 创建连接追踪器(transport, request = null, env = null) {
 	try {
 		s.hb = setInterval(() => {
 			if (s.closed) { try { clearInterval(s.hb) } catch (e) { } return; }
-			const upD = s.bytesUp - s.lastStatUp, downD = s.bytesDown - s.lastStatDown;
-			s.lastStatUp = s.bytesUp; s.lastStatDown = s.bytesDown;
-			const upBps = Math.round(upD * 1000 / 心跳毫秒), downBps = Math.round(downD * 1000 / 心跳毫秒);
-			if (upBps > s.peakUpBps) s.peakUpBps = upBps;
-			if (downBps > s.peakDownBps) s.peakDownBps = downBps;
+			const { upBps, downBps, moved } = 更新追踪速率峰值(s);
 			// Skip a fully-idle heartbeat once a route exists, so an idle DoT/API/DNS connection doesn't flood the tail.
-			if (!upD && !downD && s.route !== 'pending') return;
+			if (!moved && s.route !== 'pending') return;
+			let q = null; try { q = s.队列统计 ? s.队列统计() : null; } catch (e) { }
+			// Terminal `close` events are lost for most canceled invocations (the runtime cancels before JS
+			// cleanup runs), so mirror the key close fields into each `stat` — an AI can reconstruct most of a
+			// connection from its last heartbeat even when no close arrives.
 			追踪发射(s, 'stat', {
-				secs: Math.round((Date.now() - t0) / 1000), route: s.route, target: s.target, port: s.port,
+				secs: Math.round((Date.now() - t0) / 1000), route: s.route, endpoint: s.endpoint, target: s.target, port: s.port,
+				ttfb_ms: s.ttfbMs, dial_ms: s.dialMs,
 				up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown,
-				up_bps: upBps, down_bps: downBps, peak_down_bps: s.peakDownBps, fallbacks: s.fallbacks,
+				up_bps: upBps, down_bps: downBps, peak_up_bps: s.peakUpBps, peak_down_bps: s.peakDownBps,
+				dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
+				...(q ? { q_max_bytes: q.maxQueuedBytes, q_max_inflight: q.maxInFlightBytes, q_max_items: q.maxItems, q_max_write_ms: q.maxWriteMs, q_overflow: q.overflowCount } : {}),
 			});
 		}, 心跳毫秒);
 	} catch (e) { }
 	return s;
+}
+// Compute the up/down bytes-per-second since the last sample, update the running peaks, and reset the sample
+// markers. Called from the heartbeat AND once more inside close — so a connection shorter than one heartbeat
+// interval still gets a real peak (the prior tracer reported peak_down_bps=0 for every sub-15s download).
+function 更新追踪速率峰值(s, now = Date.now()) {
+	const elapsed = Math.max(1, now - s.lastStatAt);
+	const upD = s.bytesUp - s.lastStatUp, downD = s.bytesDown - s.lastStatDown;
+	const upBps = Math.round(upD * 1000 / elapsed), downBps = Math.round(downD * 1000 / elapsed);
+	s.lastStatAt = now; s.lastStatUp = s.bytesUp; s.lastStatDown = s.bytesDown;
+	if (upBps > s.peakUpBps) s.peakUpBps = upBps;
+	if (downBps > s.peakDownBps) s.peakDownBps = downBps;
+	return { upBps, downBps, moved: !!(upD || downD) };
 }
 function 追踪记录目标(s, host, port) { if (s && !s.target) { s.target = host; s.port = Number(port) || null; } }
 function 追踪记录路由(s, route, endpoint, dialMs) {
@@ -5574,6 +5635,7 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 	else { const c = 分类关闭原因(reasonOrWrapper, err); reason = c.reason; expected = c.expected; }
 	s.closed = true;
 	if (s.hb) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; }
+	更新追踪速率峰值(s); // fold in the final partial interval so a sub-heartbeat connection reports a real peak
 	const dur = Math.round(Date.now() - s.t0);
 	const activeMs = s.lastActivityAt && s.firstActivityAt ? Math.max(1, s.lastActivityAt - s.firstActivityAt) : 0;
 	let q = null;
@@ -5588,6 +5650,24 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 		dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
 		...(q ? { q_max_bytes: q.maxQueuedBytes, q_max_inflight: q.maxInFlightBytes, q_max_items: q.maxItems, q_max_write_ms: q.maxWriteMs, q_overflow: q.overflowCount } : {}),
 	});
+}
+
+// Emit the `close` event when the client disconnects. Most gRPC "gun" invocations are CANCELED by the runtime
+// (client closed) before cancel()/finally run, so ~83% of connections never produced a close in the capture.
+// request.signal fires on that disconnect — but only when the `enable_request_signal` compatibility flag is set
+// in wrangler.toml. No-ops gracefully when the flag/signal is absent (cancel()/finally still cover the rest).
+function 绑定请求中止(request, wrapper) {
+	const signal = request?.signal;
+	if (!wrapper || !signal || typeof signal.addEventListener !== 'function') return;
+	const onAbort = () => {
+		if (wrapper.客户端已关闭) { if (wrapper.追踪) 追踪关闭(wrapper.追踪, wrapper); return; }
+		wrapper.客户端已关闭 = true;
+		if (!wrapper.closeHint) wrapper.closeHint = 'client_abort';
+		追踪关闭(wrapper.追踪, wrapper); // synchronous close emit before the invocation is torn down
+		try { wrapper.socket?.close?.(); } catch (e) { }
+	};
+	if (signal.aborted) { onAbort(); return; }
+	try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) { }
 }
 
 function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
@@ -9079,6 +9159,7 @@ export const __testPerformanceHelpers = {
 	traceDns: 追踪DNS,
 	classifyClose: 分类关闭原因,
 	isStreamCancellation: 是流取消错误,
+	updateTraceRatePeaks: 更新追踪速率峰值,
 	formatByteCount: 格式化字节数,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket: 是可重放的TLS首包,

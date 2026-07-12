@@ -133,8 +133,11 @@ from a Worker (Error 1034) and use a relay called a **ProxyIP**.
 | **`LOG_READ_LIMIT`** | 500 (max 1000) | Max log rows the panel reads at once. | Cosmetic. |
 | **`DEBUG`** | off | Verbose routing logs **plus structured JSON per-connection telemetry** (one object per event) for every tunnel connection, visible via `npx wrangler tail`. See below. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
 | **`DEBUG_STAT_INTERVAL_MS`** | 15000 | Heartbeat (`stat`) interval, clamped 5 s–5 min. Raise it (e.g. 30000) if hundreds of connections make the tail too noisy. | Leave default for a single user. |
+| **`DEBUG_LEGACY_TEXT`** | on | When `DEBUG=1`, also emit the old human-readable `[TCP forwarding]…` text lines. Set to `0` to emit **structured events only**. | **Set `0`** for any capture you'll analyze — the text lines roughly double the tail volume, which pushes `wrangler tail` into sampling mode (it silently drops messages). Warnings/errors still print. |
 
 ### Reading the DEBUG connection telemetry
+
+> **Get complete close events:** by default the runtime cancels a gRPC "gun" invocation when the client disconnects, *before* the Worker's cleanup runs — so most connections never emit a `close`. To fix this, add the `enable_request_signal` compatibility flag to your `wrangler.toml` (`compatibility_flags = ["enable_request_signal"]`). The Worker then emits a `close` (with `reason:"client_abort"`) the moment the client disconnects. Without it, only cleanly-finished connections produce a `close` — but every `stat` heartbeat now also carries the queue/route/byte fields, so you can still reconstruct most of a connection from its last heartbeat.
 
 With `DEBUG=1`, every tunnel connection (gRPC / WS / XHTTP) emits **structured JSON objects** — one per event — so an AI (or `jq`) can parse them without guessing units. Every event carries `ev` (event name), `conn` (a globally-unique id from CF-Ray), `t` (epoch ms) and `tr` (transport). All byte fields are **raw integers**; all rates are **bytes/second** (`*_bps`).
 
@@ -145,11 +148,11 @@ With `DEBUG=1`, every tunnel connection (gRPC / WS / XHTTP) emits **structured J
 | `dial_fail` | a dial attempt failed | `route`, `ms`, `err` |
 | `fallback` | direct→ProxyIP (or re-dial) | `from`, `to`, `n` (fallback count) |
 | `first_byte` | remote's first byte | `ttfb_ms` (open→first-byte — the best "instant-feel" metric), `route` |
-| `stat` | heartbeat while open | `up_b`/`down_b` (bytes), `up_bps`/`down_bps` (this interval), `peak_down_bps`, `fallbacks` — **surfaces a long-lived gRPC "gun" connection even if the tail attached mid-stream** |
+| `stat` | heartbeat while open | now mirrors the key `close` fields (`route`, `endpoint`, `ttfb_ms`, `up_b`/`down_b`, `up_bps`/`down_bps`, `peak_*`, `dial_*`, `fallbacks`, `q_max_*`) — **so a connection that never emits a `close` is still fully reconstructable from its last heartbeat** |
 | `dns` | a tunneled DNS query resolved | `up_b`, `down_b`, `resolver` (`doh`/`tcp`), `latency_ms` |
 | `close` | connection ended | `reason` + **`expected`** (see below), `dur_ms`, `route`, `ttfb_ms`, `up_b`/`down_b`, `life_down_bps` (lifetime avg), `active_down_bps` (avg over active transfer only), `peak_down_bps`, `dial_attempts`/`dial_failures`/`fallbacks`, and `q_max_*` upload-queue high-water marks |
 
-**`reason`/`expected` — the important fix:** a normal browser/gRPC cancellation ("Stream was cancelled.") is now `reason:"runtime_cancel", expected:true`, **not** an error. Only count a close as a genuine failure when `expected:false` (e.g. `reason:"error"`, `queue_overflow`). The previous build mislabeled every cancellation as `error`, making the error rate meaningless.
+**`reason`/`expected` — read `expected` first.** `expected:true` = normal lifecycle end; `expected:false` = worth investigating. Precise reasons: `eof` / `remote_eof` / `remote_eof_no_data` (remote closed), `client_cancel` / `client_close` / `client_abort` (client left), `runtime_cancel` (normal stream cancel), `idle_timeout`; and the **unexpected** ones — `first_byte_timeout` (a route blackholed — connected but never sent a byte), `queue_overflow`, `error`. Count only `expected:false` as failures.
 
 **How to capture a good trace (important — this is why an earlier attempt showed nothing):**
 

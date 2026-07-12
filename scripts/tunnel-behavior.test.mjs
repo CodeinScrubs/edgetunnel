@@ -76,6 +76,7 @@ const {
 	traceClose,
 	classifyClose,
 	isStreamCancellation,
+	updateTraceRatePeaks,
 	formatByteCount,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket,
@@ -841,6 +842,28 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(classifyClose({}, Object.assign(new Error('overflow'), { isQueueOverflow: true })), { reason: 'queue_overflow', expected: false }, 'a queue overflow is a real (unexpected) close');
 	assert.deepEqual(classifyClose({}, new Error('connection reset by peer')), { reason: 'error', expected: false }, 'a genuine error stays reason=error/unexpected');
 	assert.deepEqual(classifyClose({}, null), { reason: 'eof', expected: true }, 'a clean end with no error is eof/expected');
+	// Precise close hints from the watchdogs / EOF / abort: a clean remote EOF and a client abort are expected;
+	// a first-byte timeout is a blackhole signal and stays UNexpected so it surfaces.
+	assert.deepEqual(classifyClose({ closeHint: 'remote_eof' }, null), { reason: 'remote_eof', expected: true });
+	assert.deepEqual(classifyClose({ closeHint: 'remote_eof_no_data' }, null), { reason: 'remote_eof_no_data', expected: true });
+	assert.deepEqual(classifyClose({ closeHint: 'client_abort' }, null), { reason: 'client_abort', expected: true });
+	assert.deepEqual(classifyClose({ closeHint: 'idle_timeout' }, null), { reason: 'idle_timeout', expected: true });
+	assert.deepEqual(classifyClose({ closeHint: 'first_byte_timeout' }, null), { reason: 'first_byte_timeout', expected: false }, 'a first-byte timeout (blackhole) is surfaced as unexpected');
+}
+
+{
+	// updateTraceRatePeaks folds a partial interval into the running peak. This is why the close path now calls
+	// it: a connection shorter than one heartbeat interval used to report peak_down_bps=0 (54/81 in the capture).
+	const s = { bytesUp: 0, bytesDown: 500000, lastStatUp: 0, lastStatDown: 0, lastStatAt: Date.now() - 1000, peakUpBps: 0, peakDownBps: 0 };
+	const r = updateTraceRatePeaks(s);
+	assert.ok(r.downBps > 0, 'a partial interval with bytes produces a non-zero rate');
+	assert.equal(s.peakDownBps, r.downBps, 'the peak is updated from the partial interval');
+	assert.ok(Math.abs(s.peakDownBps - 500000) < 50000, '~500KB in ~1s ≈ 500000 B/s');
+	assert.equal(r.moved, true);
+	// A second call with no new bytes yields a zero rate and does not lower the recorded peak.
+	const r2 = updateTraceRatePeaks(s);
+	assert.equal(r2.downBps, 0); assert.equal(r2.moved, false);
+	assert.ok(s.peakDownBps > 0, 'peak is a running max, not reset by an idle interval');
 }
 
 {
