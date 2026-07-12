@@ -1290,11 +1290,14 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		}),
 	};
 
+	// 请求已发送: true = a request was sent, then the upstream errored — that IS a real route failure and must
+	// fall over. (A no-request preconnect that errors would NOT retry — readError is no longer a stand-in for
+	// "a request was sent", so the first-byte-timeout cancellation can't masquerade as a failed route.)
 	await connectStreams(remoteSocket, webSocket, null, async () => {
 		events.push('retry');
-	});
+	}, 0, { wrapper: { 请求已发送: true } });
 
-	assert.deepEqual(events, ['retry'], 'early no-data read errors should retry before closing the client socket');
+	assert.deepEqual(events, ['retry'], 'an upstream error AFTER a request was sent should retry before closing the client socket');
 }
 
 {
@@ -1393,11 +1396,33 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// CRITICAL regression (the bug the 3000ms DIRECT_FIRST_BYTE_TIMEOUT_MS setting exposed): the first-byte
+	// watchdog must NOT arm while 请求已发送 is false. With a timeout set but no request sent, the timer must
+	// never fire — otherwise its reader cancellation looked like a route failure and a Telegram preconnect
+	// poisoned the direct cache + fell back to slow ProxyIP (70/76 first-byte timeouts in the capture).
+	const events = [];
+	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
+	let cancelled = false;
+	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }), close() { events.push('remote-close'); } };
+	const wrapper = {}; // no request sent
+	const p = connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 20, { wrapper, onNoData: () => events.push('no-data') });
+	await new Promise(r => setTimeout(r, 90)); // 4.5x the 20ms timeout — a preconnect timer would have fired long ago
+	assert.equal(cancelled, false, 'the first-byte timer must NOT fire on a no-request preconnect even when a timeout is configured');
+	assert.equal(events.includes('no-data'), false, 'no route-failure scoring for a preconnect');
+	assert.equal(events.includes('retry'), false, 'no ProxyIP fallback for a preconnect');
+	// Now a request arrives -> the watchdog arms and fires, ending the (now genuinely blackholed) read.
+	wrapper.请求已发送 = true; wrapper.记录上行活动?.();
+	await withTestTimeout(p, 250, 'timer arms once a request is sent');
+	assert.equal(cancelled, true, 'once a request is sent, the first-byte watchdog arms and fires on a real blackhole');
+}
+
+{
 	// Upload-aware watchdog: while the uplink signals activity (client streaming an UPLOAD upstream while
 	// the remote is legitimately silent), the first-byte timer keeps resetting so the upload is NOT killed;
 	// once activity stops, it fires — preserving blackhole recovery. connectStreams exposes the reset via
 	// the shared wrapper (pipeMeta.wrapper.记录上行活动), which the upload queue calls on each upstream write.
-	const wrapper = {};
+	// 请求已发送: true -> a request was sent (so the first-byte watchdog is armed); the upload keeps it re-armed.
+	const wrapper = { 请求已发送: true };
 	let cancelled = false;
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }) };

@@ -851,7 +851,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.请求已发送 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1253,7 +1253,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.请求已发送 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1471,7 +1471,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.请求已发送 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
+		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
 		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
@@ -2674,6 +2674,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// old socket here also prevents a leak when a reconnect replaces a still-open (blackholed) socket.
 			const 旧远端Socket = remoteConnWrapper.socket;
 			remoteConnWrapper.socket = newSocket;
+			// Clear any close hint the superseded (direct) pipe left behind — e.g. 'first_byte_timeout' — so a
+			// successful ProxyIP takeover isn't mis-reported with the old route's failure reason.
+			remoteConnWrapper.closeHint = null;
 			追踪记录路由(remoteConnWrapper.追踪, proxyType || 'proxyip', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
 			if (旧远端Socket && 旧远端Socket !== newSocket) { try { 旧远端Socket.close?.() } catch (e) { } }
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
@@ -3506,15 +3509,29 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// write COMPLETION, so a single write slower than the timeout window would otherwise trip the watchdog
 	// mid-upload (the reason FIRST_BYTE_TIMEOUT_MS was unsafe to enable). The queue tracks 活跃写入数 on the wrapper.
 	const 上传进行中 = () => ((pipeMeta?.wrapper?.活跃写入数 | 0) > 0);
+	const 请求已发送 = () => (pipeMeta?.wrapper?.请求已发送 === true);
 	let 首字节计时器 = null;
 	const 首字节超时回调 = () => {
-		if (hasData) return;
-		if (上传进行中()) { 首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs); return; }
+		首字节计时器 = null;
+		// Never treat a connection as blackholed before the client actually sent a request, and never while an
+		// upload write is in flight (that IS the client sending). Otherwise re-arm and keep waiting.
+		if (hasData || 管道已结束 || !请求已发送()) return;
+		if (上传进行中()) { 安排首字节计时器(); return; }
 		if (首字节超时仅关闭) 首字节超时触发关闭 = true;
 		if (pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = 'first_byte_timeout';
 		cancelReaderQuietly(reader, 'first byte timeout');
 	};
-	if (firstByteTimeoutMs > 0) 首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs);
+	// Arm the first-byte watchdog ONLY after a request has been sent. A browser preconnect (tunnel open + target
+	// header, but no ClientHello yet) is not a blackhole — arming on connect made the 3s timeout fire on idle
+	// Telegram preconnects, cancel the read, poison the direct-route cache, and shove real loads onto slow ProxyIP
+	// (70/76 first-byte timeouts in the long-session capture were one idle Telegram IP). Re-armed when a request
+	// arrives (记录上行活动) and after each in-flight write drains.
+	const 安排首字节计时器 = () => {
+		if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; }
+		if (管道已结束 || hasData || firstByteTimeoutMs <= 0 || !请求已发送() || 上传进行中()) return;
+		首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs);
+	};
+	安排首字节计时器(); // arms now if the first packet already carried a request (已有首包数据)
 
 	// Optional post-first-byte idle watchdog: once data is flowing, if the remote goes silent for the
 	// configured window (a mid-stream stall on a flaky relay), cancel the read so the stream ends and the
@@ -3546,9 +3563,8 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		// FIRST_BYTE_TIMEOUT_MS would fire before the first-byte deadline and cut the connection early.
 		if (hasData) {
 			重置空闲计时器();
-		} else if (首字节计时器) {
-			clearTimeout(首字节计时器);
-			首字节计时器 = setTimeout(首字节超时回调, firstByteTimeoutMs);
+		} else {
+			安排首字节计时器(); // a request may have just been sent -> arm the first-byte watchdog now (no-op until 请求已发送)
 		}
 	};
 	if (pipeMeta?.wrapper) pipeMeta.wrapper.记录上行活动 = 记录上行活动;
@@ -3620,12 +3636,13 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// is NOT a blackholed route — the remote has nothing to answer. Capture showed these idle-closing at 30–43s
 	// then poisoning the direct-route cache + wasting a ProxyIP fallback, pushing later REAL loads for that host
 	// onto the slower proxy. Skip onNoData + fallback unless a request was actually sent. (A sent ClientHello
-	// with no reply IS a real blackhole — 请求已发送值 is true then, so it still fails over.)
+	// with no reply IS a real blackhole — 请求已发送值 is true then, so it still fails over. The first-byte
+	// watchdog now arms only after a request is sent, so its cancellation can never masquerade as a failure here.)
 	const 请求已发送值 = pipeMeta?.wrapper?.请求已发送 === true;
-	if (!hasData && !客户端已关闭 && (请求已发送值 || readError)) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
+	if (!hasData && !客户端已关闭 && 请求已发送值) { try { pipeMeta?.onNoData?.(); } catch (e) { } }
 	// 可重放首包 === false means the first packet carried non-idempotent data (not empty, not a lone TLS
 	// ClientHello) — replaying it on a fallback is unsafe, so close instead of retrying.
-	if (!hasData && retryFunc && (请求已发送值 || readError) && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达 && pipeMeta?.可重放首包 !== false) {
+	if (!hasData && retryFunc && 请求已发送值 && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达 && pipeMeta?.可重放首包 !== false) {
 		try {
 			try { remoteSocket?.close?.() } catch (e) { }
 			await retryFunc();
@@ -5644,6 +5661,9 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 	let reason, expected;
 	if (typeof reasonOrWrapper === 'string') { reason = reasonOrWrapper; expected = 预期关闭原因集.has(reason); }
 	else { const c = 分类关闭原因(reasonOrWrapper, err); reason = c.reason; expected = c.expected; }
+	// Carry a sanitized error string on an UNEXPECTED close so `reason=error` (0-3ms undiagnosable closes in the
+	// capture) is actually diagnosable — otherwise, with legacy text off, the cause is lost.
+	const errText = (!expected && err) ? 追踪错误名(err) : null;
 	s.closed = true;
 	if (s.hb) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; }
 	更新追踪速率峰值(s); // fold in the final partial interval so a sub-heartbeat connection reports a real peak
@@ -5659,6 +5679,7 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 		active_down_bps: activeMs > 0 ? Math.round(s.bytesDown * 1000 / activeMs) : 0,
 		peak_down_bps: s.peakDownBps, peak_up_bps: s.peakUpBps,
 		dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
+		...(errText ? { err: errText } : {}),
 		...(q ? { q_max_bytes: q.maxQueuedBytes, q_max_inflight: q.maxInFlightBytes, q_max_items: q.maxItems, q_max_write_ms: q.maxWriteMs, q_overflow: q.overflowCount } : {}),
 	});
 }
