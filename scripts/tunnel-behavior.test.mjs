@@ -70,6 +70,11 @@ const {
 	readGrpcFrameLength,
 	expandPreferredEndpointVariants,
 	createUploadQueue,
+	traceUplink,
+	traceDownlink,
+	traceFirstByte,
+	traceClose,
+	formatByteCount,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket,
 	normalizeConfigHost,
@@ -793,6 +798,29 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.doesNotThrow(() => queue.写入(new Uint8Array(MAX - 1)), 'after the in-flight write settles, a fresh near-cap chunk is admitted (no accounting leak)');
 	assert.equal(closed, false, 'no phantom overflow after the prior write drained');
 	try { releaseWrite?.(); } catch (e) { }
+}
+
+{
+	// Connection tracer (DEBUG-only telemetry). Its accounting helpers are null-safe no-ops when there is no
+	// tracer (DEBUG off -> 创建连接追踪器 returns null), and correctly accumulate bytes/chunks and stamp
+	// first-byte / close when a tracer object is present. Byte formatter renders human-readable sizes.
+	assert.equal(formatByteCount(0), '0B');
+	assert.equal(formatByteCount(512), '512B');
+	assert.equal(formatByteCount(1536), '1.5KB');
+	assert.equal(formatByteCount(5 * 1024 * 1024), '5.00MB');
+	assert.equal(formatByteCount(-1), '0B', 'negative/invalid sizes clamp to 0B');
+	// Null-safe: the hot-path calls pass a possibly-null tracer and must never throw or count.
+	assert.doesNotThrow(() => { traceUplink(null, 100); traceDownlink(null, 100); traceFirstByte(null); traceClose(null, 'x'); });
+	// With a fake tracer object (no timer -> hb:null so no setInterval to clear), the helpers accumulate.
+	const fake = { id: 't', route: 'direct', target: 'a:1', t0: Date.now() - 5, ttfbMs: null, bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, retries: 0, closed: false, hb: null };
+	traceUplink(fake, 300); traceUplink(fake, 200); traceUplink(fake, 0); // 0 is ignored
+	traceDownlink(fake, 1000); traceDownlink(fake, 500);
+	assert.equal(fake.bytesUp, 500, 'uplink bytes accumulate'); assert.equal(fake.chunksUp, 2, 'zero-length uplink not counted as a chunk');
+	assert.equal(fake.bytesDown, 1500, 'downlink bytes accumulate'); assert.equal(fake.chunksDown, 2);
+	traceFirstByte(fake); assert.equal(typeof fake.ttfbMs, 'number', 'first byte stamps a ttfb'); assert.ok(fake.ttfbMs >= 0);
+	const firstTtfb = fake.ttfbMs; traceFirstByte(fake); assert.equal(fake.ttfbMs, firstTtfb, 'first-byte is stamped only once');
+	traceClose(fake, 'eof'); assert.equal(fake.closed, true, 'close marks the tracer closed');
+	traceClose(fake, 'again'); assert.equal(fake.closed, true, 'close is idempotent');
 }
 
 {

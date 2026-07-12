@@ -751,6 +751,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 	}
 
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	remoteConnWrapper.追踪 = 创建连接追踪器('xhttp', request);
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	const responseHeaders = new Headers({
@@ -845,7 +846,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					try { remoteConnWrapper.socket?.close() } catch (e) { }
 					closeSocketQuietly(xhttpBridge);
 				},
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -887,9 +888,11 @@ async function 处理XHTTP请求(request, yourUUID) {
 				}
 			} catch (err) {
 				log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
+				追踪关闭(remoteConnWrapper.追踪, 'error');
 				try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
+				追踪关闭(remoteConnWrapper.追踪, 'eof');
 				上行写入队列.清空();
 				释放远端写入器();
 				释放下行背压();
@@ -899,6 +902,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;
+			追踪关闭(remoteConnWrapper.追踪, 'client-cancel');
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
@@ -1080,6 +1084,7 @@ async function 处理gRPC请求(request, yourUUID) {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	remoteConnWrapper.追踪 = 创建连接追踪器('grpc', request);
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1233,7 +1238,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接,
-				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
 				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
@@ -1327,7 +1332,9 @@ async function 处理gRPC请求(request, yourUUID) {
 				}
 			} catch (err) {
 				log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
+				追踪关闭(remoteConnWrapper.追踪, 'error');
 			} finally {
+				追踪关闭(remoteConnWrapper.追踪, 'eof');
 				上行写入队列.清空();
 				释放远端写入器();
 				关闭连接();
@@ -1336,6 +1343,7 @@ async function 处理gRPC请求(request, yourUUID) {
 		},
 		async cancel() {
 			remoteConnWrapper.客户端已关闭 = true;
+			追踪关闭(remoteConnWrapper.追踪, 'client-cancel');
 			释放下行背压();
 			GRPC上行写入队列?.清空();
 			if (远端写入器) {
@@ -1402,6 +1410,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
 	catch (_) { serverSock.accept() }
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+	remoteConnWrapper.追踪 = 创建连接追踪器('ws', request);
 	let isDnsQuery = false;
 	let 判断是否是木马 = null;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
@@ -1443,7 +1452,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { remoteConnWrapper.socket?.close() } catch (e) { }
 			closeSocketQuietly(serverSock);
 		},
-		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); },
+		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; }, 上行活动: () => { remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
 		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
@@ -1839,6 +1848,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
 		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
 		remoteConnWrapper.客户端已关闭 = true;
+		追踪关闭(remoteConnWrapper.追踪, 'client-close');
 		closeSocketQuietly(serverSock);
 		// Close the outbound remote socket too, so a client disconnect while the remote is silent
 		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
@@ -1849,6 +1859,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
 		// doesn't score the route as failed or spend a ProxyIP fallback dial on an already-dead client.
 		remoteConnWrapper.客户端已关闭 = true;
+		追踪关闭(remoteConnWrapper.追踪, 'error');
 		try { remoteConnWrapper.socket?.close() } catch (e) { }
 		处理WS显式传输错误(err);
 	});
@@ -2411,6 +2422,8 @@ function 是可重放的TLS首包(dataInput) {
 
 async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null) {
 	validateTunnelTarget(host, portNum);
+	追踪记录目标(remoteConnWrapper?.追踪, host, portNum);
+	const 拨号开始毫秒 = remoteConnWrapper?.追踪 ? Date.now() : 0;
 	const { env, ctx } = getWorkerRequestContext(request);
 	const tunnelContext = getRequestTunnelContext(request);
 	const parsedProxyAddress = tunnelContext.parsedProxyAddress || {};
@@ -2627,6 +2640,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// old socket here also prevents a leak when a reconnect replaces a still-open (blackholed) socket.
 			const 旧远端Socket = remoteConnWrapper.socket;
 			remoteConnWrapper.socket = newSocket;
+			追踪记录路由(remoteConnWrapper.追踪, proxyType || 'proxyip', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
 			if (旧远端Socket && 旧远端Socket !== newSocket) { try { 旧远端Socket.close?.() } catch (e) { } }
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
 			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
@@ -2690,6 +2704,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP forwarding] Trying direct connection to: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
+			追踪记录路由(remoteConnWrapper.追踪, 'direct', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
 			// First-byte watchdog on the direct path. When the first packet carries NO data it may safely
 			// replay to ProxyIP (retryFunc). When it DOES carry data, replay is unsafe (non-idempotent
 			// first packet) — but we still arm a CLOSE-ONLY timeout so a blackholed direct connection (connect
@@ -3073,7 +3088,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -3191,6 +3206,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				const item = bundle();
 				if (!item) break;
 				inFlightBytes += item.chunk.byteLength;
+				if (统计上行) 统计上行(item.chunk.byteLength);
 				let writer = 获取写入器();
 				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
 				const completions = item.completions || null;
@@ -3400,8 +3416,9 @@ function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firs
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
 	let readError = null;
+	const 追踪 = pipeMeta?.wrapper?.追踪 || null; // DEBUG-only connection tracer (null when DEBUG off)
 	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
-	const 标记首字节 = () => { if (hasData) return; hasData = true; if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; } if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
+	const 标记首字节 = () => { if (hasData) return; hasData = true; if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; } if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; 追踪首字节(追踪); try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
 	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env);
@@ -3474,6 +3491,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
+				if (追踪) 追踪下行(追踪, value.byteLength);
 				await 下行发送器.发送(value);
 				重置空闲计时器();
 			}
@@ -3485,6 +3503,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				if (!仍为当前管道()) break; // superseded by a reconnect — stop forwarding to the shared client
 				if (!value || value.byteLength === 0) continue;
 				标记首字节();
+				if (追踪) 追踪下行(追踪, value.byteLength);
 				if (value.byteLength >= downlinkGrainBytes) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -5384,6 +5403,69 @@ function debugWarn(...args) {
 
 function debugError(...args) {
 	if (调试日志打印) console.error(...args);
+}
+
+// ── Connection tracer (DEBUG-only telemetry) ──────────────────────────────────────────────────────
+// When DEBUG is on, each tunnel connection gets a lightweight tracer that emits structured, greppable
+// log lines an AI (or a human) can analyze to find slow dials, bad routes, blackholes, stalls, and
+// throughput ceilings. When DEBUG is off, 创建连接追踪器 returns null and every 追踪* helper is a cheap
+// no-op — zero string-building, zero timers, negligible per-chunk cost. Lines are prefixed `[conn <id>]`
+// with an UPPERCASE event verb so they filter cleanly: OPEN / ROUTE / FIRST-BYTE / STAT / RETRY / CLOSE.
+let 连接追踪序号 = 0;
+const 连接追踪心跳毫秒 = 15000; // periodic STAT so a long-lived (e.g. gRPC "gun") connection is visible even if the tail attaches mid-stream
+function 格式化字节数(n) {
+	if (!Number.isFinite(n) || n < 0) return '0B';
+	if (n < 1024) return `${n}B`;
+	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+	if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)}MB`;
+	return `${(n / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+}
+function 创建连接追踪器(transport, request = null) {
+	if (!调试日志打印) return null;
+	const id = ((连接追踪序号 = (连接追踪序号 + 1) & 0xffffff)).toString(36);
+	const ip = request?.headers?.get?.('CF-Connecting-IP') || '?';
+	const colo = request?.cf?.colo || '?';
+	const t0 = Date.now();
+	const s = {
+		id, transport, t0, ip, colo,
+		target: null, route: 'pending', endpoint: null, dialMs: null, ttfbMs: null,
+		bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, retries: 0, lastStatBytes: 0,
+		closed: false, hb: null,
+	};
+	log(`[conn ${id}] OPEN transport=${transport} ip=${ip} colo=${colo}`);
+	try {
+		s.hb = setInterval(() => {
+			if (s.closed) { try { clearInterval(s.hb) } catch (e) { } return; }
+			const dt = (Date.now() - t0) / 1000;
+			const 增量 = s.bytesDown - s.lastStatBytes;
+			s.lastStatBytes = s.bytesDown;
+			const rate = 增量 > 0 ? `${格式化字节数(增量 / 连接追踪心跳毫秒 * 1000)}/s` : 'idle';
+			log(`[conn ${id}] STAT t=${dt.toFixed(0)}s route=${s.route} target=${s.target || '?'} ttfb=${s.ttfbMs == null ? '-' : s.ttfbMs + 'ms'} up=${格式化字节数(s.bytesUp)}/${s.chunksUp}ch down=${格式化字节数(s.bytesDown)}/${s.chunksDown}ch rate=${rate} retries=${s.retries}`);
+		}, 连接追踪心跳毫秒);
+	} catch (e) { }
+	return s;
+}
+function 追踪记录目标(s, host, port) { if (s && !s.target) s.target = `${host}:${port}`; }
+function 追踪记录路由(s, route, endpoint, dialMs) {
+	if (!s) return;
+	if (s.route !== 'pending' && s.route !== route) s.retries++; // a route change after one was chosen = a fallback/re-dial
+	s.route = route; s.endpoint = endpoint || null; if (dialMs != null) s.dialMs = dialMs;
+	log(`[conn ${s.id}] ROUTE ${route}${endpoint ? ' endpoint=' + endpoint : ''}${dialMs != null ? ' dialMs=' + dialMs : ''} target=${s.target || '?'}`);
+}
+function 追踪首字节(s) {
+	if (!s || s.ttfbMs != null) return;
+	s.ttfbMs = Math.round(Date.now() - s.t0);
+	log(`[conn ${s.id}] FIRST-BYTE ttfb=${s.ttfbMs}ms route=${s.route} target=${s.target || '?'}`);
+}
+function 追踪上行(s, n) { if (s && n > 0) { s.bytesUp += n; s.chunksUp++; } }
+function 追踪下行(s, n) { if (s && n > 0) { s.bytesDown += n; s.chunksDown++; } }
+function 追踪关闭(s, reason) {
+	if (!s || s.closed) return;
+	s.closed = true;
+	if (s.hb) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; }
+	const dt = Math.round(Date.now() - s.t0);
+	const rate = dt > 0 ? `${格式化字节数(s.bytesDown / dt * 1000)}/s` : '-';
+	log(`[conn ${s.id}] CLOSE reason=${reason || '?'} durMs=${dt} route=${s.route} target=${s.target || '?'} ttfb=${s.ttfbMs == null ? '-' : s.ttfbMs + 'ms'} up=${格式化字节数(s.bytesUp)}/${s.chunksUp}ch down=${格式化字节数(s.bytesDown)}/${s.chunksDown}ch avg_down=${rate} retries=${s.retries}`);
 }
 
 function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
@@ -8865,6 +8947,13 @@ export const __testPerformanceHelpers = {
 	dnsAnswerMinTtlMs: 解析DNS应答最小TTL毫秒,
 	readXhttpFirstPacket: 读取XHTTP首包,
 	createUploadQueue: 创建上行写入队列,
+	createConnectionTracer: 创建连接追踪器,
+	traceUplink: 追踪上行,
+	traceDownlink: 追踪下行,
+	traceFirstByte: 追踪首字节,
+	traceRoute: 追踪记录路由,
+	traceClose: 追踪关闭,
+	formatByteCount: 格式化字节数,
 	getUplinkWriteTimeoutMs,
 	isReplayableTlsFirstPacket: 是可重放的TLS首包,
 	normalizeConfigHost,

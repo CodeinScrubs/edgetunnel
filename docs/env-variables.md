@@ -131,7 +131,28 @@ from a Worker (Error 1034) and use a relay called a **ProxyIP**.
 | **`ENABLE_KV_LOG`** (alias `KV_LOG`) | off | Logs requests to KV (visible in the admin "operation log"). | Turn on briefly to inspect usage, then off (it consumes KV writes). `OFF_LOG=1` force-disables. |
 | **`LOG_TTL_DAYS`** / **`LOG_TTL_SECONDS`** | 7 days | How long log entries live. | Lower to save KV. |
 | **`LOG_READ_LIMIT`** | 500 (max 1000) | Max log rows the panel reads at once. | Cosmetic. |
-| **`DEBUG`** | off | Verbose `[TCP forwarding]` / `[ProxyIP]` / `[UDP forwarding]` logs, visible via `npx wrangler tail`. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
+| **`DEBUG`** | off | Verbose routing logs **plus structured per-connection telemetry** (`[conn <id>]` lines) for every tunnel connection, visible via `npx wrangler tail`. See below. | Turn on (`1`) only while debugging, then off — logging adds a little overhead. |
+
+### Reading the DEBUG connection telemetry
+
+With `DEBUG=1`, every tunnel connection (gRPC / WS / XHTTP) emits a compact, greppable trace you (or an AI) can analyze to find slow dials, bad routes, blackholes, stalls, and throughput ceilings. Each line is prefixed `[conn <id>]` (a short per-connection id) with an UPPERCASE event verb:
+
+| Event | Meaning | Key fields |
+|---|---|---|
+| `OPEN` | connection accepted | `transport` (grpc/ws/xhttp), `ip`, `colo` |
+| `ROUTE` | which upstream route was chosen | `direct` \| `proxyip` \| `socks5`/`http`/… , `dialMs` (connect latency), `target` |
+| `FIRST-BYTE` | remote returned its first byte | `ttfb=<ms>` (time-to-first-byte from OPEN) — the single best "instant-feel" metric |
+| `STAT` | heartbeat every 15 s while open | `up`/`down` bytes+chunks, `rate` (current down/s), `retries` — **surfaces a long-lived gRPC "gun" connection even if `wrangler tail` attached after it started** |
+| `RETRY` | a fallback/re-dial happened | folded into `ROUTE` (a route change bumps `retries`) |
+| `CLOSE` | connection ended | `reason` (eof / error / client-cancel / client-close), `durMs`, `avg_down` (avg throughput), final byte totals |
+
+**How to capture a good trace (important — this is why an earlier attempt showed nothing):**
+
+1. Set `DEBUG=1`, then **start `npx wrangler tail <worker-name>` FIRST** and leave it running.
+2. **Reconnect the client** (toggle the VPN off→on in v2rayN/xray). A gRPC "gun" connection is one long-lived POST — if the tail attaches *after* the client is already connected, the `OPEN`/`ROUTE`/`FIRST-BYTE` lines already fired and you'll only see the 15 s `STAT` heartbeats (or nothing until the next connection). Reconnecting forces a fresh invocation the tail can see from the start.
+3. Browse/stream for a minute so `STAT` heartbeats and `CLOSE` summaries accumulate, then turn `DEBUG` back off.
+
+**What the numbers tell you:** high `ttfb` or `dialMs` → slow dial (try a different `PROXYIP`, or `DIAL_STAGGER_MS`); lots of `direct→proxyip` `ROUTE` changes / `retries` → direct route is being censored (expected in Iran; ProxyIP is doing its job); `CLOSE reason=error` bursts → resets worth investigating; low `avg_down` on big downloads → a throughput knob to tune (`DOWNLINK_BACKPRESSURE_HWM_BYTES`, `DOWNLINK_GRAIN_PACKET_BYTES`). Paste a batch of these lines to an AI and it can reason about concrete tuning changes.
 
 ---
 
