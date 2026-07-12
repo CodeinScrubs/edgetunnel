@@ -887,6 +887,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				}
 			} catch (err) {
 				log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
+				try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
 				上行写入队列.清空();
@@ -2060,15 +2061,16 @@ function encodeGrpcVarint(value) {
 }
 
 function readGrpcVarint(data, offset = 0) {
-	let value = 0, shift = 0;
-	for (let i = offset; i < data.byteLength; i++) {
-		const current = data[i];
-		value |= (current & 0x7f) << shift;
-		if ((current & 0x80) === 0) return { value: value >>> 0, nextOffset: i + 1 };
-		shift += 7;
-		if (shift > 35) break;
+	let value = 0;
+	for (let index = 0; index < 5; index++) {
+		const position = offset + index;
+		if (position >= data.byteLength) throw new Error('Invalid gRPC protobuf wrapper: truncated varint length');
+		const byte = data[position];
+		if (index === 4 && (byte & 0xf0) !== 0) throw new Error('Invalid gRPC protobuf wrapper: varint length exceeds uint32');
+		value += (byte & 0x7f) * 2 ** (index * 7); // arithmetic, not `<<` (which wraps at 32 bits)
+		if ((byte & 0x80) === 0) return { value, nextOffset: position + 1 };
 	}
-	throw new Error('Invalid gRPC protobuf wrapper: bad varint length');
+	throw new Error('Invalid gRPC protobuf wrapper: varint length too long');
 }
 
 function encodeGrpcMessagePayload(payload) {

@@ -1464,6 +1464,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		for (let i = 0; i < 4097; i++) tooManyFields[i * 2] = 0x0a; // 4097 zero-length protobuf fields
 		assert.throws(() => unwrapGrpcMessagePayloads(tooManyFields), /too many protobuf fields/, 'a frame exceeding the per-frame field cap is rejected');
 	}
+	// An overlong (6-byte) protobuf varint length must be rejected, not silently mis-parsed by a 32-bit
+	// wrapping shift (`<< 35` == `<< 3`).
+	assert.throws(() => unwrapGrpcMessagePayloads(new Uint8Array([0x0a, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00])), /exceeds uint32|too long/, 'an overlong protobuf varint length is rejected');
 }
 
 {
