@@ -1789,6 +1789,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		上行写入队列.清空();
 		释放远端写入器();
+		try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream directly, not only via the serverSock close cascade
 		closeSocketQuietly(serverSock);
 	};
 
@@ -1922,6 +1923,7 @@ function 解析木马请求(buffer, passwordPlainText) {
 	const portIndex = addressIndex + addressLength;
 	if (data.byteLength < portIndex + 4) return { hasError: true, message: "invalid S5 request data" };
 	const portRemote = (data[portIndex] << 8) | data[portIndex + 1];
+	if (data[portIndex + 2] !== 0x0d || data[portIndex + 3] !== 0x0a) return { hasError: true, message: "invalid S5 delimiter" };
 
 	return {
 		hasError: false,
