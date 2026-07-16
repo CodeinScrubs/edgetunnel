@@ -1,6 +1,9 @@
 name = "v20251104"
 main = "_worker_copypaste.js"
 compatibility_date = "2025-11-04"
+# Emit a synchronous close/cleanup when the client disconnects (request.signal). The tracer + upstream
+# cleanup depend on it; for a Dashboard copy-paste deploy set the same flag in the dashboard Compatibility flags.
+compatibility_flags = ["enable_request_signal"]
 keep_vars = true
 
 # No cron triggers: automated background ProxyIP scanning rapidly probes many Cloudflare IPs,

@@ -18,6 +18,9 @@
 name = "newera2"   # the Worker this build deploys to (e.g. v20251104)
 main = "_worker.js"
 compatibility_date = "2026-07-06"        # today-or-earlier only; never a future date
+# Emit a synchronous close/cleanup when the client disconnects (request.signal). The tracer + upstream
+# cleanup depend on it; for a Dashboard copy-paste deploy set the same flag in the dashboard Compatibility flags.
+compatibility_flags = ["enable_request_signal"]
 keep_vars = true
 
 # No cron triggers: automated ProxyIP scanning probes many Cloudflare IPs and gets flagged
