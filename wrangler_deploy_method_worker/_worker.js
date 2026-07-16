@@ -2751,7 +2751,14 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					await 写入首包(socket, data);
 					const 成功候选 = candidate, 成功开始时间 = 开始时间;
 					remoteConnWrapper.反代首字节回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], true, performance.now() - 成功开始时间, Date.now(), host, yourUUID);
-					remoteConnWrapper.反代无数据回调 = () => rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
+					// A relay that accepted TCP but returned NO byte is strong evidence it is silently broken for this
+					// target, so move the cursor PAST it as well as scoring the failure. Without this the cursor still
+					// pointed at the winner of the dial and the very next connection re-selected the same dead relay —
+					// live capture: both api.onesignal.com attempts picked 136.244.85.65 and both timed out with 0 bytes.
+					remoteConnWrapper.反代无数据回调 = () => {
+						try { setProxyEndpointCursor(proxyIP, host, 成功候选.index + 1, 所有反代数组.length); } catch (e) { }
+						rememberProxyEndpointResult(env, ctx, proxyIP, [成功候选.hostname, 成功候选.port], false, null, Date.now(), host, yourUUID);
+					};
 					log(`[ProxyIP connection] Connected to: ${candidate.hostname}:${candidate.port} (index: ${candidate.index})`);
 					if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.endpoint = `${candidate.hostname}:${candidate.port}`; // correlate the winning endpoint to this connection's route event
 					setProxyEndpointCursor(proxyIP, host, candidate.index, 所有反代数组.length);
