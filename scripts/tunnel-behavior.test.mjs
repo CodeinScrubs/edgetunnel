@@ -46,6 +46,7 @@ const {
 	httpsConnect,
 	handleGrpcRequest,
 	encodeGrpcDataFrame,
+	encodeGrpcFramePrefix,
 	parseGrpcFrameChunk,
 	unwrapGrpcMessagePayloads,
 	getSubscriptionRequestOptions,
@@ -1641,6 +1642,22 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// protobuf field-1 tag 0x0a, varint length, then the payload.
 	assert.deepEqual([...encodeGrpcDataFrame(new Uint8Array([0xaa, 0xbb]))], [0x00, 0x00, 0x00, 0x00, 0x04, 0x0a, 0x02, 0xaa, 0xbb], 'encodeGrpcDataFrame emits the exact expected frame bytes');
 	assert.deepEqual(parseGrpcFrameChunk(new Uint8Array(0), encodeGrpcDataFrame(new Uint8Array([1, 2, 3, 4, 5]))).payloads.map(p => [...p]), [[1, 2, 3, 4, 5]], 'encode/parse round-trips the payload');
+	{
+		// Zero-copy downlink framing: enqueuing encodeGrpcFramePrefix(len) followed by the payload VIEW must
+		// produce byte-identical wire output to encodeGrpcDataFrame (which copies the whole payload). This is
+		// what lets the heavy download path skip the per-byte copy that was blowing the 10ms CPU budget.
+		for (const size of [1, 5, 127, 128, 4096, 16384, 32768, 70000]) {
+			const payload = new Uint8Array(size);
+			for (let i = 0; i < size; i++) payload[i] = (i * 31 + 7) & 0xff;
+			const prefix = encodeGrpcFramePrefix(size);
+			const stitched = new Uint8Array(prefix.byteLength + size);
+			stitched.set(prefix, 0);
+			stitched.set(payload, prefix.byteLength);
+			assert.deepEqual([...stitched], [...encodeGrpcDataFrame(payload)], `prefix+view is byte-identical to a copied frame (size=${size})`);
+			// ...and it still parses back to exactly the original payload.
+			assert.deepEqual([...parseGrpcFrameChunk(new Uint8Array(0), stitched).payloads[0]], [...payload], `prefix+view round-trips (size=${size})`);
+		}
+	}
 	{
 		// Per-chunk frame caps (pre-auth CPU-DoS guards). Real xray "gun" traffic carries a handful of frames
 		// per chunk (bulk data rides in few large frames), so both caps are far above legitimate use.

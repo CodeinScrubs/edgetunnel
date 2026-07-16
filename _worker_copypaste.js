@@ -1245,6 +1245,27 @@ async function 处理gRPC请求(request, yourUUID) {
 				send(data) {
 					if (已关闭) return;
 					const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
+					// Zero-copy fast path for sizeable payloads: enqueue the frame prefix + the payload VIEW
+					// instead of allocating a full frame and copying the payload into it. Identical wire bytes,
+					// but removes the download path's dominant per-byte CPU cost — the copy is what pushed heavy
+					// page loads over the Free plan's 10ms budget (exceededCpu killed the connection mid-load).
+					// Safe to enqueue a view: every chunk arriving here owns an orphaned/fresh buffer (the grain
+					// sender rebinds pendingBuffer on flush; the direct-send path rebinds readBuffer), so nothing
+					// mutates it after we hand it off.
+					if (chunk.byteLength >= GRPC_ZERO_COPY_MIN_BYTES) {
+						刷新发送队列(true); // ordering: drain anything already batched before emitting the view
+						if (!已关闭) {
+							try {
+								controller.enqueue(encodeGrpcFramePrefix(chunk.byteLength));
+								controller.enqueue(chunk);
+							} catch (e) {
+								已关闭 = true;
+								grpcBridge.readyState = WebSocket.CLOSED;
+								释放下行背压();
+							}
+						}
+						return 等待下行可写();
+					}
 					const frame = encodeGrpcDataFrame(chunk);
 					发送队列.push(frame);
 					队列字节数 += frame.byteLength;
@@ -2229,6 +2250,28 @@ function encodeGrpcDataFrame(payload) {
 	frame.set(chunk, 6 + lenBytes.byteLength);
 	return frame;
 }
+
+// Frame PREFIX only — the gRPC 5-byte header + protobuf field tag + varint length for a payload of the given
+// size. Enqueuing this followed by the payload VIEW produces byte-identical wire output to
+// encodeGrpcDataFrame() while skipping the full-payload copy, which is the dominant per-byte CPU cost of the
+// download path. That copy is what pushes a heavy page load past the Free plan's 10ms CPU budget (the runtime
+// then kills the invocation with exceededCpu and the page stalls mid-load).
+function encodeGrpcFramePrefix(payloadLength) {
+	const lenBytes = encodeGrpcVarint(payloadLength);
+	const messageLength = 1 + lenBytes.byteLength + payloadLength;
+	const prefix = new Uint8Array(6 + lenBytes.byteLength);
+	prefix[0] = 0;
+	prefix[1] = (messageLength >>> 24) & 0xff;
+	prefix[2] = (messageLength >>> 16) & 0xff;
+	prefix[3] = (messageLength >>> 8) & 0xff;
+	prefix[4] = messageLength & 0xff;
+	prefix[5] = 0x0a;
+	prefix.set(lenBytes, 6);
+	return prefix;
+}
+// Payloads at/above this size skip the frame copy (prefix + zero-copy view). Below it, batching several tiny
+// frames into one enqueue is the better trade.
+const GRPC_ZERO_COPY_MIN_BYTES = 4096;
 
 const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf field; cap adversarial ones
 // A single read chunk holds a handful of frames for real xray "gun" traffic (bulk data rides in few large
@@ -9278,6 +9321,7 @@ export const __testPerformanceHelpers = {
 	httpsConnect,
 	handleGrpcRequest: 处理gRPC请求,
 	encodeGrpcDataFrame,
+	encodeGrpcFramePrefix,
 	parseGrpcFrameChunk,
 	unwrapGrpcMessagePayloads,
 	getSubscriptionRequestOptions,
