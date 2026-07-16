@@ -533,6 +533,29 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 }
 
 {
+	// The TUNNEL must not be gated on the admin password. A UUID-only deployment (no ADMIN) is a valid config:
+	// its WS/gRPC routes must still be reachable, while /admin stays disabled. (Regression: the admin-password
+	// chain used to fall back to the UUID, so narrowing it to explicit-ADMIN silently killed UUID-only tunnels.)
+	const ctx = { waitUntil() { } };
+	const uuidOnlyEnv = { UUID: '11111111-1111-4111-8111-111111111111' }; // no ADMIN
+
+	// A WS upgrade on a UUID-only deploy must NOT fall through to the decoy — it must enter the tunnel handler
+	// (which rejects the fake handshake, but the point is that routing reached it, i.e. not a 200 decoy page).
+	const wsResponse = await workerModule.default.fetch(
+		new Request('https://worker.example/', { headers: { 'User-Agent': 'UnitTest/1.0', Upgrade: 'websocket' } }),
+		uuidOnlyEnv, ctx,
+	);
+	assert.notEqual(wsResponse.status, 200, 'a UUID-only deploy must still route WS to the tunnel, not the decoy page');
+
+	// ...and the admin panel stays disabled without an explicit ADMIN (the security fix).
+	const adminResponse = await workerModule.default.fetch(
+		new Request('https://worker.example/admin/cf.json', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+		uuidOnlyEnv, ctx,
+	);
+	assert.notEqual(adminResponse.status, 200, 'admin is disabled without an explicit ADMIN credential');
+}
+
+{
 	const response = await workerModule.default.fetch(
 		new Request('https://worker.example/not-a-tunnel', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
 		{ ADMIN: 'admin-password', UUID: '11111111-1111-4111-8111-111111111111', URL: '1101' },

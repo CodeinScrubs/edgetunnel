@@ -235,6 +235,10 @@ export default {
 		// alter userID/subscription/token derivation for any existing deployment.
 		const 身份种子 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
 		const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN;
+		// The TUNNEL must not be gated on the admin password — a UUID-only deployment (no ADMIN) is valid and must
+		// still serve WS/gRPC/XHTTP. Gate tunnel routes on "any credential is configured" and keep 管理员密码 for
+		// /login + /admin only. A worker with NO credential at all falls through to the decoy (fails closed).
+		const 隧道凭据可用 = Boolean(身份种子);
 		const 加密秘钥 = env.KEY || 'default-key-change-with-KEY-env-if-needed';
 		const userIDMD5 = await MD5MD5(身份种子 + 加密秘钥);
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
@@ -272,11 +276,11 @@ export default {
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
 			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-		} else if (管理员密码 && upgradeHeader === 'websocket' && 隧道路径匹配) {
+		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url);
-		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST' && 隧道路径匹配) {
+		} else if (隧道凭据可用 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding');
