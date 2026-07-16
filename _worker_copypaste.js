@@ -331,9 +331,15 @@ export default {
 		const url = new URL(请求URL文本);
 		const UA = request.headers.get('User-Agent') || 'null';
 		const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase(), contentType = (request.headers.get('content-type') || '').toLowerCase();
-		const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
+		// The admin-panel password must NEVER fall back to the UUID or KEY: those travel inside every client
+		// subscription config, so a leaked node would otherwise hand out the panel password. Admin access requires
+		// an explicit admin credential; without one the panel is disabled (the tunnel still works). The broader
+		// 身份种子 (which may include UUID/KEY) is kept ONLY as the userID-derivation seed, so this change does not
+		// alter userID/subscription/token derivation for any existing deployment.
+		const 身份种子 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
+		const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN;
 		const 加密秘钥 = env.KEY || 'default-key-change-with-KEY-env-if-needed';
-		const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
+		const userIDMD5 = await MD5MD5(身份种子 + 加密秘钥);
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
 		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
@@ -2481,7 +2487,13 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 }
 
 function closeRemoteSocketQuietly(socket) {
-	try { socket?.close?.() } catch (e) { }
+	// A Cloudflare TCP socket's close() is asynchronous and returns a promise that can reject (e.g. the peer
+	// already RST'd). Swallow both the synchronous throw AND the async rejection so a routine cleanup during
+	// fallback / client-disconnect / handshake failure never surfaces as an unhandled promise rejection.
+	try {
+		const result = socket?.close?.();
+		if (result && typeof result.catch === 'function') result.catch(() => { });
+	} catch (e) { }
 }
 
 function uniqueDialCandidates(candidates) {
