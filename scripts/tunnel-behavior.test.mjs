@@ -1684,6 +1684,23 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		}
 	}
 	{
+		// Two-stage frame cap. gRPC framing is parsed BEFORE UUID auth, so an unauthenticated peer must not be
+		// able to make the parser reassemble a multi-MB frame: an INCOMPLETE frame is legitimately retained while
+		// waiting for the rest, so releasing consumed tails does not help this case — only a smaller cap does.
+		const 宣告4MB = new Uint8Array([0, 0x00, 0x40, 0x00, 0x00]); // gRPC header declaring a 4MiB message
+		assert.throws(() => parseGrpcFrameChunk(new Uint8Array(0), 宣告4MB, 256 * 1024), /frame too large/,
+			'a 4MiB frame is rejected under the pre-auth cap instead of being accumulated');
+		// The same frame is accepted (kept pending) once authenticated, under the default 4MiB cap.
+		const authed = parseGrpcFrameChunk(new Uint8Array(0), 宣告4MB);
+		assert.equal(authed.payloads.length, 0, 'an incomplete frame yields no payloads yet');
+		assert.equal(authed.pending.byteLength, 5, 'the authenticated path still accumulates the large frame');
+		// A normal-sized first packet (VLESS header + ClientHello is ~2-3KiB) passes the pre-auth cap untouched.
+		const 首包 = encodeGrpcDataFrame(new Uint8Array(2500));
+		assert.equal(parseGrpcFrameChunk(new Uint8Array(0), 首包, 256 * 1024).payloads[0].byteLength, 2500,
+			'a realistic first packet is unaffected by the pre-auth cap');
+	}
+
+	{
 		// A fully-consumed frame must RELEASE its reassembly backing buffer. `pending: merged.subarray(offset)`
 		// left a zero-length view still pinning the whole (2x-headroom) allocation — a pre-auth memory
 		// amplification vector, since gRPC framing is parsed before UUID auth.

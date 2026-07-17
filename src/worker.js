@@ -1306,7 +1306,11 @@ async function 处理gRPC请求(request, yourUUID) {
 					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
-					const parsedFrames = parseGrpcFrameChunk(pending, 当前块);
+					// Until the VLESS/Trojan header authenticates (a remote socket exists, or this is the DNS path),
+					// hold the parser to the small pre-auth frame cap so an unauthenticated peer cannot make it
+					// reassemble a multi-MB frame.
+					const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
+					const parsedFrames = parseGrpcFrameChunk(pending, 当前块, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES);
 					pending = parsedFrames.pending;
 					for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
@@ -2192,14 +2196,21 @@ const GRPC_MAX_FRAMES_PER_CHUNK = 4096;
 // Empty (zero-payload) 5-byte frames carry no tunnel data and are the cheapest flood to generate, so cap them
 // far tighter than total frames. Real xray "gun" traffic sends essentially none in a chunk.
 const GRPC_MAX_EMPTY_FRAMES_PER_CHUNK = 64;
-function readGrpcFrameLength(frameHeader) {
+// Pre-auth frame cap. gRPC framing is parsed BEFORE the UUID is checked, so an unauthenticated peer can make the
+// parser reassemble a frame this large — and an INCOMPLETE frame is legitimately retained while waiting for the
+// rest, with 2x growth headroom on the reassembly buffer. Under the full 4MiB post-auth cap that let one
+// never-authenticating connection pin ~8MiB of a shared 128MiB isolate (releasing consumed tails does NOT help an
+// incomplete frame). A real xray "gun" first frame is the VLESS header + first packet (~2-3KiB), so 256KiB keeps
+// ~100x headroom while cutting the pre-auth amplification ~16x. The 4MiB cap still applies once authenticated.
+const GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024;
+function readGrpcFrameLength(frameHeader, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
 	if (data[0] !== 0) throw new Error(`unsupported gRPC compression flag: ${data[0]}`);
 	// Unsigned 32-bit big-endian length. Plain arithmetic (not `<<`/`|`, which produce a SIGNED int32 — a
 	// top-byte >= 0x80 would go negative and slip past the size cap below on a malformed/hostile frame).
 	const grpcLen = data[1] * 0x1000000 + data[2] * 0x10000 + data[3] * 0x100 + data[4];
-	if (grpcLen > GRPC_MAX_FRAME_PAYLOAD_BYTES) throw new Error(`gRPC frame too large: ${grpcLen}B`);
+	if (grpcLen > maxPayloadBytes) throw new Error(`gRPC frame too large: ${grpcLen}B`);
 	return grpcLen;
 }
 
@@ -2224,7 +2235,7 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 
 // Buffers this parser allocated itself; only these are safe to append into in place.
 const GRPC_REASSEMBLY_BUFFERS = new WeakSet();
-function parseGrpcFrameChunk(pending, chunk) {
+function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
 	const prior = 数据转Uint8Array(pending);
 	const current = 数据转Uint8Array(chunk);
 	let merged;
@@ -2252,7 +2263,7 @@ function parseGrpcFrameChunk(pending, chunk) {
 	while (merged.byteLength - offset >= 5) {
 		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
 		const frameHeader = merged.subarray(offset, offset + 5);
-		const grpcLen = readGrpcFrameLength(frameHeader);
+		const grpcLen = readGrpcFrameLength(frameHeader, maxPayloadBytes);
 		const frameSize = 5 + grpcLen;
 		if (merged.byteLength - offset < frameSize) break;
 		if (grpcLen === 0 && ++emptyFrameCount > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many empty frames');
