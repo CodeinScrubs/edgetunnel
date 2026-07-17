@@ -292,7 +292,11 @@ export default {
 			return await 处理XHTTP请求(request, userID);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
-			if (!管理员密码) return fetchEnglishStaticPage('/noADMIN', 404);
+			// Admin disabled (no explicit ADMIN) is a VALID config — the tunnel still runs on the UUID. Ordinary
+			// traffic must then look like a plain web server rather than announcing "this is a proxy whose admin
+			// panel is unconfigured": serve the same camouflage as any unmatched request. The early return is kept
+			// so the routes below can never compare a password against undefined (fail closed).
+			if (!管理员密码) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 			if (env.KV && typeof env.KV.get === 'function') {
 				const 区分大小写访问路径 = url.pathname.slice(1);
 				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== 'default-key-change-with-KEY-env-if-needed') {

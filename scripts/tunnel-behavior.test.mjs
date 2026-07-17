@@ -547,12 +547,14 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	);
 	assert.notEqual(wsResponse.status, 200, 'a UUID-only deploy must still route WS to the tunnel, not the decoy page');
 
-	// ...and the admin panel stays disabled without an explicit ADMIN (the security fix).
-	const adminResponse = await workerModule.default.fetch(
-		new Request('https://worker.example/admin/cf.json', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+	// ...and the admin panel stays disabled without an explicit ADMIN (the security fix), while ordinary traffic
+	// gets the camouflage page — NOT a distinctive "/noADMIN" 404 that would announce this is an unconfigured proxy.
+	const ordinary = await workerModule.default.fetch(
+		new Request('https://worker.example/some/page', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
 		uuidOnlyEnv, ctx,
 	);
-	assert.notEqual(adminResponse.status, 200, 'admin is disabled without an explicit ADMIN credential');
+	assert.equal(ordinary.status, 200, 'admin-disabled ordinary traffic gets the decoy, not a 404 fingerprint');
+	assert.match(await ordinary.text(), /nginx/i, 'the decoy is the nginx camouflage page');
 }
 
 {
