@@ -2360,7 +2360,17 @@ function parseGrpcFrameChunk(pending, chunk) {
 		if (grpcPayload.byteLength) payloads.push(...unwrapGrpcMessagePayloads(grpcPayload));
 		offset += frameSize;
 	}
-	return { payloads, pending: merged.subarray(offset) };
+	// Don't let a consumed frame's reassembly buffer stay pinned by the leftover view. `subarray` keeps the WHOLE
+	// backing ArrayBuffer alive — after a large frame that buffer carries 2x growth headroom, so a zero-length
+	// tail could pin multiple MB per connection until the next chunk replaced it. This runs BEFORE UUID auth, so
+	// it was a pre-auth memory-amplification vector. Release it when the tail is empty, and copy the tail out when
+	// it is small relative to its backing store; keep the zero-copy view when the tail is most of the buffer.
+	const remaining = merged.byteLength - offset;
+	let nextPending;
+	if (remaining === 0) nextPending = new Uint8Array(0);
+	else if (remaining * 4 < merged.buffer.byteLength) nextPending = merged.slice(offset);
+	else nextPending = merged.subarray(offset);
+	return { payloads, pending: nextPending };
 }
 
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {

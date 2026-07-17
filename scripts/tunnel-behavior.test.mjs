@@ -1682,6 +1682,24 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		}
 	}
 	{
+		// A fully-consumed frame must RELEASE its reassembly backing buffer. `pending: merged.subarray(offset)`
+		// left a zero-length view still pinning the whole (2x-headroom) allocation — a pre-auth memory
+		// amplification vector, since gRPC framing is parsed before UUID auth.
+		const big = encodeGrpcDataFrame(new Uint8Array(256 * 1024));
+		// Feed it split so the parser builds an owned, oversized reassembly buffer, then completes the frame.
+		const firstHalf = parseGrpcFrameChunk(new Uint8Array(0), big.subarray(0, 64));
+		const done = parseGrpcFrameChunk(firstHalf.pending, big.subarray(64));
+		assert.equal(done.payloads.length, 1, 'the split frame reassembles');
+		assert.equal(done.payloads[0].byteLength, 256 * 1024, 'payload survives intact');
+		assert.equal(done.pending.byteLength, 0, 'the frame was fully consumed');
+		assert.ok(done.pending.buffer.byteLength < 4096, `a consumed frame must not pin its reassembly buffer (pinned ${done.pending.buffer.byteLength}B)`);
+		// A small leftover tail is copied out rather than pinning the big buffer.
+		const withTail = parseGrpcFrameChunk(new Uint8Array(0), new Uint8Array([...big, 0x00, 0x00]));
+		assert.equal(withTail.pending.byteLength, 2, 'the incomplete tail is retained');
+		assert.ok(withTail.pending.buffer.byteLength < 4096, 'a small tail is copied out of the large backing buffer');
+	}
+
+	{
 		// Per-chunk frame caps (pre-auth CPU-DoS guards). Real xray "gun" traffic carries a handful of frames
 		// per chunk (bulk data rides in few large frames), so both caps are far above legitimate use.
 		// (a) empty (zero-payload) 5-byte frames — the cheapest flood — are capped tight.
