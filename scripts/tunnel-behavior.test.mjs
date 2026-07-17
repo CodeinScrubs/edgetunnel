@@ -555,6 +555,31 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	);
 	assert.equal(ordinary.status, 200, 'admin-disabled ordinary traffic gets the decoy, not a 404 fingerprint');
 	assert.match(await ordinary.text(), /nginx/i, 'the decoy is the nginx camouflage page');
+
+	// But the ADMIN paths (/login, /admin) show a setup reminder instead of the silent decoy, so the operator
+	// knows what to configure. Fires only on those paths while ADMIN and/or KV are missing.
+	for (const path of ['login', 'admin']) {
+		const resp = await workerModule.default.fetch(
+			new Request(`https://worker.example/${path}`, { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+			uuidOnlyEnv, ctx,
+		);
+		assert.equal(resp.status, 503, `/${path} without ADMIN/KV returns the setup reminder`);
+		const body = await resp.text();
+		assert.match(body, /Setup required/i, `the /${path} reminder says setup is required`);
+		assert.match(body, /ADMIN/, `the /${path} reminder names ADMIN`);
+		assert.match(body, /\bKV\b/, `the /${path} reminder names KV`);
+		// Stealth: the reminder must not identify this as a proxy/tunnel.
+		assert.doesNotMatch(body, /proxy|tunnel|vpn|vless|trojan/i, `the /${path} reminder stays generic`);
+	}
+
+	// With ADMIN set but KV still missing, /login must ALSO get the reminder (this was the user's exact case:
+	// the admin block is gated on KV, so without it /login silently fell to the decoy).
+	const adminNoKv = await workerModule.default.fetch(
+		new Request('https://worker.example/login', { headers: { 'User-Agent': 'UnitTest/1.0' } }),
+		{ UUID: '11111111-1111-4111-8111-111111111111', ADMIN: 'pw' }, ctx,
+	);
+	assert.equal(adminNoKv.status, 503, '/login with ADMIN but no KV still returns the setup reminder');
+	assert.match(await adminNoKv.text(), /\bKV\b/, 'the reminder points at the missing KV binding');
 }
 
 {

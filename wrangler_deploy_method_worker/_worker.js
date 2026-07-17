@@ -396,6 +396,20 @@ export default {
 			return await 处理XHTTP请求(request, userID);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
+			// Setup helper: the admin panel needs BOTH an explicit ADMIN password AND a bound KV namespace. If the
+			// operator visits /login or /admin while either is missing, say exactly what to set instead of silently
+			// serving the decoy (which just looks like "the panel is broken"). Scoped to these two paths only and
+			// only while misconfigured — once ADMIN + KV are set the normal login flow takes over and this never
+			// shows, so ordinary `/` traffic and scanners still see a plain web server. Wording is generic (no
+			// "proxy"/protocol terms) to keep the fingerprint minimal.
+			const 是管理路径 = 访问路径 === 'login' || 访问路径 === 'admin' || 访问路径.startsWith('admin/');
+			const KV已绑定 = Boolean(env.KV && typeof env.KV.get === 'function');
+			if (是管理路径 && (!管理员密码 || !KV已绑定)) {
+				const 缺少配置 = [];
+				if (!管理员密码) 缺少配置.push('the <code>ADMIN</code> environment variable / secret (the admin-panel password)');
+				if (!KV已绑定) 缺少配置.push('a <b>KV namespace binding named <code>KV</code></b> (Settings &rarr; Bindings &rarr; add KV namespace)');
+				return new Response(管理面板设置提示(缺少配置), { status: 503, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
+			}
 			// Admin disabled (no explicit ADMIN) is a VALID config — the tunnel still runs on the UUID. Ordinary
 			// traffic must then look like a plain web server rather than announcing "this is a proxy whose admin
 			// panel is unconfigured": serve the same camouflage as any unmatched request. The early return is kept
@@ -1410,7 +1424,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
-					// Until the VLESS/Trojan header authenticates (a remote socket exists, or this is the DNS path),
+					// Until the 魏烈思/木马 header authenticates (a remote socket exists, or this is the DNS path),
 					// hold the parser to the small pre-auth frame cap so an unauthenticated peer cannot make it
 					// reassemble a multi-MB frame.
 					const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
@@ -2304,7 +2318,7 @@ const GRPC_MAX_EMPTY_FRAMES_PER_CHUNK = 64;
 // parser reassemble a frame this large — and an INCOMPLETE frame is legitimately retained while waiting for the
 // rest, with 2x growth headroom on the reassembly buffer. Under the full 4MiB post-auth cap that let one
 // never-authenticating connection pin ~8MiB of a shared 128MiB isolate (releasing consumed tails does NOT help an
-// incomplete frame). A real xray "gun" first frame is the VLESS header + first packet (~2-3KiB), so 256KiB keeps
+// incomplete frame). A real xray "gun" first frame is the 魏烈思 header + first packet (~2-3KiB), so 256KiB keeps
 // ~100x headroom while cutting the pre-auth amplification ~16x. The 4MiB cap still applies once authenticated.
 const GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024;
 function readGrpcFrameLength(frameHeader, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
@@ -9529,6 +9543,26 @@ async function 解析地址端口Legacy(proxyIP, 目标域名 = 'dash.cloudflare
 	return liveEndpoints;
 }
 
+
+// Setup-reminder page for /login and /admin when ADMIN and/or KV are not configured. Deliberately generic
+// (looks like any unconfigured web app) so it reveals nothing about what this Worker actually is. Only ever
+// reachable on the admin paths while misconfigured; disappears once ADMIN + KV are set.
+function 管理面板设置提示(缺少配置) {
+	const 列表项 = 缺少配置.map(项 => `<li>${项}</li>`).join('');
+	return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup required</title>
+<style>html{color-scheme:light dark;font-family:system-ui,Segoe UI,Arial,sans-serif}
+body{max-width:38em;margin:3rem auto;padding:0 1.25rem;line-height:1.55}
+h1{font-size:1.4rem}code{background:rgba(128,128,128,.18);padding:.1em .35em;border-radius:4px}
+li{margin:.4rem 0}.hint{opacity:.75;font-size:.9rem;margin-top:1.5rem}</style></head>
+<body><h1>Setup required</h1>
+<p>The admin panel is not usable yet because the following ${缺少配置.length > 1 ? 'items are' : 'item is'} not configured:</p>
+<ul>${列表项}</ul>
+<p>Add ${缺少配置.length > 1 ? 'them' : 'it'} in the Cloudflare dashboard (Workers &amp; Pages &rarr; your Worker &rarr; Settings), then redeploy.</p>
+<p class="hint">The connection itself does not require the admin panel — this message only appears on the admin routes while setup is incomplete.</p>
+</body></html>`;
+}
 
 async function nginx() {
 	return `
