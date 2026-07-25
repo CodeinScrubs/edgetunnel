@@ -432,10 +432,11 @@ export default {
 						return new Response('Redirecting...', { status: 302, headers: { 'Location': '/admin' } });
 					}
 					if (request.method === 'POST') {
-						// Bound the pre-auth login body: a login form is tiny, so reject a declared-huge body
-						// instead of buffering it (cheap guard against a memory-spike POST from the open internet).
-						if (Number(request.headers.get('content-length') || 0) > 4096) return new Response('Payload Too Large', { status: 413 });
-						const formData = await request.text();
+						// Bound the pre-auth login body by ACTUAL bytes, not the Content-Length header (a chunked
+						// body omits it), so a memory-spike POST from the open internet can't buffer freely.
+						let formData;
+						try { formData = await 读取有限请求文本(request, 4096); }
+						catch (e) { if (e?.请求体过大) return new Response('Payload Too Large', { status: 413 }); throw e; }
 						const params = new URLSearchParams(formData);
 						const 输入密码 = params.get('password');
 						if (输入密码 === (typeof 管理员密码 === 'string' ? 管理员密码.replace(/[\r\n]/g, '') : 管理员密码)) {
@@ -567,7 +568,7 @@ export default {
 					} else if (request.method === 'POST') {
 						if (访问路径 === 'admin/config.json') {
 							try {
-								const newConfig = await request.json();
+								const newConfig = await 读取有限请求JSON(request, 512 * 1024);
 
 								if (!newConfig.UUID || !newConfig.HOST) return new Response(JSON.stringify({ error: 'Configuration is incomplete' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 
@@ -581,7 +582,7 @@ export default {
 							}
 						} else if (访问路径 === 'admin/cf.json') {
 							try {
-								const newConfig = await request.json();
+								const newConfig = await 读取有限请求JSON(request, 512 * 1024);
 								const CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
 								if (!newConfig.init || newConfig.init !== true) {
 									if (newConfig.Email && newConfig.GlobalAPIKey) {
@@ -607,7 +608,7 @@ export default {
 							}
 						} else if (访问路径 === 'admin/tg.json') {
 							try {
-								const newConfig = await request.json();
+								const newConfig = await 读取有限请求JSON(request, 512 * 1024);
 								if (newConfig.init && newConfig.init === true) {
 									const TG_JSON = { BotToken: null, ChatID: null };
 									await env.KV.put('tg.json', JSON.stringify(TG_JSON, null, 2));
@@ -623,7 +624,7 @@ export default {
 							}
 						} else if (区分大小写访问路径 === 'admin/ADD.txt') {
 							try {
-								const customIPs = await request.text();
+								const customIPs = await 读取有限请求文本(request, 512 * 1024);
 								await env.KV.put('ADD.txt', customIPs);
 								ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
 								return new Response(JSON.stringify({ success: true, message: 'Custom IP list saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -2263,6 +2264,41 @@ function 拼接字节数据(...chunkList) {
 	let offset = 0;
 	for (const c of chunks) { result.set(c, offset); offset += c.byteLength }
 	return result;
+}
+
+// Read a request body with a REAL byte ceiling. A Content-Length check alone is not a limit: a chunked /
+// streaming body omits that header entirely, so `await request.text()` would buffer the whole thing. This
+// counts actual bytes and cancels the stream the moment the cap is crossed, which matters most on the
+// public pre-auth /login route (a 128 MiB isolate is shared with live tunnels).
+async function 读取有限请求体(request, 最大字节) {
+	const 过大 = () => Object.assign(new Error('Request body too large'), { 请求体过大: true });
+	const declared = Number(request.headers.get('content-length') || 0);
+	if (Number.isFinite(declared) && declared > 最大字节) throw 过大();
+	if (!request.body) return new Uint8Array(0);
+	const reader = request.body.getReader();
+	const chunks = [];
+	let total = 0;
+	try {
+		for (; ;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const chunk = 数据转Uint8Array(value);
+			total += chunk.byteLength;
+			if (total > 最大字节) { try { await reader.cancel('request body too large') } catch (e) { } throw 过大(); }
+			if (chunk.byteLength) chunks.push(chunk);
+		}
+	} finally { try { reader.releaseLock() } catch (e) { } }
+	if (!chunks.length) return new Uint8Array(0);
+	return chunks.length === 1 ? chunks[0] : 拼接字节数据(...chunks);
+}
+
+async function 读取有限请求文本(request, 最大字节) {
+	return new TextDecoder().decode(await 读取有限请求体(request, 最大字节));
+}
+
+async function 读取有限请求JSON(request, 最大字节) {
+	const text = await 读取有限请求文本(request, 最大字节);
+	return text ? JSON.parse(text) : {};
 }
 
 function encodeGrpcVarint(value) {
@@ -4029,6 +4065,26 @@ function validateTunnelTarget(host, port) {
 }
 
 
+// Stitch bytes the proxy coalesced into its handshake segment back onto the FRONT of the socket stream.
+// A TransformStream must NOT be used here: its backpressure starts ENGAGED, so `await writer.write(prefix)`
+// does not settle until something reads the readable side — and that readable is only returned after the
+// await, so the connection deadlocks before the first target byte ever arrives ("connects, then hangs").
+// Verified: the TransformStream form times out; this pull-based form delivers prefix-then-body in order.
+function 前置字节流(前置数据, 源可读流) {
+	let 头部 = 数据转Uint8Array(前置数据);
+	let reader = null;
+	return new ReadableStream({
+		start() { reader = 源可读流.getReader(); },
+		async pull(controller) {
+			if (头部 && 头部.byteLength) { const chunk = 头部; 头部 = null; controller.enqueue(chunk); return; }
+			const { done, value } = await reader.read();
+			if (done) { try { reader.releaseLock() } catch (e) { } controller.close(); return; }
+			if (value && value.byteLength) controller.enqueue(value);
+		},
+		async cancel(reason) { try { await reader?.cancel(reason) } catch (e) { } }
+	});
+}
+
 async function socks5Connect(targetHost, targetPort, initialData, TCP连接, proxyAddress = {}) {
 	const { username, password, hostname, port } = proxyAddress;
 	const timeoutMs = getProxyHandshakeTimeoutMs(proxyAddress);
@@ -4085,12 +4141,7 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 		// the handshake reply, those bytes are sitting in `pending` (already read off the socket).
 		// Stitch them back onto the front of the stream so the inner TLS/HTTP2 doesn't desync.
 		if (有效数据长度(pending) > 0) {
-			const { readable, writable } = new TransformStream();
-			const transformWriter = writable.getWriter();
-			await transformWriter.write(pending);
-			transformWriter.releaseLock();
-			socket.readable.pipeTo(writable).catch(() => { });
-			return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
+			return { readable: 前置字节流(pending, socket.readable), writable: socket.writable, closed: socket.closed, close: () => socket.close() };
 		}
 
 		return socket;
@@ -4147,12 +4198,7 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 
 
 		if (bytesRead > headerEndIndex) {
-			const { readable, writable } = new TransformStream();
-			const transformWriter = writable.getWriter();
-			await transformWriter.write(responseBuffer.subarray(headerEndIndex, bytesRead));
-			transformWriter.releaseLock();
-			socket.readable.pipeTo(writable).catch(() => { });
-			return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
+			return { readable: 前置字节流(responseBuffer.subarray(headerEndIndex, bytesRead), socket.readable), writable: socket.writable, closed: socket.closed, close: () => socket.close() };
 		}
 
 		return socket;
