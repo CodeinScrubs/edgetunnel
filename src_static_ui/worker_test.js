@@ -239,7 +239,9 @@ function getDohLookupUrl(env = {}) {
 	if (!raw) return DEFAULT_DOH_LOOKUP_URL;
 	try {
 		const url = new URL(raw);
-		if (url.protocol === 'https:' || url.protocol === 'http:') return url.href;
+		// HTTPS only. A cleartext DoH endpoint would let anyone on the path read and REWRITE the tunnel's DNS
+		// answers (redirecting a destination), which defeats the point of tunnelling in the first place.
+		if (url.protocol === 'https:') return url.href;
 	} catch (error) { }
 	return DEFAULT_DOH_LOOKUP_URL;
 }
@@ -252,7 +254,7 @@ function getDohLookupUrls(env = {}) {
 	const fallbackRaw = String(env?.DOH_URL_FALLBACK || 'https://dns.google/dns-query').trim();
 	try {
 		const u = new URL(fallbackRaw);
-		if ((u.protocol === 'https:' || u.protocol === 'http:') && u.href !== primary) urls.push(u.href);
+		if (u.protocol === 'https:' && u.href !== primary) urls.push(u.href);
 	} catch (error) { }
 	return urls;
 }
@@ -1464,14 +1466,19 @@ async function 处理gRPC请求(request, yourUUID) {
 					const { done, value } = await reader.read();
 					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
-					const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
+					let 待并入 = value instanceof Uint8Array ? value : new Uint8Array(value);
 					// Until the 魏烈思/木马 header authenticates (a remote socket exists, or this is the DNS path),
 					// hold the parser to the small pre-auth frame cap so an unauthenticated peer cannot make it
-					// reassemble a multi-MB frame.
-					const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
-					const parsedFrames = parseGrpcFrameChunk(pending, 当前块, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES);
-					pending = parsedFrames.pending;
-					for (const payload of parsedFrames.payloads) {
+					// reassemble a multi-MB frame. While unauthenticated we also take ONE frame per pass and
+					// process it before measuring the next: a single read can carry [small auth frame][large data
+					// frame], and judging the large one under the pre-auth cap rejected a stream that had in fact
+					// just authenticated. Once authenticated the whole chunk is parsed in one pass, as before.
+					for (; ;) {
+						const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
+						const parsedFrames = parseGrpcFrameChunk(pending, 待并入, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES, 已认证 ? Infinity : 1);
+						pending = parsedFrames.pending;
+						待并入 = GRPC空块;
+						for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
 							else await forwardataudp(payload, grpcBridge, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
@@ -1519,8 +1526,12 @@ async function 处理gRPC请求(request, yourUUID) {
 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
 							}
 						}
+						}
+						刷新发送队列();
+						// Authenticated pass already consumed the whole chunk. Otherwise keep taking one frame at
+						// a time for as long as frames are actually being consumed (auth may have just flipped).
+						if (已认证 || !parsedFrames.consumed) break;
 					}
-					刷新发送队列();
 				}
 				await 上行写入队列.等待空();
 				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
@@ -2412,6 +2423,9 @@ const GRPC_MAX_EMPTY_FRAMES_PER_CHUNK = 64;
 // incomplete frame). A real xray "gun" first frame is the 魏烈思 header + first packet (~2-3KiB), so 256KiB keeps
 // ~100x headroom while cutting the pre-auth amplification ~16x. The 4MiB cap still applies once authenticated.
 const GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024;
+// Shared empty view: later passes of the one-frame-at-a-time pre-auth loop merge no NEW bytes, they just
+// drain what is already buffered in `pending`.
+const GRPC空块 = new Uint8Array(0);
 function readGrpcFrameLength(frameHeader, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
@@ -2444,7 +2458,12 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 
 // Buffers this parser allocated itself; only these are safe to append into in place.
 const GRPC_REASSEMBLY_BUFFERS = new WeakSet();
-function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
+// maxFrames bounds how many frames one call may consume. The caller passes 1 while the stream is still
+// UNAUTHENTICATED so each frame is processed (and can flip the auth state) before the next one is measured
+// against a cap — otherwise a read holding [small auth frame][large data frame] judged the large frame under
+// the pre-auth cap and rejected it even though authentication had just succeeded. Default is unlimited, so
+// the authenticated hot path keeps parsing a whole chunk in one pass exactly as before.
+function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES, maxFrames = Infinity) {
 	const prior = 数据转Uint8Array(pending);
 	const current = 数据转Uint8Array(chunk);
 	let merged;
@@ -2468,8 +2487,9 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	}
 	const payloads = [];
 	let offset = 0;
-	let frameCount = 0, emptyFrameCount = 0;
+	let frameCount = 0, emptyFrameCount = 0, 已消费帧数 = 0;
 	while (merged.byteLength - offset >= 5) {
+		if (已消费帧数 >= maxFrames) break;
 		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
 		const frameHeader = merged.subarray(offset, offset + 5);
 		const grpcLen = readGrpcFrameLength(frameHeader, maxPayloadBytes);
@@ -2479,6 +2499,7 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 		const grpcPayload = merged.subarray(offset + 5, offset + frameSize);
 		if (grpcPayload.byteLength) payloads.push(...unwrapGrpcMessagePayloads(grpcPayload));
 		offset += frameSize;
+		已消费帧数++;
 	}
 	// Don't let a consumed frame's reassembly buffer stay pinned by the leftover view. `subarray` keeps the WHOLE
 	// backing ArrayBuffer alive — after a large frame that buffer carries 2x growth headroom, so a zero-length
@@ -2490,7 +2511,10 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	if (remaining === 0) nextPending = new Uint8Array(0);
 	else if (remaining * 4 < merged.buffer.byteLength) nextPending = merged.slice(offset);
 	else nextPending = merged.subarray(offset);
-	return { payloads, pending: nextPending };
+	// `consumed` = complete frames taken this call. The caller loops on it while unauthenticated: an EMPTY
+	// frame yields no payload yet still advances the buffer, so "did we make progress" cannot be inferred
+	// from payloads.length alone.
+	return { payloads, pending: nextPending, consumed: 已消费帧数 };
 }
 
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
@@ -3436,6 +3460,12 @@ function getWsBufferedAmountMaxWaitMs(env) {
 	return Math.max(100, Math.min(10000, Math.round(configured)));
 }
 
+// Hard ceiling for a client that never drains: 8x the soft limit, floored at 8 MiB so it can only fire on a
+// genuinely stuck consumer, never on an ordinary slow one.
+function 下行硬上限字节(软上限) {
+	return Math.max(8 * 1024 * 1024, 软上限 * 8);
+}
+
 async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
@@ -3449,6 +3479,14 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit && 已等待 < maxWaitMs) {
 			await new Promise(r => setTimeout(r, 5));
 			已等待 += 5;
+		}
+		// After the bounded wait we deliberately keep sending: a phone on a weak link can sit above the soft
+		// limit for seconds during a burst, and tearing that connection down would cause the very drops this
+		// tunnel is tuned to avoid. But "send anyway" forever is not a bound, so a HARD ceiling well above the
+		// soft limit ends a client that is not draining at all — by then it is effectively dead, and stopping
+		// protects the other tunnels sharing the isolate's memory.
+		if (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 下行硬上限字节(bufferedLimit)) {
+			throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
 		}
 	}
 }
@@ -4112,7 +4150,11 @@ function 前置字节流(前置数据, 源可读流) {
 			if (done) { try { reader.releaseLock() } catch (e) { } controller.close(); return; }
 			if (value && value.byteLength) controller.enqueue(value);
 		},
-		async cancel(reason) { try { await reader?.cancel(reason) } catch (e) { } }
+		async cancel(reason) {
+			try { await reader?.cancel(reason) }
+			catch (e) { }
+			finally { try { reader?.releaseLock() } catch (e) { } reader = null; 头部 = null; }
+		}
 	});
 }
 
