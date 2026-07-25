@@ -143,6 +143,10 @@ const Pages静态页面 = ENGINE_DEFAULTS.PAGES_STATIC_URL;
 
 const WS早期数据最大字节 = ENGINE_DEFAULTS.WS_EARLY_DATA_MAX_BYTES, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
 const 上行合包目标字节 = ENGINE_DEFAULTS.UPLINK_BUNDLE_TARGET_BYTES, 上行队列最大字节 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_BYTES, 上行队列最大条目 = ENGINE_DEFAULTS.UPLINK_QUEUE_MAX_ITEMS;
+// Ceiling for ONE inbound WS message (see the message handler): the aggregate queue cap cannot bound a single
+// huge frame because the runtime buffers it fully before dispatch. 8 MiB is far above any real client's frame
+// (xray fragments to tens of KiB) while keeping one frame from dominating the 128 MiB isolate.
+const WS单帧最大字节 = 8 * 1024 * 1024;
 const 下行Grain包字节 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_PACKET_BYTES, 下行Grain尾部阈值 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_TAIL_THRESHOLD, 下行Grain静默毫秒 = ENGINE_DEFAULTS.DOWNLINK_GRAIN_QUIET_MS;
 const 下行背压高水位字节 = ENGINE_DEFAULTS.DOWNLINK_BACKPRESSURE_HWM_BYTES;
 const WS缓冲上限字节 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_LIMIT_BYTES, WS缓冲最大等待毫秒 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_MAX_WAIT_MS;
@@ -870,12 +874,16 @@ export default {
 };
 
 async function 处理XHTTP请求(request, yourUUID) {
-	if (!request.body) return new Response('Bad Request', { status: 400 });
+	// Pre-auth failures must be indistinguishable from an ordinary unmatched request: with PATH unset every
+	// path matches, so any POST reaches this parser, and a distinctive 400 tells a scanner this is not a plain
+	// web server. Same camouflage as the routing tail. The errors below are post-auth (a credential already
+	// parsed) and may report real statuses.
+	if (!request.body) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	const reader = request.body.getReader();
 	const 首包 = await 读取XHTTP首包(reader, yourUUID);
 	if (!首包) {
 		try { reader.releaseLock() } catch (e) { }
-		return new Response('Invalid request', { status: 400 });
+		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	}
 	if (isSpeedTestSite(首包.hostname)) {
 		try { reader.releaseLock() } catch (e) { }
@@ -980,7 +988,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接: () => {
-					try { remoteConnWrapper.socket?.close() } catch (e) { }
+					closeRemoteSocketQuietly(remoteConnWrapper.socket);
 					closeSocketQuietly(xhttpBridge);
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
@@ -1027,7 +1035,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			} catch (err) {
 				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
-				try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream too (WS/gRPC already do)
+				closeRemoteSocketQuietly(remoteConnWrapper.socket); // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
@@ -1043,7 +1051,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
-			try { remoteConnWrapper.socket?.close() } catch (e) { }
+			closeRemoteSocketQuietly(remoteConnWrapper.socket);
 			释放远端写入器();
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
@@ -1219,7 +1227,8 @@ async function 读取XHTTP首包(reader, token) {
 }
 
 async function 处理gRPC请求(request, yourUUID) {
-	if (!request.body) return new Response('Bad Request', { status: 400 });
+	// Pre-auth: same camouflage as 处理XHTTP请求 rather than a fingerprintable 400.
+	if (!request.body) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	const reader = request.body.getReader();
 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	remoteConnWrapper.追踪 = 创建连接追踪器('grpc', request, getWorkerRequestContext(request)?.env);
@@ -1377,7 +1386,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				}
 				当前写入Socket = null;
 				try { reader.releaseLock() } catch (e) { }
-				try { remoteConnWrapper.socket?.close() } catch (e) { }
+				closeRemoteSocketQuietly(remoteConnWrapper.socket);
 				try { controller.close() } catch (e) { }
 			};
 
@@ -1526,7 +1535,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				远端写入器 = null;
 			}
 			当前写入Socket = null;
-			try { remoteConnWrapper.socket?.close() } catch (e) { }
+			closeRemoteSocketQuietly(remoteConnWrapper.socket);
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
@@ -1625,7 +1634,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			await remoteConnWrapper.retryConnect();
 		},
 		关闭连接: () => {
-			try { remoteConnWrapper.socket?.close() } catch (e) { }
+			closeRemoteSocketQuietly(remoteConnWrapper.socket);
 			closeSocketQuietly(serverSock);
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
@@ -1975,7 +1984,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		上行写入队列.清空();
 		释放远端写入器();
-		try { remoteConnWrapper.socket?.close() } catch (e) { } // close the upstream directly, not only via the serverSock close cascade
+		closeRemoteSocketQuietly(remoteConnWrapper.socket); // close the upstream directly, not only via the serverSock close cascade
 		closeSocketQuietly(serverSock);
 	};
 
@@ -2003,7 +2012,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		});
 	};
 
-	const 收尾WS显式传输 = () => {
+	const 收尾WS显式传输 = (关闭远端 = false) => {
 		if (WS显式传输收尾已入队) return;
 		WS显式传输收尾已入队 = true;
 		WS显式传输停止接收 = true;
@@ -2011,12 +2020,27 @@ async function 处理WS请求(request, yourUUID, url) {
 			if (WS显式传输失败) return;
 			await 上行写入队列.等待空();
 			释放远端写入器();
+		}).finally(() => {
+			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
+			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
+			// before the close frame was still being written when the socket died, so its bytes were lost
+			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
+			if (关闭远端) { closeRemoteSocketQuietly(remoteConnWrapper.socket); }
 		});
 	};
 
 	serverSock.addEventListener('message', (event) => {
 		if (typeof event.data === 'string') {
 			处理WS显式传输错误(new Error('[WS explicit transport] text frames are not supported'));
+			return;
+		}
+		// Per-MESSAGE ceiling. The aggregate queue cap can't protect the isolate from one huge frame: the
+		// runtime fully buffers an inbound WS message before this handler ever sees it, so a single oversized
+		// frame is already resident. Reject it here instead of admitting it to the queue and retaining it
+		// further. Real clients fragment well below this; the cap is generous enough never to hit normal use.
+		const 单帧字节 = 有效数据长度(event.data);
+		if (单帧字节 > WS单帧最大字节) {
+			处理WS显式传输错误(new Error(`[WS explicit transport] frame too large: ${单帧字节}B`));
 			return;
 		}
 		入队WS显式传输(event.data);
@@ -2028,10 +2052,10 @@ async function 处理WS请求(request, yourUUID, url) {
 		remoteConnWrapper.closeHint = 'client_close';
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 		closeSocketQuietly(serverSock);
-		// Close the outbound remote socket too, so a client disconnect while the remote is silent
-		// doesn't leak the TCP socket + a blocked reader (gRPC/XHTTP already do this in cancel()).
-		try { remoteConnWrapper.socket?.close() } catch (e) { }
-		收尾WS显式传输();
+		// The outbound remote socket is closed by 收尾WS显式传输's finalizer — AFTER the message chain drains
+		// and the upload queue empties — so a client disconnect still can't leak the socket + a blocked reader
+		// (gRPC/XHTTP do this in cancel()), but a final in-flight upload isn't cut off mid-write either.
+		收尾WS显式传输(true);
 	});
 	serverSock.addEventListener('error', (err) => {
 		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
@@ -2039,7 +2063,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		remoteConnWrapper.客户端已关闭 = true;
 		remoteConnWrapper.closeHint = 'client_ws_error';
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err?.error || err);
-		try { remoteConnWrapper.socket?.close() } catch (e) { }
+		closeRemoteSocketQuietly(remoteConnWrapper.socket);
 		处理WS显式传输错误(err);
 	});
 
@@ -2495,6 +2519,7 @@ async function SS派生主密钥(passwordText, keyLen) {
 		return result.slice(0, keyLen);
 	})();
 	SS主密钥缓存.set(cacheKey, deriveTask);
+	while (SS主密钥缓存.size > HASH_CACHE_MAX_ENTRIES) SS主密钥缓存.delete(SS主密钥缓存.keys().next().value);
 	try { return await deriveTask }
 	catch (error) { SS主密钥缓存.delete(cacheKey); throw error }
 }
@@ -2858,7 +2883,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 						const writer = newSocket.writable.getWriter();
 						try { await writer.write(数据转Uint8Array(本次首包数据)) }
 						finally { try { writer.releaseLock() } catch (e) { } }
-					} catch (err) { try { newSocket.close?.() } catch (e) { } throw err; }
+					} catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
 				}
 			} else if (proxyType === 'sstp') {
 				log(`[SSTP proxy] Proxying to: ${host}:${portNum}`);
@@ -2868,7 +2893,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 						const writer = newSocket.writable.getWriter();
 						try { await writer.write(数据转Uint8Array(本次首包数据)) }
 						finally { try { writer.releaseLock() } catch (e) { } }
-					} catch (err) { try { newSocket.close?.() } catch (e) { } throw err; }
+					} catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
 				}
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
@@ -2882,12 +2907,15 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// sees itself as stale (wrapper.socket !== its socket) and won't close the shared client. Closing the
 			// old socket here also prevents a leak when a reconnect replaces a still-open (blackholed) socket.
 			const 旧远端Socket = remoteConnWrapper.socket;
+			// Client left mid-dial (app backgrounded): close the freshly-dialed socket instead of installing and
+			// piping it to a dead client, so a blackholed relay can't pin it open against the connection cap.
+			if (remoteConnWrapper.客户端已关闭) { closeRemoteSocketQuietly(newSocket); return; }
 			remoteConnWrapper.socket = newSocket;
 			// Clear any close hint the superseded (direct) pipe left behind — e.g. 'first_byte_timeout' — so a
 			// successful ProxyIP takeover isn't mis-reported with the old route's failure reason.
 			remoteConnWrapper.closeHint = null;
 			追踪记录路由(remoteConnWrapper.追踪, proxyType || 'proxyip', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
-			if (旧远端Socket && 旧远端Socket !== newSocket) { try { 旧远端Socket.close?.() } catch (e) { } }
+			if (旧远端Socket && 旧远端Socket !== newSocket) { closeRemoteSocketQuietly(旧远端Socket); }
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
 			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
 			// must not have the stale socket's closed-promise tear down the healthy replacement's client ws.
@@ -2950,6 +2978,10 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP forwarding] Trying direct connection to: ${host}:${portNum}`);
 			追踪拨号尝试(remoteConnWrapper.追踪);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
+			// If the client went away (app backgrounded) while this dial was in flight, the abort handler
+			// already fired but couldn't reach this not-yet-installed socket. Close it now so a blackholed
+			// remote can't pin it open indefinitely, leaking against the free-plan connection cap.
+			if (remoteConnWrapper.客户端已关闭) { closeRemoteSocketQuietly(initialSocket); return; }
 			remoteConnWrapper.socket = initialSocket;
 			追踪记录路由(remoteConnWrapper.追踪, 'direct', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
 			// First-byte watchdog on the direct path. When the first packet carries NO data it may safely
@@ -3973,6 +4005,10 @@ function isProbablyValidDomain(host) {
 	if (!value || value.length > 253 || /[\s\0]/.test(value)) return false;
 	if (!value.includes('.')) return false;
 	const labels = value.split('.');
+	// A real domain's rightmost label (TLD) is never all-numeric. Rejecting an all-numeric TLD blocks
+	// non-canonical IP forms (127.1, 0177.0.0.1, 999.1.1.1) that otherwise pass here as "domains" and slip
+	// past the private-IP checks — an SSRF / DNS-rebind bypass. Canonical IP literals go via isIPHostname.
+	if (/^\d+$/.test(labels[labels.length - 1])) return false;
 	return labels.every(label => label.length >= 1 && label.length <= 63 && /^[a-zA-Z0-9-]+$/.test(label) && !label.startsWith('-') && !label.endsWith('-'));
 }
 
@@ -4143,7 +4179,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 			log(`[HTTPS proxy] TLS version: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
 			return socket;
 		} catch (error) {
-			try { proxySocket.close() } catch (e) { }
+			closeRemoteSocketQuietly(proxySocket);
 			throw error;
 		}
 	};
