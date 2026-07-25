@@ -1028,7 +1028,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				}
 
 				if (!首包.isUDP) {
-					await 上行写入队列.等待空();
+					await 有限排空上行队列(上行写入队列);
 					const writer = 获取远端写入器();
 					if (writer) {
 						try { await writer.close() } catch (e) { }
@@ -1430,6 +1430,7 @@ async function 处理gRPC请求(request, yourUUID) {
 			try {
 				let pending = new Uint8Array(0);
 				let 正常结束 = false;
+				let 预认证帧数 = 0, 预认证无数据帧数 = 0;
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
@@ -1441,20 +1442,21 @@ async function 处理gRPC请求(request, yourUUID) {
 					// process it before measuring the next: a single read can carry [small auth frame][large data
 					// frame], and judging the large one under the pre-auth cap rejected a stream that had in fact
 					// just authenticated. Once authenticated the whole chunk is parsed in one pass, as before.
-					// Flood budgets for THIS read. parseGrpcFrameChunk's own counters are per-call, so the
-					// one-frame-at-a-time pre-auth loop below would reset them on every frame and never reach the
-					// caps; accumulate here so an unauthenticated peer can't spend the CPU budget on a chunk packed
-					// with thousands of (empty) frames.
-					let 本次读取帧数 = 0, 本次读取空帧数 = 0;
 					for (; ;) {
 						const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
 						const parsedFrames = parseGrpcFrameChunk(pending, 待并入, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES, 已认证 ? Infinity : 1);
 						pending = parsedFrames.pending;
 						待并入 = GRPC空块;
-						本次读取帧数 += parsedFrames.consumed;
-						本次读取空帧数 += parsedFrames.emptyConsumed;
-						if (本次读取帧数 > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC read contains too many frames');
-						if (本次读取空帧数 > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC read contains too many empty frames');
+						// Pre-auth budgets span the WHOLE request, not one read: the parser's own counters are
+						// per-call and a per-read tally still resets on every body chunk, so a peer that drip-feeds
+						// one no-data frame per chunk would never reach either cap. Only unauthenticated frames are
+						// charged, so ordinary traffic is untouched once the header lands.
+						if (!已认证) {
+							预认证帧数 += parsedFrames.consumed;
+							预认证无数据帧数 += parsedFrames.emptyConsumed;
+							if (预认证帧数 > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC request sent too many pre-auth frames');
+							if (预认证无数据帧数 > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC request sent too many no-data frames');
+						}
 						for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
@@ -1510,7 +1512,7 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (已认证 || !parsedFrames.consumed) break;
 					}
 				}
-				await 上行写入队列.等待空();
+				await 有限排空上行队列(上行写入队列);
 				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
 				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
 				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
@@ -2474,7 +2476,7 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	}
 	const payloads = [];
 	let offset = 0;
-	let frameCount = 0, emptyFrameCount = 0, 已消费帧数 = 0;
+	let frameCount = 0, emptyFrameCount = 0, 已消费帧数 = 0, 无数据帧数 = 0;
 	while (merged.byteLength - offset >= 5) {
 		if (已消费帧数 >= maxFrames) break;
 		if (++frameCount > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many frames');
@@ -2484,7 +2486,12 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 		if (merged.byteLength - offset < frameSize) break;
 		if (grpcLen === 0 && ++emptyFrameCount > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many empty frames');
 		const grpcPayload = merged.subarray(offset + 5, offset + frameSize);
-		if (grpcPayload.byteLength) payloads.push(...unwrapGrpcMessagePayloads(grpcPayload));
+		const 本帧负载 = grpcPayload.byteLength ? unwrapGrpcMessagePayloads(grpcPayload) : [];
+		// Count frames that carry no tunnel data SEMANTICALLY, not just outer-length-zero ones: a frame whose
+		// protobuf body is a zero-length data field (0a 00) has a non-zero outer length yet still yields nothing,
+		// so counting only grpcLen===0 let an unauthenticated peer spend parse work without ever tripping the cap.
+		if (!本帧负载.length) 无数据帧数++;
+		else payloads.push(...本帧负载);
 		offset += frameSize;
 		已消费帧数++;
 	}
@@ -2503,7 +2510,7 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	// from payloads.length alone. `emptyConsumed` lets the caller carry the flood budgets ACROSS calls —
 	// the counters below are per-call, so a one-frame-at-a-time loop would otherwise reset them every frame
 	// and never reach the limits.
-	return { payloads, pending: nextPending, consumed: 已消费帧数, emptyConsumed: emptyFrameCount };
+	return { payloads, pending: nextPending, consumed: 已消费帧数, emptyConsumed: 无数据帧数 };
 }
 
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
@@ -9093,6 +9100,18 @@ function getDialStaggerMs(env) {
 	const configured = Number(env?.DIAL_STAGGER_MS);
 	if (!Number.isFinite(configured) || configured < 0) return DIAL_STAGGER_MS;
 	return Math.max(0, Math.min(500, Math.round(configured)));
+}
+
+// Teardown-only drain bound. 等待空() waits for the uplink queue to empty, and the per-write watchdog is off
+// by default, so a remote writer that never settles would keep a teardown pending forever and hold its socket
+// open. Applies at teardown only — normal uploads are never timed by this.
+async function 有限排空上行队列(队列, timeoutMs = 5000) {
+	if (!队列) return;
+	try { await withOperationTimeout(队列.等待空(), timeoutMs, 'Upload teardown drain timed out'); }
+	catch (error) {
+		log(`[Teardown] ${error?.message || error}`);
+		try { 队列.清空() } catch (e) { }
+	}
 }
 
 async function withOperationTimeout(operation, timeoutMs, message, onTimeout = null) {
