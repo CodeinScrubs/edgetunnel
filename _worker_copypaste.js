@@ -2038,7 +2038,12 @@ async function 处理WS请求(request, yourUUID, url) {
 		WS显式传输停止接收 = true;
 		追加WS显式传输任务(async () => {
 			if (WS显式传输失败) return;
-			await 上行写入队列.等待空();
+			// Bounded: 等待空() waits for the uplink queue to drain, and the per-write watchdog is off by
+			// default, so a wedged remote writer would otherwise keep this teardown pending forever — holding
+			// the remote socket open against the platform's small simultaneous-connection budget and making
+			// later dials queue behind a connection that is already dead.
+			try { await withOperationTimeout(上行写入队列.等待空(), 5000, 'WS teardown drain timed out'); }
+			catch (e) { log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
 		}).finally(() => {
 			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
@@ -9309,12 +9314,21 @@ function scheduleProxyCacheWrite(env, ctx, cacheKey, record, now = Date.now(), f
 	// Global throttle across all target-aware keys so active browsing cannot exhaust the
 	// free-plan daily KV write quota. Applies even to forced writes (they retry on the next pass).
 	if (now - 上次代理缓存KV写入 < PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS) return;
+	// Claim the slot up front so concurrent requests in this isolate don't stampede, but ROLL IT BACK if the
+	// write fails. Leaving the timestamps advanced after a failure silenced the next 3 minutes of writes, so a
+	// single transient KV error kept the resolution cache from ever persisting — every isolate then re-resolved
+	// the proxy list over DoH before it could dial, which is a latency cost on the connect path.
+	const 上次全局写入 = 上次代理缓存KV写入, 上次记录写入 = record.lastKvWriteAt;
+	const 回滚写入节流 = () => {
+		if (上次代理缓存KV写入 === now) 上次代理缓存KV写入 = 上次全局写入;
+		if (record.lastKvWriteAt === now) record.lastKvWriteAt = 上次记录写入;
+	};
 	上次代理缓存KV写入 = now;
 	record.lastKvWriteAt = now;
 	let writePromise;
 	try {
 		writePromise = Promise.resolve(env.KV.put(cacheKey, serializeProxyCacheRecord(record, now), { expirationTtl: PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS }))
-			.catch(error => log(`[ProxyIP cache] KV write failed: ${error?.message || error}`));
+			.catch(error => { 回滚写入节流(); log(`[ProxyIP cache] KV write failed: ${error?.message || error}`); });
 		if (ctx?.waitUntil) {
 			try { ctx?.waitUntil?.(writePromise) }
 			catch (error) {
@@ -9323,6 +9337,7 @@ function scheduleProxyCacheWrite(env, ctx, cacheKey, record, now = Date.now(), f
 			}
 		} else writePromise.catch(() => { });
 	} catch (error) {
+		回滚写入节流();
 		log(`[ProxyIP cache] KV write failed: ${error?.message || error}`);
 	}
 }
