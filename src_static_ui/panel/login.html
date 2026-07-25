@@ -1,0 +1,96 @@
+<!-- Extracted from src_static_ui/worker_test.js for reference. Live data needs the worker backend. -->
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>Sign in</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--panel:#fff;--ink:#11151c;--muted:#5f6b7a;--line:#e3e7ec;--accent:#3b5bdb;--accent-ink:#fff;--ok:#0f7b47;--bad:#b42318;--code:#f1f3f5}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--ink:#e6edf3;--muted:#98a3b0;--line:#2a313a;--accent:#5c7cfa;--accent-ink:#fff;--ok:#3dd68c;--bad:#ff6b6b;--code:#0b0e12}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+a{color:var(--accent)}
+header{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.9rem 1.25rem;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.brand{font-weight:650;letter-spacing:.2px}
+.brand span{display:block;font-weight:400;font-size:.78rem;color:var(--muted)}
+.wrap{max-width:88rem;margin:0 auto;padding:1.1rem 1.5rem}
+nav.tabs{display:flex;flex-wrap:wrap;gap:.35rem;margin-bottom:1.1rem}
+nav.tabs button{border:1px solid var(--line);background:var(--panel);color:var(--muted);padding:.45rem .85rem;border-radius:999px;cursor:pointer;font:inherit;font-size:.9rem}
+nav.tabs button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+section{display:none}
+section.on{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1.1rem;margin-bottom:1rem}
+.card h2{margin:0 0 .25rem;font-size:1rem}
+.card p.hint{margin:0 0 .9rem;color:var(--muted);font-size:.86rem}
+label{display:block;font-size:.82rem;color:var(--muted);margin:.6rem 0 .25rem}
+input,select,textarea{width:100%;padding:.5rem .6rem;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+textarea{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;min-height:22rem;resize:vertical}
+button.act{border:0;background:var(--accent);color:var(--accent-ink);padding:.5rem 1rem;border-radius:8px;cursor:pointer;font:inherit;font-size:.9rem}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:0 .8rem}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:.4rem .9rem;font-size:.9rem}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+.msg{margin-top:.8rem;font-size:.87rem;min-height:1.2em}
+.msg.ok{color:var(--ok)}
+.msg.bad{color:var(--bad)}
+pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:.75rem;overflow:auto;font-size:.82rem;max-height:26rem}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:500}
+.scroll{overflow-x:auto}
+.ovgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 1.1rem;align-items:start}
+.envgroup{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1rem 0 .35rem}
+.envgroup:first-child{margin-top:0}
+.envrow{margin-bottom:.55rem}
+.envrow .envlabel{display:flex;align-items:center;gap:.35rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.75rem;color:var(--ink);margin:.15rem 0}
+.envrow input{padding:.38rem .55rem}
+#envrows{display:grid;grid-template-columns:1fr 1fr;gap:0 .9rem;align-items:end}
+#envrows .envgroup{grid-column:1/-1}
+.envcur{font-size:.72rem;color:var(--muted);margin:.1rem 0 .05rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+.envcur .envval{color:var(--ink)}
+.envbadge{font-size:.62rem;padding:.03rem .4rem;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+.envbadge.set{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.envbadge.def{color:var(--muted)}
+.tip{display:inline-flex;align-items:center;justify-content:center;min-width:1.15em;height:1.15em;border-radius:50%;background:var(--muted);color:var(--panel);font-size:.7rem;font-weight:700;font-style:normal;cursor:help;position:relative;outline:none;flex:none;user-select:none}
+.tip::after{content:attr(data-tip);position:absolute;left:0;top:150%;background:var(--ink);color:var(--bg);padding:.55rem .7rem;border-radius:8px;width:17rem;max-width:74vw;font-size:.76rem;font-weight:400;line-height:1.45;letter-spacing:normal;text-transform:none;font-family:system-ui,sans-serif;z-index:30;box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:0;visibility:hidden;transition:opacity .12s}
+.tip:hover::after,.tip:focus::after{opacity:1;visibility:visible}
+h2 .tip{vertical-align:middle;margin-left:.35rem}
+@media(max-width:860px){
+.ovgrid{grid-template-columns:1fr}
+#envrows{grid-template-columns:1fr}
+.wrap{padding:1rem .75rem}
+header{padding:.8rem 1rem}
+.foot{flex-wrap:wrap;gap:.5rem}
+.foot .msg{flex-basis:100%;order:3}
+.tip::after{left:auto;right:0}
+}
+
+body{display:grid;place-items:center;min-height:100vh;padding:1.25rem}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.6rem;width:min(23rem,100%)}
+h1{margin:0 0 .2rem;font-size:1.15rem}
+</style></head>
+<body><main class="box">
+<h1>Sign in</h1>
+<p class="hint" style="color:var(--muted);font-size:.86rem;margin:.2rem 0 1rem">Enter your access password to continue.</p>
+<form id="f" autocomplete="on">
+<label for="pw">Password</label>
+<input id="pw" name="password" type="password" autocomplete="current-password" required autofocus>
+<div class="row"><button class="act" id="b" type="submit" style="width:100%">Sign in</button></div>
+</form>
+<div class="msg" id="m"></div>
+</main>
+<script>
+var f=document.getElementById('f'),pw=document.getElementById('pw'),b=document.getElementById('b'),m=document.getElementById('m');
+f.addEventListener('submit',function(ev){
+  ev.preventDefault();
+  m.className='msg';m.textContent='';b.disabled=true;b.textContent='Signing in...';
+  fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(pw.value)})
+    .then(function(r){return r.json().catch(function(){return null})})
+    .then(function(j){
+      if(j&&j.success===true){location.href='/admin';return}
+      m.className='msg bad';m.textContent='Incorrect password.';
+      b.disabled=false;b.textContent='Sign in';pw.select();
+    })
+    .catch(function(){m.className='msg bad';m.textContent='Network error. Try again.';b.disabled=false;b.textContent='Sign in'});
+});
+</script></body></html>
