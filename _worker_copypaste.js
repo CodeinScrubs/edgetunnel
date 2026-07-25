@@ -2687,6 +2687,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const forceProxyHosts = Array.isArray(tunnelContext.forceProxyHosts) ? tunnelContext.forceProxyHosts : [];
 	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
+	// Proxy-path concurrency is tracked separately (PROXY_CONCURRENT_DIAL); it defaults to the TCP value, so
+	// behavior is unchanged unless it is explicitly set.
+	const proxyDialConcurrency = Math.max(1, (tunnelContext.proxyDialConcurrency | 0) || dialConcurrency);
 	const 已有首包数据 = 有效数据长度(rawData) > 0;
 	// A request is "sent" as soon as the first packet carries data (e.g. a ClientHello); a later uplink write
 	// also sets this (via 写入开始). A connection that never sets it is a no-request preconnect — the no-data
@@ -2796,9 +2799,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = true) {
 		if (所有反代数组 && 所有反代数组.length > 0) {
-			for (let i = 0; i < 所有反代数组.length; i += dialConcurrency) {
+			for (let i = 0; i < 所有反代数组.length; i += proxyDialConcurrency) {
 				const 候选列表 = [];
-				for (let j = 0; j < dialConcurrency && i + j < 所有反代数组.length; j++) {
+				for (let j = 0; j < proxyDialConcurrency && i + j < 所有反代数组.length; j++) {
 					const 反代数组索引 = (getProxyEndpointCursor(proxyIP, host, 所有反代数组.length) + i + j) % 所有反代数组.length;
 					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
 					候选列表.push({ hostname: 反代地址, port: 反代端口, index: 反代数组索引 });
@@ -8741,7 +8744,8 @@ async function createTunnelContext(request, env = {}) {
 	}
 	tunnelContext.socksWhitelist = await getSocksWhitelist(env);
 	tunnelContext.forceProxyHosts = await getForceProxyHosts(env);
-	tunnelContext.tcpDialConcurrency = 识别运营商(request) === 'cmcc' ? 1 : 2;
+	tunnelContext.tcpDialConcurrency = getTcpDialConcurrency(env, request);
+	tunnelContext.proxyDialConcurrency = getProxyDialConcurrency(env, tunnelContext.tcpDialConcurrency);
 	tunnelContext.preloadRaceDial = ['1', 'true'].includes(String(env?.PRELOAD_RACE_DIAL || '').toLowerCase());
 	// NOTE: no automatic ProxyIP scan here. Auto-scanning rapidly TCP-probes many Cloudflare IPs,
 	// which is flagged as network abuse. The ProxyIP scan is manual-only (admin "Scan now" button).
@@ -8947,6 +8951,22 @@ function getUplinkWriteTimeoutMs(env) {
 // client half-closes its request stream mid-response (a response cut off right after an upload finishes).
 function isGrpcHalfCloseOnEof(env) {
 	return ['1', 'true', 'yes', 'on'].includes(String(env?.GRPC_HALF_CLOSE_ON_EOF || '').trim().toLowerCase());
+}
+
+// Dial concurrency, env-overridable (upstream parity: TCP_CONCURRENT_DIAL / PROXY_CONCURRENT_DIAL).
+// Unset keeps the previous behavior exactly: 1 on CMCC (that carrier punishes parallel dials), else 2, and the
+// proxy path inherits the TCP value. Raising it races more candidates (faster when some are dead) at the cost
+// of more simultaneous outbound connections — the free plan allows ~6, so keep the sum modest. Clamped [1,4].
+function 拨号并发取值(raw, fallback) {
+	const v = Number(raw);
+	if (!Number.isFinite(v) || v < 1) return fallback;
+	return Math.max(1, Math.min(4, Math.round(v)));
+}
+function getTcpDialConcurrency(env, request) {
+	return 拨号并发取值(env?.TCP_CONCURRENT_DIAL, 识别运营商(request) === 'cmcc' ? 1 : 2);
+}
+function getProxyDialConcurrency(env, tcpConcurrency) {
+	return 拨号并发取值(env?.PROXY_CONCURRENT_DIAL, tcpConcurrency);
 }
 
 function getDialStaggerMs(env) {

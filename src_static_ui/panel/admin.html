@@ -383,6 +383,8 @@ var ENV_SETTINGS=[
  {k:'IDLE_TIMEOUT_MS',d:'0 (off)',h:'Close a connection with no traffic for this long. Leave off unless you see stuck sessions; too low kills quiet-but-alive streams like video buffering.'},
  {k:'CONNECT_TIMEOUT_MS',d:'850',h:'Max ms to establish a TCP connection before trying the next candidate. Clamped to 400-5000.'},
  {k:'DIAL_STAGGER_MS',d:'90',h:'Delay before racing the second dial candidate. Lower it on reliable networks for faster failover.'},
+ {k:'TCP_CONCURRENT_DIAL',d:'2 (1 on CMCC)',h:'How many direct candidates to dial at once. 2 is a good balance. Higher connects faster when some addresses are dead, but each dial uses one of the free plan’s ~6 simultaneous outbound connections. Clamped 1-4.'},
+ {k:'PROXY_CONCURRENT_DIAL',d:'same as TCP',h:'How many relay (ProxyIP) endpoints to dial at once. Defaults to the TCP value. Set 1 to be gentle on the connection budget, or 2-3 to find a working relay faster when your list has dead entries. Clamped 1-4.'},
  {k:'PRELOAD_RACE_DIAL',d:'off',h:'Race IPv4 and IPv6 results at once. Helps multi-homed hosts but costs an extra DNS lookup. Set 1 to enable.'},
  {g:'DNS'},
  {k:'DNS_TUNNEL_TCP_FIRST',d:'0',h:'Prefer DNS-over-TCP over DoH for tunneled DNS. Saves free-plan subrequests on long sessions. Set 1 if your client routes DNS through the tunnel.'},
