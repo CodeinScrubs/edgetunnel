@@ -1441,11 +1441,20 @@ async function 处理gRPC请求(request, yourUUID) {
 					// process it before measuring the next: a single read can carry [small auth frame][large data
 					// frame], and judging the large one under the pre-auth cap rejected a stream that had in fact
 					// just authenticated. Once authenticated the whole chunk is parsed in one pass, as before.
+					// Flood budgets for THIS read. parseGrpcFrameChunk's own counters are per-call, so the
+					// one-frame-at-a-time pre-auth loop below would reset them on every frame and never reach the
+					// caps; accumulate here so an unauthenticated peer can't spend the CPU budget on a chunk packed
+					// with thousands of (empty) frames.
+					let 本次读取帧数 = 0, 本次读取空帧数 = 0;
 					for (; ;) {
 						const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
 						const parsedFrames = parseGrpcFrameChunk(pending, 待并入, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES, 已认证 ? Infinity : 1);
 						pending = parsedFrames.pending;
 						待并入 = GRPC空块;
+						本次读取帧数 += parsedFrames.consumed;
+						本次读取空帧数 += parsedFrames.emptyConsumed;
+						if (本次读取帧数 > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC read contains too many frames');
+						if (本次读取空帧数 > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC read contains too many empty frames');
 						for (const payload of parsedFrames.payloads) {
 						if (isDnsQuery) {
 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
@@ -2437,6 +2446,11 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	let merged;
 	if (!prior.byteLength) {
 		merged = current;
+	} else if (!current.byteLength) {
+		// Draining frames already buffered in `pending` (the one-frame-at-a-time pre-auth loop passes no new
+		// bytes). Nothing to append, so reuse the view as-is instead of allocating a 2x buffer and copying the
+		// whole tail on every pass — that copy is proportional to the largest buffered frame.
+		merged = prior;
 	} else if (GRPC_REASSEMBLY_BUFFERS.has(prior.buffer) && prior.buffer.byteLength - (prior.byteOffset + prior.byteLength) >= current.byteLength) {
 		// Append into spare capacity of a buffer we own — O(current), not O(prior+current) — so a frame
 		// arriving in many small fragments reassembles in O(total) instead of O(total^2) (a DoS vector).
@@ -2481,8 +2495,10 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 	else nextPending = merged.subarray(offset);
 	// `consumed` = complete frames taken this call. The caller loops on it while unauthenticated: an EMPTY
 	// frame yields no payload yet still advances the buffer, so "did we make progress" cannot be inferred
-	// from payloads.length alone.
-	return { payloads, pending: nextPending, consumed: 已消费帧数 };
+	// from payloads.length alone. `emptyConsumed` lets the caller carry the flood budgets ACROSS calls —
+	// the counters below are per-call, so a one-frame-at-a-time loop would otherwise reset them every frame
+	// and never reach the limits.
+	return { payloads, pending: nextPending, consumed: 已消费帧数, emptyConsumed: emptyFrameCount };
 }
 
 async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
@@ -3431,7 +3447,10 @@ function getWsBufferedAmountMaxWaitMs(env) {
 // Hard ceiling for a client that never drains: 8x the soft limit, floored at 8 MiB so it can only fire on a
 // genuinely stuck consumer, never on an ordinary slow one.
 function 下行硬上限字节(软上限) {
-	return Math.max(8 * 1024 * 1024, 软上限 * 8);
+	// Capped at 16 MiB: the soft limit itself is configurable up to 8 MiB, and an uncapped multiple of it
+	// would derive a 64 MiB ceiling — half the isolate's 128 MiB, before upload queues, gRPC reassembly and
+	// any concurrent tunnel are accounted for.
+	return Math.min(16 * 1024 * 1024, Math.max(8 * 1024 * 1024, 软上限 * 4));
 }
 
 async function WebSocket发送并等待(webSocket, payload, limits = null) {
@@ -4113,10 +4132,18 @@ function 前置字节流(前置数据, 源可读流) {
 	return new ReadableStream({
 		start() { reader = 源可读流.getReader(); },
 		async pull(controller) {
-			if (头部 && 头部.byteLength) { const chunk = 头部; 头部 = null; controller.enqueue(chunk); return; }
-			const { done, value } = await reader.read();
-			if (done) { try { reader.releaseLock() } catch (e) { } controller.close(); return; }
-			if (value && value.byteLength) controller.enqueue(value);
+			try {
+				if (头部 && 头部.byteLength) { const chunk = 头部; 头部 = null; controller.enqueue(chunk); return; }
+				const { done, value } = await reader.read();
+				if (done) { try { reader.releaseLock() } catch (e) { } reader = null; controller.close(); return; }
+				if (value && value.byteLength) controller.enqueue(value);
+			} catch (error) {
+				// A failed read errors this stream; release the source lock too so the dead socket isn't left
+				// with a held reader.
+				try { reader?.releaseLock() } catch (e) { }
+				reader = null; 头部 = null;
+				throw error;
+			}
 		},
 		async cancel(reason) {
 			try { await reader?.cancel(reason) }
