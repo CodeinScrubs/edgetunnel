@@ -1659,6 +1659,10 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS上行写入队列 = null;
 	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
+	// Force-close deadline for teardown. It must be armed from the close EVENT, not from inside the serialized
+	// message chain: if the task currently on that chain is parked in a remote writer.write() that never settles,
+	// anything appended after it never starts, so a drain timeout queued there could never fire.
+	let WS强制关闭定时器 = null;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
 	let ss上下文 = null, ss初始化任务 = null;
@@ -2080,6 +2084,8 @@ async function 处理WS请求(request, yourUUID, url) {
 			catch (e) { log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
 		}).finally(() => {
+			// Graceful path completed: cancel the force-close deadline armed by the close handler.
+			if (WS强制关闭定时器) { try { clearTimeout(WS强制关闭定时器) } catch (e) { } WS强制关闭定时器 = null; }
 			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
 			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
 			// before the close frame was still being written when the socket died, so its bytes were lost
@@ -2111,6 +2117,18 @@ async function 处理WS请求(request, yourUUID, url) {
 		remoteConnWrapper.closeHint = 'client_close';
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 		closeSocketQuietly(serverSock);
+		// Arm the force-close deadline HERE, in the event handler, so it runs even when the serialized chain is
+		// parked in a write that never settles. Clearing the queue rejects the parked waiter and closing the
+		// remote makes its write reject, which unwedges the chain. The finalizer cancels this timer on the
+		// normal path, so a healthy teardown still drains fully before the socket closes.
+		if (!WS强制关闭定时器) {
+			WS强制关闭定时器 = setTimeout(() => {
+				WS强制关闭定时器 = null;
+				log('[WS forwarding] teardown deadline reached; forcing close');
+				try { 上行写入队列.清空() } catch (e) { }
+				closeRemoteSocketQuietly(remoteConnWrapper.socket);
+			}, 5000);
+		}
 		// The outbound remote socket is closed by 收尾WS显式传输's finalizer — AFTER the message chain drains
 		// and the upload queue empties — so a client disconnect still can't leak the socket + a blocked reader
 		// (gRPC/XHTTP do this in cancel()), but a final in-flight upload isn't cut off mid-write either.
