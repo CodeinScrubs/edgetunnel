@@ -44,11 +44,13 @@ function encodeDnsName(name) {
 	return out;
 }
 
-function makeDnsAResponse(name, ttl, ipBytes) {
+// `id` echoes the query's transaction ID, as every real resolver does — the worker now verifies that a DoH
+// answer corresponds to the query it sent, and DoH查询 randomizes the ID per RFC 1035.
+function makeDnsAResponse(name, ttl, ipBytes, id = 0x1234) {
 	const qname = encodeDnsName(name);
 	const response = new Uint8Array(12 + qname.byteLength + 4 + 16);
 	const view = new DataView(response.buffer);
-	view.setUint16(0, 0x1234);
+	view.setUint16(0, id);
 	view.setUint16(2, 0x8180);
 	view.setUint16(4, 1);
 	view.setUint16(6, 1);
@@ -111,9 +113,10 @@ function decodeDnsQuestion(packet) {
 	DNS_RESULT_CACHE.clear();
 	const originalFetch = globalThis.fetch;
 	let fetchCalls = 0;
-	globalThis.fetch = async () => {
+	globalThis.fetch = async (url, init) => {
 		fetchCalls++;
-		return new Response(makeDnsAResponse('cache.example', 120, new Uint8Array([203, 0, 113, 7])), {
+		const q = new Uint8Array(init.body);
+		return new Response(makeDnsAResponse('cache.example', 120, new Uint8Array([203, 0, 113, 7]), (q[0] << 8) | q[1]), {
 			status: 200,
 			headers: { 'Content-Type': 'application/dns-message' },
 		});
@@ -144,7 +147,7 @@ function decodeDnsQuestion(packet) {
 		assert.equal(question.name, 'default-type.example', 'DoH query should use the normalized domain name');
 		assert.equal(question.qtype, 1, 'missing DoH record type should default to A');
 		assert.equal(question.qclass, 1);
-		return new Response(makeDnsAResponse('default-type.example', 60, new Uint8Array([203, 0, 113, 8])), {
+		return new Response(makeDnsAResponse('default-type.example', 60, new Uint8Array([203, 0, 113, 8]), (body[0] << 8) | body[1]), {
 			status: 200,
 			headers: { 'Content-Type': 'application/dns-message' },
 		});

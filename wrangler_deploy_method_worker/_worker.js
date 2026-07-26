@@ -1032,7 +1032,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 					await 有限排空上行队列(上行写入队列);
 					const writer = 获取远端写入器();
 					if (writer) {
-						try { await writer.close() } catch (e) { }
+						// close() queues BEHIND any outstanding write, so a wedged write would leave this pending
+						// forever. Bound it and force the socket shut when the deadline passes.
+						try {
+							await withOperationTimeout(writer.close(), 5000, 'XHTTP upstream close timed out',
+								() => closeRemoteSocketQuietly(remoteConnWrapper.socket));
+						} catch (e) { closeRemoteSocketQuietly(remoteConnWrapper.socket); }
 					}
 				}
 			} catch (err) {
@@ -1445,7 +1450,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					// just authenticated. Once authenticated the whole chunk is parsed in one pass, as before.
 					for (; ;) {
 						const 已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
-						const parsedFrames = parseGrpcFrameChunk(pending, 待并入, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES, 已认证 ? Infinity : 1);
+						const parsedFrames = parseGrpcFrameChunk(pending, 待并入, 已认证 ? GRPC_MAX_FRAME_PAYLOAD_BYTES : GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES, 已认证 ? Infinity : 1, 已认证 ? GRPC_MAX_FIELDS_PER_FRAME : GRPC_PREAUTH_MAX_FIELDS_PER_FRAME);
 						pending = parsedFrames.pending;
 						待并入 = GRPC空块;
 						// Pre-auth budgets span the WHOLE request, not one read: the parser's own counters are
@@ -2358,14 +2363,17 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	let total = 0, 分片数 = 0;
 	try {
 		for (; ;) {
-			if (++分片数 > 最大分片数) throw new Error(`${label}: too many response body chunks`);
 			const 剩余毫秒 = 截止时刻 - Date.now();
 			if (剩余毫秒 <= 0) throw new Error(`${label}: response body timed out`);
 			const { done, value } = await readWithOperationTimeout(reader, 剩余毫秒, `${label}: response body timed out`);
 			if (done) break;
 			const chunk = 数据转Uint8Array(value);
+			// Count DATA chunks only, and count them after the read: counting before it meant a body of exactly
+			// 最大分片数 chunks was rejected on the final read that would have reported EOF.
+			if (!chunk.byteLength) continue;
+			if (++分片数 > 最大分片数) throw new Error(`${label}: too many response body chunks`);
 			if (total + chunk.byteLength > 最大字节) throw new Error(`${label}: response body too large`);
-			if (chunk.byteLength) { output.set(chunk, total); total += chunk.byteLength; }
+			output.set(chunk, total); total += chunk.byteLength;
 		}
 	} finally {
 		cancelReaderQuietly(reader, `${label} body read finished`);
@@ -2466,6 +2474,10 @@ const GRPC_PREAUTH_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024;
 // Shared empty view: later passes of the one-frame-at-a-time pre-auth loop merge no NEW bytes, they just
 // drain what is already buffered in `pending`.
 const GRPC空块 = new Uint8Array(0);
+// Protobuf fields allowed in ONE frame before the tunnel authenticates. A real gun frame carries a single
+// data field, so 16 is generous — while the post-auth limit would let an unauthenticated peer spend 4096
+// parser iterations per frame that still counts as only one no-data frame against the flood budget.
+const GRPC_PREAUTH_MAX_FIELDS_PER_FRAME = 16;
 function readGrpcFrameLength(frameHeader, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES) {
 	const data = 数据转Uint8Array(frameHeader);
 	if (data.byteLength < 5) throw new Error('gRPC frame header is incomplete');
@@ -2477,7 +2489,7 @@ function readGrpcFrameLength(frameHeader, maxPayloadBytes = GRPC_MAX_FRAME_PAYLO
 	return grpcLen;
 }
 
-function unwrapGrpcMessagePayloads(grpcPayload) {
+function unwrapGrpcMessagePayloads(grpcPayload, maxFields = GRPC_MAX_FIELDS_PER_FRAME) {
 	const data = 数据转Uint8Array(grpcPayload);
 	if (!data.byteLength) return [];
 	if (data[0] !== 0x0a) return [data];
@@ -2485,7 +2497,7 @@ function unwrapGrpcMessagePayloads(grpcPayload) {
 	let offset = 0;
 	let fieldCount = 0;
 	while (offset < data.byteLength) {
-		if (++fieldCount > GRPC_MAX_FIELDS_PER_FRAME) throw new Error('gRPC frame has too many protobuf fields');
+		if (++fieldCount > maxFields) throw new Error('gRPC frame has too many protobuf fields');
 		if (data[offset] !== 0x0a) throw new Error('Invalid gRPC protobuf wrapper: expected data field');
 		const { value: length, nextOffset } = readGrpcVarint(data, offset + 1);
 		const end = nextOffset + length;
@@ -2503,7 +2515,7 @@ const GRPC_REASSEMBLY_BUFFERS = new WeakSet();
 // against a cap — otherwise a read holding [small auth frame][large data frame] judged the large frame under
 // the pre-auth cap and rejected it even though authentication had just succeeded. Default is unlimited, so
 // the authenticated hot path keeps parsing a whole chunk in one pass exactly as before.
-function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES, maxFrames = Infinity) {
+function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PAYLOAD_BYTES, maxFrames = Infinity, maxFields = GRPC_MAX_FIELDS_PER_FRAME) {
 	const prior = 数据转Uint8Array(pending);
 	const current = 数据转Uint8Array(chunk);
 	let merged;
@@ -2542,7 +2554,7 @@ function parseGrpcFrameChunk(pending, chunk, maxPayloadBytes = GRPC_MAX_FRAME_PA
 		if (merged.byteLength - offset < frameSize) break;
 		if (grpcLen === 0 && ++emptyFrameCount > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC chunk has too many empty frames');
 		const grpcPayload = merged.subarray(offset + 5, offset + frameSize);
-		const 本帧负载 = grpcPayload.byteLength ? unwrapGrpcMessagePayloads(grpcPayload) : [];
+		const 本帧负载 = grpcPayload.byteLength ? unwrapGrpcMessagePayloads(grpcPayload, maxFields) : [];
 		// Count frames that carry no tunnel data SEMANTICALLY, not just outer-length-zero ones: a frame whose
 		// protobuf body is a zero-length data field (0a 00) has a non-zero outer length yet still yields nothing,
 		// so counting only grpcLen===0 let an unauthenticated peer spend parse work without ever tripping the cap.
@@ -3328,6 +3340,59 @@ function 写入DNS线缓存(key, msg) {
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
+// Walk one DNS name, returning the offset just past its ENCODED form (a compression pointer ends the
+// encoding even though the name continues elsewhere). Throws on anything malformed.
+function 跳过DNS名称(message, start) {
+	let cursor = start, encodedEnd = -1, jumps = 0;
+	const seen = new Set();
+	for (; ;) {
+		if (cursor >= message.byteLength) throw new Error('truncated DNS name');
+		const length = message[cursor];
+		if ((length & 0xc0) === 0xc0) {
+			if (cursor + 1 >= message.byteLength) throw new Error('truncated DNS compression pointer');
+			const pointer = ((length & 0x3f) << 8) | message[cursor + 1];
+			if (pointer >= message.byteLength) throw new Error('invalid DNS compression pointer');
+			if (encodedEnd < 0) encodedEnd = cursor + 2;
+			if (seen.has(pointer) || ++jumps > 32) throw new Error('DNS compression loop');
+			seen.add(pointer);
+			cursor = pointer;
+			continue;
+		}
+		if ((length & 0xc0) !== 0) throw new Error('unsupported DNS label type');
+		cursor++;
+		if (length === 0) return encodedEnd >= 0 ? encodedEnd : cursor;
+		if (length > 63 || cursor + length > message.byteLength) throw new Error('invalid DNS label');
+		cursor += length;
+	}
+}
+
+// Prove a DNS message is structurally complete: every declared record must actually be present. Without
+// this, a response can claim ANCOUNT=1 while carrying no answer bytes at all — it passes the header checks,
+// gets forwarded, and (because it looks like a positive answer) is cached and replayed to later queries.
+function 验证DNS消息结构(messageInput) {
+	const message = 数据转Uint8Array(messageInput);
+	if (message.byteLength < 12) throw new Error('DNS message is too short');
+	const qd = (message[4] << 8) | message[5];
+	const an = (message[6] << 8) | message[7];
+	const ns = (message[8] << 8) | message[9];
+	const ar = (message[10] << 8) | message[11];
+	let cursor = 12;
+	for (let i = 0; i < qd; i++) {
+		cursor = 跳过DNS名称(message, cursor);
+		if (cursor + 4 > message.byteLength) throw new Error('truncated DNS question');
+		cursor += 4;
+	}
+	for (let i = 0; i < an + ns + ar; i++) {
+		cursor = 跳过DNS名称(message, cursor);
+		if (cursor + 10 > message.byteLength) throw new Error('truncated DNS resource record');
+		const rdLength = (message[cursor + 8] << 8) | message[cursor + 9];
+		cursor += 10;
+		if (cursor + rdLength > message.byteLength) throw new Error('truncated DNS RDATA');
+		cursor += rdLength;
+	}
+	if (cursor !== message.byteLength) throw new Error('unexpected trailing bytes in DNS message');
+}
+
 // Do two DNS messages ask the same question? Labels compare case-insensitively (RFC 1035 §2.3.3).
 function DNS问题相同(a, b) {
 	let ai = 12, bi = 12;
@@ -3356,17 +3421,22 @@ function DNS问题相同(a, b) {
 function 验证DNS响应(queryInput, msgInput) {
 	const query = 数据转Uint8Array(queryInput);
 	const msg = 数据转Uint8Array(msgInput);
-	// Correspondence can only be judged against a real DNS query. Anything shorter than a header isn't one,
-	// so there is nothing to correlate — don't reject on that basis. Every real client sends a full header,
-	// so production traffic is always fully validated.
-	if (query.byteLength < 12 || ((query[4] << 8) | query[5]) !== 1) return;
+	// A query too short to hold a header isn't DNS at all; there is nothing to correlate against, so leave it
+	// to the caller's own framing checks rather than inventing a verdict.
+	if (query.byteLength < 12) return;
 	if (msg.byteLength < 12) throw new Error('DoH response is too short');
 	if (msg[0] !== query[0] || msg[1] !== query[1]) throw new Error('DoH transaction ID mismatch');
 	if ((msg[2] & 0x80) === 0) throw new Error('DoH message is not a response');
 	if ((msg[2] & 0x78) !== (query[2] & 0x78)) throw new Error('DoH opcode mismatch');
 	if ((msg[2] & 0x02) !== 0) throw new Error('DoH response is truncated');
-	if (((msg[4] << 8) | msg[5]) !== 1) throw new Error('DoH response question count is invalid');
-	if (!DNS问题相同(query, msg)) throw new Error('DoH response answers a different question');
+	// Structure first: a message that merely CLAIMS records must actually carry them, or a positive-looking
+	// but truncated answer would be forwarded and cached.
+	验证DNS消息结构(msg);
+	const 查询问题数 = (query[4] << 8) | query[5];
+	if (((msg[4] << 8) | msg[5]) !== 查询问题数) throw new Error('DoH response question count does not match the query');
+	// Question equality is only well-defined for the ordinary single-question case; the header/structure
+	// checks above still apply to anything else, so an unusual query is never left completely unverified.
+	if (查询问题数 === 1 && !DNS问题相同(query, msg)) throw new Error('DoH response answers a different question');
 }
 
 // End offset of a single-question section, or null when the message isn't a plain one-question query.
@@ -3457,8 +3527,10 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 		// and because this never returned, the fallback DoH URL and the DNS-over-TCP fallback never ran either,
 		// so the whole tunnel looked frozen on a single bad resolver. Also enforces the 64KB cap by ACTUAL bytes
 		// (the Content-Length check above only helps when that header is present).
-		// Only a DNS wire message is acceptable (RFC 8484). An HTML error page or a JSON body means the
-		// endpoint isn't answering DoH, and must never reach the parser or the cache.
+		// Reject a body that DECLARES some other type. A missing header is deliberately tolerated rather than
+		// rejected: the full correlation below (transaction ID, opcode, structure, question) already refuses
+		// anything that isn't the DNS answer to this query, so an HTML error page fails there regardless —
+		// while hard-failing on an absent header would break an otherwise working resolver that omits it.
 		const 内容类型 = String(resp.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
 		if (内容类型 && 内容类型 !== 'application/dns-message') {
 			try { resp.body?.cancel() } catch (e) { }
@@ -3599,7 +3671,12 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 			}
 		}
 	} catch (error) {
+		// Report and RE-THROW. Swallowing here would also swallow the downstream congestion error that the
+		// hard buffer ceiling raises, so a DNS-only WebSocket could sit above the memory ceiling indefinitely
+		// with nothing tearing it down. It still must not become a SERVFAIL — that is why this is a separate
+		// phase — but the transport handler does need to see that delivery failed.
 		log(`[UDP forwarding] DNS response delivery failed: ${error?.message || error}`);
+		throw error;
 	}
 }
 
@@ -7319,8 +7396,14 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 
 
 		if (Number(response.headers?.get?.('content-length') || 0) > 65535) { try { response.body?.cancel() } catch (e) { } log(`[DoH lookup] Declared response too large for ${域名} via ${DoH解析服务}`); return []; }
-		const buf = new Uint8Array(await response.arrayBuffer());
+		// Same media-type and body-deadline rules as the tunneled-DNS path. This function resolves ProxyIP
+		// (and preload-race) targets, so an endpoint that returns headers and then stalls its body used to
+		// hang name resolution here with no timer running — freezing relay setup before any dial began.
+		const 应答类型 = String(response.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+		if (应答类型 && 应答类型 !== 'application/dns-message') { try { response.body?.cancel() } catch (e) { } log(`[DoH lookup] Unexpected content-type (${应答类型}) for ${域名} via ${DoH解析服务}`); return []; }
+		const buf = await 读取有限响应体(response, 65535, DOH_LOOKUP_TIMEOUT_MS, 'DoH lookup');
 		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
+		验证DNS响应(query, buf);
 		const dv = new DataView(buf.buffer);
 		const qdcount = dv.getUint16(4);
 		const ancount = dv.getUint16(6);
