@@ -2247,25 +2247,27 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	}
 	const reader = response.body.getReader();
 	const 截止时刻 = Date.now() + 期限毫秒;
-	const chunks = [];
-	let total = 0;
+	// A byte cap alone doesn't bound WORK: 65535 one-byte chunks stay under the cap yet cost 65535 reads.
+	// Copy into one preallocated buffer and cap the chunk count too.
+	const 最大分片数 = 256;
+	const output = new Uint8Array(最大字节);
+	let total = 0, 分片数 = 0;
 	try {
 		for (; ;) {
+			if (++分片数 > 最大分片数) throw new Error(`${label}: too many response body chunks`);
 			const 剩余毫秒 = 截止时刻 - Date.now();
 			if (剩余毫秒 <= 0) throw new Error(`${label}: response body timed out`);
 			const { done, value } = await readWithOperationTimeout(reader, 剩余毫秒, `${label}: response body timed out`);
 			if (done) break;
 			const chunk = 数据转Uint8Array(value);
-			total += chunk.byteLength;
-			if (total > 最大字节) throw new Error(`${label}: response body too large`);
-			if (chunk.byteLength) chunks.push(chunk);
+			if (total + chunk.byteLength > 最大字节) throw new Error(`${label}: response body too large`);
+			if (chunk.byteLength) { output.set(chunk, total); total += chunk.byteLength; }
 		}
 	} finally {
 		cancelReaderQuietly(reader, `${label} body read finished`);
 		try { reader.releaseLock() } catch (e) { }
 	}
-	if (!chunks.length) return new Uint8Array(0);
-	return chunks.length === 1 ? chunks[0] : 拼接字节数据(...chunks);
+	return output.slice(0, total);
 }
 
 async function 读取有限请求文本(request, 最大字节) {
@@ -3222,6 +3224,47 @@ function 写入DNS线缓存(key, msg) {
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
+// Do two DNS messages ask the same question? Labels compare case-insensitively (RFC 1035 §2.3.3).
+function DNS问题相同(a, b) {
+	let ai = 12, bi = 12;
+	for (; ;) {
+		if (ai >= a.byteLength || bi >= b.byteLength) return false;
+		const alen = a[ai++], blen = b[bi++];
+		if (alen !== blen || alen > 63) return false;   // >63 also rejects a compression pointer
+		if (alen === 0) break;
+		if (ai + alen > a.byteLength || bi + blen > b.byteLength) return false;
+		for (let i = 0; i < alen; i++) {
+			let ac = a[ai++], bc = b[bi++];
+			if (ac >= 65 && ac <= 90) ac += 32;
+			if (bc >= 65 && bc <= 90) bc += 32;
+			if (ac !== bc) return false;
+		}
+	}
+	if (ai + 4 > a.byteLength || bi + 4 > b.byteLength) return false;
+	for (let i = 0; i < 4; i++) if (a[ai + i] !== b[bi + i]) return false; // QTYPE + QCLASS
+	return true;
+}
+
+// Prove a DoH body is THE answer to the query we sent before forwarding or caching it. Without this a
+// resolver that returns an unrelated answer (a captive portal, an HTML error page, a proxy that rewrites
+// DNS, or plain corruption) is cached under our query's key and then served for later queries with only its
+// transaction ID rewritten — the client silently gets the wrong address for a name it never asked about.
+function 验证DNS响应(queryInput, msgInput) {
+	const query = 数据转Uint8Array(queryInput);
+	const msg = 数据转Uint8Array(msgInput);
+	// Correspondence can only be judged against a real DNS query. Anything shorter than a header isn't one,
+	// so there is nothing to correlate — don't reject on that basis. Every real client sends a full header,
+	// so production traffic is always fully validated.
+	if (query.byteLength < 12 || ((query[4] << 8) | query[5]) !== 1) return;
+	if (msg.byteLength < 12) throw new Error('DoH response is too short');
+	if (msg[0] !== query[0] || msg[1] !== query[1]) throw new Error('DoH transaction ID mismatch');
+	if ((msg[2] & 0x80) === 0) throw new Error('DoH message is not a response');
+	if ((msg[2] & 0x78) !== (query[2] & 0x78)) throw new Error('DoH opcode mismatch');
+	if ((msg[2] & 0x02) !== 0) throw new Error('DoH response is truncated');
+	if (((msg[4] << 8) | msg[5]) !== 1) throw new Error('DoH response question count is invalid');
+	if (!DNS问题相同(query, msg)) throw new Error('DoH response answers a different question');
+}
+
 // End offset of a single-question section, or null when the message isn't a plain one-question query.
 function DNS问题段结束(msg) {
 	if (msg.byteLength < 12) return null;
@@ -3242,17 +3285,24 @@ function DNS问题段结束(msg) {
 // returning nothing leaves the client waiting out its own multi-second DNS timeout, which is exactly what
 // "the page just hangs" feels like. An explicit SERVFAIL lets it fail fast and retry immediately.
 function 构建DNS服务失败响应(requestData) {
+	const input = 数据转Uint8Array(requestData);
 	let frames;
-	try { frames = 解析DNS_TCP帧(requestData); } catch (e) { return null; }
-	if (!frames?.length) return null;
+	try { frames = 解析DNS_TCP帧(input); } catch (e) { return null; }
+	// Honour the SAME batch cap the resolvers enforce. Without it, an oversized batch that the resolvers
+	// rejected outright would still be answered frame-by-frame here — spending real CPU building thousands of
+	// replies to a request that was already refused.
+	if (!frames?.length || frames.length > DNS_MAX_FRAMES_PER_REQUEST) return null;
+	// A valid prefix followed by malformed/incomplete trailing bytes isn't a batch we should answer.
+	const consumed = frames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
+	if (consumed !== input.byteLength) return null;
 	const out = [];
 	for (const query of frames) {
 		const 问题结束 = DNS问题段结束(query);
 		if (问题结束 === null) continue;
 		const resp = new Uint8Array(问题结束);
 		resp.set(query.subarray(0, 问题结束));
-		resp[2] = (query[2] & 0x79) | 0x80; // QR=1, preserve OPCODE + RD, clear AA/TC
-		resp[3] = 0x02;                     // RA=0, Z=0, RCODE=2 (SERVFAIL)
+		resp[2] = (query[2] & 0x79) | 0x80;      // QR=1, preserve OPCODE + RD, clear AA/TC
+		resp[3] = (query[3] & 0x10) | 0x80 | 0x02; // preserve CD, RA=1 (we do recurse), Z=0, RCODE=2 SERVFAIL
 		resp[6] = 0; resp[7] = 0;           // ANCOUNT
 		resp[8] = 0; resp[9] = 0;           // NSCOUNT
 		resp[10] = 0; resp[11] = 0;         // ARCOUNT
@@ -3303,8 +3353,16 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 		// and because this never returned, the fallback DoH URL and the DNS-over-TCP fallback never ran either,
 		// so the whole tunnel looked frozen on a single bad resolver. Also enforces the 64KB cap by ACTUAL bytes
 		// (the Content-Length check above only helps when that header is present).
+		// Only a DNS wire message is acceptable (RFC 8484). An HTML error page or a JSON body means the
+		// endpoint isn't answering DoH, and must never reach the parser or the cache.
+		const 内容类型 = String(resp.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+		if (内容类型 && 内容类型 !== 'application/dns-message') {
+			try { resp.body?.cancel() } catch (e) { }
+			throw new Error(`unexpected DoH content-type: ${内容类型}`);
+		}
 		const msg = await 读取有限响应体(resp, 65535, timeoutMs, 'DoH');
 		if (!msg.byteLength) throw new Error('empty DoH response');
+		验证DNS响应(query, msg);
 		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
 		if (缓存键) 写入DNS线缓存(缓存键, msg);
 		return 封装响应(msg);
@@ -3379,11 +3437,14 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	const requestBytes = requestData.byteLength;
 	const dnsStart = 追踪 ? Date.now() : 0;
 	let dnsResolver = null;
+	let rawResponse = null;
+	// RESOLVE phase. Only a resolver failure may synthesize SERVFAIL. Delivery is deliberately OUTSIDE this
+	// try: if a send throws after a real answer has already gone out (downstream congestion can now throw),
+	// treating it as a resolver failure would put a contradictory SERVFAIL on the wire for the same query.
 	try {
 		const { env } = getWorkerRequestContext(request);
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		log(`[UDP forwarding] Received DNS request: ${requestBytes}B`);
-		let rawResponse;
 		// DNS_TUNNEL_TCP_FIRST=1 prefers DNS-over-TCP (connect(), no subrequest cost) over DoH (fetch(), one
 		// subrequest per query). Useful on the Free plan: a long-lived WS connection shares a 50-subrequest
 		// budget, so a client that tunnels its DNS can exhaust it mid-session (→ DNS silently stops). Default
@@ -3404,7 +3465,16 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
 			}
 		}
-		if (!rawResponse || !rawResponse.byteLength) return;
+	} catch (error) {
+		// Every resolver failed. Answer SERVFAIL rather than dropping the query: a dropped answer makes the
+		// client sit out its own DNS timeout, which reads to the user as a page that hangs.
+		log(`[UDP forwarding] DNS resolution failed: ${error?.message || error}`);
+		rawResponse = 构建DNS服务失败响应(requestData);
+		dnsResolver = 'servfail';
+	}
+	if (!rawResponse || !rawResponse.byteLength) return;
+	// DELIVERY phase: a failure here is reported, never converted into a second DNS answer.
+	try {
 		追踪DNS(追踪, requestBytes, rawResponse.byteLength, { resolver: dnsResolver, latency_ms: dnsStart ? Date.now() - dnsStart : null });
 		log(`[UDP forwarding] DNS response: ${rawResponse.byteLength}B`);
 		const wrappedResult = 响应封装器 ? await 响应封装器(rawResponse) : rawResponse;
@@ -3425,28 +3495,7 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 			}
 		}
 	} catch (error) {
-		log(`[UDP forwarding] DNS forwarding failed: ${error?.message || error}`);
-		// Every resolver failed. Answer with SERVFAIL rather than silently dropping the query — a dropped
-		// answer makes the client sit out its own DNS timeout, which reads to the user as a page that hangs.
-		try {
-			const 失败响应 = 构建DNS服务失败响应(requestData);
-			if (失败响应 && webSocket.readyState === WebSocket.OPEN) {
-				const 封装结果 = 响应封装器 ? await 响应封装器(失败响应) : 失败响应;
-				const 片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
-				let 头部 = respHeader;
-				for (const 片段 of 片段列表) {
-					const bytes = 数据转Uint8Array(片段);
-					if (!bytes.byteLength || webSocket.readyState !== WebSocket.OPEN) continue;
-					if (头部) {
-						const 合并 = new Uint8Array(头部.length + bytes.byteLength);
-						合并.set(头部, 0);
-						合并.set(bytes, 头部.length);
-						await WebSocket发送并等待(webSocket, 合并.buffer);
-						头部 = null;
-					} else await WebSocket发送并等待(webSocket, bytes);
-				}
-			}
-		} catch (e) { }
+		log(`[UDP forwarding] DNS response delivery failed: ${error?.message || error}`);
 	}
 }
 
