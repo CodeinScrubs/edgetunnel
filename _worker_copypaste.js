@@ -2336,6 +2336,41 @@ async function 读取有限请求体(request, 最大字节) {
 	return chunks.length === 1 ? chunks[0] : 拼接字节数据(...chunks);
 }
 
+// Response-body counterpart of 读取有限请求体, with its own deadline. fetch()'s AbortSignal stops applying
+// once the response headers land, so a body that never finishes is otherwise unbounded in BOTH time and size.
+async function 读取有限响应体(response, 最大字节, timeoutMs, label = 'response') {
+	const 期限毫秒 = Math.max(1, Number(timeoutMs) || 1000);
+	// Some responses expose no streaming body. Still bound it in TIME (the whole point here) by racing the
+	// buffered read against the same deadline, then enforce the size cap on the result.
+	if (!response?.body || typeof response.body.getReader !== 'function') {
+		const buffered = await withOperationTimeout(response.arrayBuffer(), 期限毫秒, `${label}: response body timed out`);
+		const bytes = new Uint8Array(buffered);
+		if (bytes.byteLength > 最大字节) throw new Error(`${label}: response body too large`);
+		return bytes;
+	}
+	const reader = response.body.getReader();
+	const 截止时刻 = Date.now() + 期限毫秒;
+	const chunks = [];
+	let total = 0;
+	try {
+		for (; ;) {
+			const 剩余毫秒 = 截止时刻 - Date.now();
+			if (剩余毫秒 <= 0) throw new Error(`${label}: response body timed out`);
+			const { done, value } = await readWithOperationTimeout(reader, 剩余毫秒, `${label}: response body timed out`);
+			if (done) break;
+			const chunk = 数据转Uint8Array(value);
+			total += chunk.byteLength;
+			if (total > 最大字节) throw new Error(`${label}: response body too large`);
+			if (chunk.byteLength) chunks.push(chunk);
+		}
+	} finally {
+		cancelReaderQuietly(reader, `${label} body read finished`);
+		try { reader.releaseLock() } catch (e) { }
+	}
+	if (!chunks.length) return new Uint8Array(0);
+	return chunks.length === 1 ? chunks[0] : 拼接字节数据(...chunks);
+}
+
 async function 读取有限请求文本(request, 最大字节) {
 	return new TextDecoder().decode(await 读取有限请求体(request, 最大字节));
 }
@@ -3290,6 +3325,50 @@ function 写入DNS线缓存(key, msg) {
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
+// End offset of a single-question section, or null when the message isn't a plain one-question query.
+function DNS问题段结束(msg) {
+	if (msg.byteLength < 12) return null;
+	if (((msg[4] << 8) | msg[5]) !== 1) return null; // only QDCOUNT==1 is echoed safely
+	let i = 12;
+	while (i < msg.byteLength) {
+		const len = msg[i];
+		if (len === 0) { i += 1; break; }
+		if ((len & 0xc0) === 0xc0) return null;      // compression pointer has no place in a question
+		i += 1 + len;
+		if (i >= msg.byteLength) return null;
+	}
+	const end = i + 4;                                // QTYPE + QCLASS
+	return end <= msg.byteLength ? end : null;
+}
+
+// Build a length-prefixed SERVFAIL for every query in a tunneled DNS batch. Used when EVERY resolver failed:
+// returning nothing leaves the client waiting out its own multi-second DNS timeout, which is exactly what
+// "the page just hangs" feels like. An explicit SERVFAIL lets it fail fast and retry immediately.
+function 构建DNS服务失败响应(requestData) {
+	let frames;
+	try { frames = 解析DNS_TCP帧(requestData); } catch (e) { return null; }
+	if (!frames?.length) return null;
+	const out = [];
+	for (const query of frames) {
+		const 问题结束 = DNS问题段结束(query);
+		if (问题结束 === null) continue;
+		const resp = new Uint8Array(问题结束);
+		resp.set(query.subarray(0, 问题结束));
+		resp[2] = (query[2] & 0x79) | 0x80; // QR=1, preserve OPCODE + RD, clear AA/TC
+		resp[3] = 0x02;                     // RA=0, Z=0, RCODE=2 (SERVFAIL)
+		resp[6] = 0; resp[7] = 0;           // ANCOUNT
+		resp[8] = 0; resp[9] = 0;           // NSCOUNT
+		resp[10] = 0; resp[11] = 0;         // ARCOUNT
+		const framed = new Uint8Array(2 + resp.byteLength);
+		framed[0] = (resp.byteLength >>> 8) & 0xff;
+		framed[1] = resp.byteLength & 0xff;
+		framed.set(resp, 2);
+		out.push(framed);
+	}
+	if (!out.length) return null;
+	return out.length === 1 ? out[0] : 拼接字节数据(...out);
+}
+
 async function DNS经DoH转发(requestData, env, timeoutMs) {
 	const frames = 解析DNS_TCP帧(requestData);
 	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
@@ -3322,7 +3401,12 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 		// Reject a declared-oversized body before buffering it (a DNS message can't exceed 64KB; a
 		// misbehaving/hostile DoH endpoint shouldn't get to spike isolate memory via arrayBuffer()).
 		if (Number(resp.headers?.get?.('content-length') || 0) > 65535) { try { resp.body?.cancel() } catch (e) { } throw new Error('DoH response too large'); }
-		const msg = new Uint8Array(await resp.arrayBuffer());
+		// Read the body with its OWN deadline. fetchWithTimeout's timer is cleared the moment response headers
+		// arrive, so an endpoint that answers with headers and then stalls its body used to hang here forever —
+		// and because this never returned, the fallback DoH URL and the DNS-over-TCP fallback never ran either,
+		// so the whole tunnel looked frozen on a single bad resolver. Also enforces the 64KB cap by ACTUAL bytes
+		// (the Content-Length check above only helps when that header is present).
+		const msg = await 读取有限响应体(resp, 65535, timeoutMs, 'DoH');
 		if (!msg.byteLength) throw new Error('empty DoH response');
 		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
 		if (缓存键) 写入DNS线缓存(缓存键, msg);
@@ -3445,6 +3529,27 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		}
 	} catch (error) {
 		log(`[UDP forwarding] DNS forwarding failed: ${error?.message || error}`);
+		// Every resolver failed. Answer with SERVFAIL rather than silently dropping the query — a dropped
+		// answer makes the client sit out its own DNS timeout, which reads to the user as a page that hangs.
+		try {
+			const 失败响应 = 构建DNS服务失败响应(requestData);
+			if (失败响应 && webSocket.readyState === WebSocket.OPEN) {
+				const 封装结果 = 响应封装器 ? await 响应封装器(失败响应) : 失败响应;
+				const 片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
+				let 头部 = respHeader;
+				for (const 片段 of 片段列表) {
+					const bytes = 数据转Uint8Array(片段);
+					if (!bytes.byteLength || webSocket.readyState !== WebSocket.OPEN) continue;
+					if (头部) {
+						const 合并 = new Uint8Array(头部.length + bytes.byteLength);
+						合并.set(头部, 0);
+						合并.set(bytes, 头部.length);
+						await WebSocket发送并等待(webSocket, 合并.buffer);
+						头部 = null;
+					} else await WebSocket发送并等待(webSocket, bytes);
+				}
+			}
+		} catch (e) { }
 	}
 }
 
