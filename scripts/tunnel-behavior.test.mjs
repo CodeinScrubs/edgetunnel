@@ -1809,7 +1809,12 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	let upstreamClosed = false;
 	const writes = [];
 	const sent = [];
-	const responseFrame = new Uint8Array([0, 3, 0xaa, 0xbb, 0xcc]);
+	// Real single-question DNS: tunneled queries are validated and TCP replies are matched to their query.
+	const dnsQuery = new Uint8Array([0x33, 0x44, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const dnsReply = new Uint8Array([0x33, 0x44, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const withLen = (m) => { const f = new Uint8Array(2 + m.length); f[0] = m.length >> 8; f[1] = m.length & 0xff; f.set(m, 2); return f; };
+	const queryFrame = withLen(dnsQuery);
+	const responseFrame = withLen(dnsReply);
 	const tcpSocket = {
 		opened: Promise.resolve(),
 		readable: new ReadableStream({
@@ -1844,10 +1849,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	};
 
 	try {
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DNS TCP response should not wait for upstream close');
+		await withTestTimeout(forwardataudp(queryFrame, webSocket, new Uint8Array([0, 0]), request), 80, 'DNS TCP response should not wait for upstream close');
 
-		assert.deepEqual(writes, [new Uint8Array([0, 2, 0x12, 0x34])]);
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])]);
+		assert.deepEqual(writes, [queryFrame]);
+		assert.deepEqual(sent, [new Uint8Array([0, 0, ...responseFrame])]);
 		assert.equal(upstreamClosed, true, 'DNS TCP socket should be closed after one complete response frame');
 	} finally {
 		globalThis.fetch = 原始fetch;
@@ -1860,13 +1865,22 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	let upstreamClosed = false;
 	const writes = [];
 	const sent = [];
-	const responseFrames = new Uint8Array([0, 1, 0xaa, 0, 2, 0xbb, 0xcc]);
+	// Real single-question DNS messages: the worker validates every tunneled query and now matches each
+	// DNS-over-TCP reply back to its query (RFC 7766 allows out-of-order pipelined replies), so synthetic
+	// non-DNS payloads no longer exercise this path.
+	const mkQuery = (id) => new Uint8Array([id >> 8, id & 0xff, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const mkReply = (id) => new Uint8Array([id >> 8, id & 0xff, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const frame = (m) => { const f = new Uint8Array(2 + m.length); f[0] = m.length >> 8; f[1] = m.length & 0xff; f.set(m, 2); return f; };
+	const join = (...parts) => { const t = parts.reduce((s, p) => s + p.length, 0); const o = new Uint8Array(t); let k = 0; for (const p of parts) { o.set(p, k); k += p.length; } return o; };
+	const queryBatch = join(frame(mkQuery(0x1111)), frame(mkQuery(0x2222)));
+	const responseFrames = join(frame(mkReply(0x1111)), frame(mkReply(0x2222)));
 	const tcpSocket = {
 		opened: Promise.resolve(),
 		readable: new ReadableStream({
 			start(controller) {
-				controller.enqueue(responseFrames.subarray(0, 4));
-				controller.enqueue(responseFrames.subarray(4));
+				// split mid-message so the reader must reassemble across TCP chunks
+				controller.enqueue(responseFrames.subarray(0, 7));
+				controller.enqueue(responseFrames.subarray(7));
 			},
 		}),
 		writable: new WritableStream({
@@ -1890,9 +1904,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		},
 	};
 	try {
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 2, 0x34, 0x56]), webSocket, new Uint8Array([0, 0]), request), 100, 'DNS TCP multi-frame response');
-		assert.deepEqual(writes, [new Uint8Array([0, 1, 0x12, 0, 2, 0x34, 0x56])]);
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 1, 0xaa, 0, 2, 0xbb, 0xcc])], 'DNS TCP fallback should return one response frame per query frame');
+		await withTestTimeout(forwardataudp(queryBatch, webSocket, new Uint8Array([0, 0]), request), 100, 'DNS TCP multi-frame response');
+		assert.deepEqual(writes, [queryBatch], 'the whole query batch is written upstream once');
+		assert.deepEqual(sent, [join(new Uint8Array([0, 0]), responseFrames)], 'DNS TCP fallback should return one response frame per query frame, matched to its query');
 		assert.equal(upstreamClosed, true);
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -1904,20 +1918,25 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// response is returned re-framed with a 2-byte length prefix, then delivered with the resp header.
 	const 原始fetch = globalThis.fetch;
 	const calls = [];
+	// Real single-question query and its matching answer: tunneled queries are validated and DoH answers are
+	// correlated to the query that was sent.
+	const dohQuery = new Uint8Array([0x56, 0x78, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const dohReply = new Uint8Array([0x56, 0x78, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const dohFrame = new Uint8Array([0, dohQuery.length, ...dohQuery]);
 	globalThis.fetch = (url, init) => {
 		calls.push({ url, init });
-		return Promise.resolve({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0xaa, 0xbb, 0xcc]).buffer });
+		return Promise.resolve({ ok: true, status: 200, arrayBuffer: async () => dohReply.buffer.slice(dohReply.byteOffset, dohReply.byteOffset + dohReply.byteLength) });
 	};
 	const sent = [];
 	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
 	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
 	try {
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12, 0x34]), webSocket, new Uint8Array([0, 0]), request), 80, 'DoH DNS forward');
+		await withTestTimeout(forwardataudp(dohFrame, webSocket, new Uint8Array([0, 0]), request), 80, 'DoH DNS forward');
 		assert.equal(calls.length, 1, 'one DoH request is made for one query');
 		assert.equal(calls[0].init.method, 'POST', 'DoH uses POST');
 		assert.equal(calls[0].init.headers['content-type'], 'application/dns-message', 'DoH sends application/dns-message');
-		assert.deepEqual([...new Uint8Array(calls[0].init.body)], [0x12, 0x34], 'DoH body is the raw query without the TCP length prefix');
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])], 'DoH response is re-framed and delivered with the resp header');
+		assert.deepEqual([...new Uint8Array(calls[0].init.body)], [...dohQuery], 'DoH body is the raw query without the TCP length prefix');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, dohReply.length, ...dohReply])], 'DoH response is re-framed and delivered with the resp header');
 	} finally {
 		globalThis.fetch = 原始fetch;
 	}
@@ -1927,14 +1946,20 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const originalFetch = globalThis.fetch;
 	let inFlight = 0, maxInFlight = 0;
 	const calls = [];
+	// Real single-question queries; the resolver echoes each one back as its answer (ID + question must match,
+	// which is what the worker now verifies). The first query is answered slower so ordering is still proven.
+	const mkQ = (id) => new Uint8Array([0x00, id, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const q1 = mkQ(0x12), q2 = mkQ(0x34);
+	const batch = new Uint8Array([0, q1.length, ...q1, 0, q2.length, ...q2]);
+	const replyFor = (body) => { const r = new Uint8Array(body); r[2] = 0x81; r[3] = 0x80; return r; };
 	globalThis.fetch = async (url, init) => {
 		inFlight++;
 		maxInFlight = Math.max(maxInFlight, inFlight);
 		const body = new Uint8Array(init.body);
 		calls.push([...body]);
-		await new Promise(resolve => setTimeout(resolve, body[0] === 0x12 ? 25 : 5));
+		await new Promise(resolve => setTimeout(resolve, body[1] === 0x12 ? 25 : 5));
 		inFlight--;
-		return new Response(new Uint8Array([body[0], 0xee]), {
+		return new Response(replyFor(body), {
 			status: 200,
 			headers: { 'Content-Type': 'application/dns-message' },
 		});
@@ -1943,10 +1968,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
 	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
 	try {
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 1, 0x34]), webSocket, new Uint8Array([0, 0]), request), 200, 'DoH DNS batch forward');
+		await withTestTimeout(forwardataudp(batch, webSocket, new Uint8Array([0, 0]), request), 200, 'DoH DNS batch forward');
 		assert.equal(maxInFlight > 1, true, 'multiple DNS query frames should be sent to DoH concurrently');
-		assert.deepEqual(calls, [[0x12], [0x34]]);
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 2, 0x12, 0xee, 0, 2, 0x34, 0xee])], 'batched DoH responses should preserve query order');
+		assert.deepEqual(calls, [[...q1], [...q2]]);
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, q1.length, ...replyFor(q1), 0, q2.length, ...replyFor(q2)])], 'batched DoH responses should preserve query order');
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -1958,23 +1983,26 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// udpContext — the Trojan-UDP path already buffers, the VLESS path previously dropped the tail.
 	const originalFetch = globalThis.fetch;
 	const calls = [];
+	const splitQuery = new Uint8Array([0x9a, 0xbc, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const splitReply = new Uint8Array([0x9a, 0xbc, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const splitFrame = new Uint8Array([0, splitQuery.length, ...splitQuery]);
 	globalThis.fetch = (url, init) => {
 		calls.push([...new Uint8Array(init.body)]);
-		return Promise.resolve(new Response(new Uint8Array([0xaa, 0xbb, 0xcc]), { status: 200, headers: { 'Content-Type': 'application/dns-message' } }));
+		return Promise.resolve(new Response(splitReply, { status: 200, headers: { 'Content-Type': 'application/dns-message' } }));
 	};
 	const sent = [];
 	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
 	const request = { env: {}, fetcher: { connect() { throw new Error('TCP should not be used when DoH succeeds'); } } };
 	const udpContext = { 缓存: new Uint8Array(0) };
 	try {
-		// Query frame [0,2,0x12,0x34] (length=2, payload 0x12 0x34) split after 3 bytes.
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 2, 0x12]), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 1');
+		// One length-prefixed query split mid-message across two calls.
+		await withTestTimeout(forwardataudp(splitFrame.subarray(0, 6), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 1');
 		assert.equal(calls.length, 0, 'no DoH request until the frame is complete');
 		assert.equal(sent.length, 0, 'nothing sent until the frame is complete');
-		await withTestTimeout(forwardataudp(new Uint8Array([0x34]), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 2');
+		await withTestTimeout(forwardataudp(splitFrame.subarray(6), webSocket, new Uint8Array([0, 0]), request, null, udpContext), 80, 'split UDP frame part 2');
 		assert.equal(calls.length, 1, 'exactly one DoH request once the frame completes');
-		assert.deepEqual(calls[0], [0x12, 0x34], 'reassembled query matches the original unsplit frame');
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 3, 0xaa, 0xbb, 0xcc])], 'response delivered once, correctly framed');
+		assert.deepEqual(calls[0], [...splitQuery], 'reassembled query matches the original unsplit frame');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, splitReply.length, ...splitReply])], 'response delivered once, correctly framed');
 		assert.equal(udpContext.缓存.byteLength, 0, 'reassembly buffer empty after a fully-consumed frame');
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -1987,12 +2015,19 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// and 0x12 is never re-fetched.
 	const originalFetch = globalThis.fetch;
 	const primaryCalls = [], fallbackCalls = [];
+	// Real single-question queries, identified by their transaction ID; the resolver echoes each query back
+	// as its answer, which is what the worker now requires.
+	const mkQ = (id) => new Uint8Array([0x00, id, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0x00, 0, 1, 0, 1]);
+	const qa = mkQ(0x12), qb = mkQ(0x34);
+	const batch = new Uint8Array([0, qa.length, ...qa, 0, qb.length, ...qb]);
+	const replyFor = (body) => { const r = new Uint8Array(body); r[2] = 0x81; r[3] = 0x80; return r; };
 	globalThis.fetch = async (url, init) => {
-		const query = [...new Uint8Array(init.body)];
+		const body = new Uint8Array(init.body);
+		const query = [...body];
 		const isFallback = String(url).includes('f.example');
 		(isFallback ? fallbackCalls : primaryCalls).push(query);
-		if (!isFallback && query[0] === 0x34) throw new Error('primary DoH failed for this frame');
-		return new Response(new Uint8Array([query[0], 0xee]), {
+		if (!isFallback && body[1] === 0x34) throw new Error('primary DoH failed for this frame');
+		return new Response(replyFor(body), {
 			status: 200,
 			headers: { 'Content-Type': 'application/dns-message' },
 		});
@@ -2001,10 +2036,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const webSocket = { readyState: WebSocket.OPEN, send(p) { sent.push(new Uint8Array(p)); } };
 	const request = { env: { DOH_URL: 'https://p.example/dns-query', DOH_URL_FALLBACK: 'https://f.example/dns-query' }, fetcher: { connect() { throw new Error('TCP should not be used when DoH resolves all frames'); } } };
 	try {
-		await withTestTimeout(forwardataudp(new Uint8Array([0, 1, 0x12, 0, 1, 0x34]), webSocket, new Uint8Array([0, 0]), request), 200, 'DoH partial-batch carry-over');
-		assert.deepEqual(primaryCalls.slice().sort((a, b) => a[0] - b[0]), [[0x12], [0x34]], 'primary DoH is tried for both frames');
-		assert.deepEqual(fallbackCalls, [[0x34]], 'fallback only re-fetches the frame that failed on the primary (0x12 is not re-fetched)');
-		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, 2, 0x12, 0xee, 0, 2, 0x34, 0xee])], 'both frames delivered in original order');
+		await withTestTimeout(forwardataudp(batch, webSocket, new Uint8Array([0, 0]), request), 200, 'DoH partial-batch carry-over');
+		assert.deepEqual(primaryCalls.slice().sort((a, b) => a[1] - b[1]), [[...qa], [...qb]], 'primary DoH is tried for both frames');
+		assert.deepEqual(fallbackCalls, [[...qb]], 'fallback only re-fetches the frame that failed on the primary (the first is not re-fetched)');
+		assert.deepEqual(sent, [new Uint8Array([0, 0, 0, qa.length, ...replyFor(qa), 0, qb.length, ...replyFor(qb)])], 'both frames delivered in original order');
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

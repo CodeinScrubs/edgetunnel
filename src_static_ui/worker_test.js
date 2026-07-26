@@ -1060,8 +1060,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 				}
 
 				if (!首包.isUDP) {
-					await 有限排空上行队列(上行写入队列);
-					const writer = 获取远端写入器();
+					// Only attempt a graceful upstream close if the queue actually drained. If it timed out the
+					// writer is wedged, and close() queues behind that same write — waiting a second full
+					// deadline on it just doubles teardown time before the inevitable force-close.
+					const 已排空 = await 有限排空上行队列(上行写入队列);
+					if (!已排空) closeRemoteSocketQuietly(remoteConnWrapper.socket);
+					const writer = 已排空 ? 获取远端写入器() : null;
 					if (writer) {
 						// close() queues BEHIND any outstanding write, so a wedged write would leave this pending
 						// forever. Bound it and force the socket shut when the deadline passes.
@@ -3452,9 +3456,10 @@ function DNS问题相同(a, b) {
 function 验证DNS响应(queryInput, msgInput) {
 	const query = 数据转Uint8Array(queryInput);
 	const msg = 数据转Uint8Array(msgInput);
-	// A query too short to hold a header isn't DNS at all; there is nothing to correlate against, so leave it
-	// to the caller's own framing checks rather than inventing a verdict.
-	if (query.byteLength < 12) return;
+	// Callers hand us a query that 解析并验证DNS查询帧 (or our own builder) already proved is a well-formed
+	// single-question request, so there is no "can't correlate" case to fall through any more: anything that
+	// cannot be matched is refused.
+	if (query.byteLength < 12) throw new Error('DNS query is too short to correlate');
 	if (msg.byteLength < 12) throw new Error('DoH response is too short');
 	if (msg[0] !== query[0] || msg[1] !== query[1]) throw new Error('DoH transaction ID mismatch');
 	if ((msg[2] & 0x80) === 0) throw new Error('DoH message is not a response');
@@ -3463,11 +3468,37 @@ function 验证DNS响应(queryInput, msgInput) {
 	// Structure first: a message that merely CLAIMS records must actually carry them, or a positive-looking
 	// but truncated answer would be forwarded and cached.
 	验证DNS消息结构(msg);
-	const 查询问题数 = (query[4] << 8) | query[5];
-	if (((msg[4] << 8) | msg[5]) !== 查询问题数) throw new Error('DoH response question count does not match the query');
-	// Question equality is only well-defined for the ordinary single-question case; the header/structure
-	// checks above still apply to anything else, so an unusual query is never left completely unverified.
-	if (查询问题数 === 1 && !DNS问题相同(query, msg)) throw new Error('DoH response answers a different question');
+	if (((msg[4] << 8) | msg[5]) !== ((query[4] << 8) | query[5])) throw new Error('DoH response question count does not match the query');
+	if (!DNS问题相同(query, msg)) throw new Error('DoH response answers a different question');
+}
+
+// Single gate for every tunneled DNS batch, used by BOTH resolvers and the SERVFAIL builder. The previous
+// per-frame length guard lived in one caller and only ever inspected the FIRST frame, so a batch could carry
+// a small valid query followed by a 5 KB one and the oversized frame was still parsed and forwarded; the
+// 木马-UDP route skipped that guard entirely because it passes no reassembly context. Validating here
+// means every path gets the same limits and every query is proved to be a real single-question request
+// before it reaches a resolver or the wire cache.
+function 解析并验证DNS查询帧(inputData) {
+	const input = 数据转Uint8Array(inputData);
+	const frames = [];
+	let cursor = 0;
+	while (cursor < input.byteLength) {
+		if (cursor + 2 > input.byteLength) throw new Error('incomplete DNS frame length prefix');
+		const length = (input[cursor] << 8) | input[cursor + 1];
+		if (length < 12 || length > DNS_QUERY_MAX_BYTES) throw new Error(`invalid DNS query length: ${length}`);
+		const start = cursor + 2, end = start + length;
+		if (end > input.byteLength) throw new Error('incomplete DNS query frame');
+		const query = input.subarray(start, end);
+		验证DNS消息结构(query);
+		if ((query[2] & 0x80) !== 0) throw new Error('DNS request has the response bit set');
+		if ((query[2] & 0x78) !== 0) throw new Error('unsupported DNS opcode');
+		if (((query[4] << 8) | query[5]) !== 1) throw new Error('only one-question DNS queries are supported');
+		frames.push(query);
+		if (frames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
+		cursor = end;
+	}
+	if (!frames.length) throw new Error('no DNS query frames');
+	return frames;
 }
 
 // End offset of a single-question section, or null when the message isn't a plain one-question query.
@@ -3490,16 +3521,9 @@ function DNS问题段结束(msg) {
 // returning nothing leaves the client waiting out its own multi-second DNS timeout, which is exactly what
 // "the page just hangs" feels like. An explicit SERVFAIL lets it fail fast and retry immediately.
 function 构建DNS服务失败响应(requestData) {
-	const input = 数据转Uint8Array(requestData);
+	// Same gate as the resolvers: a batch they refused outright must not be answered frame-by-frame here.
 	let frames;
-	try { frames = 解析DNS_TCP帧(input); } catch (e) { return null; }
-	// Honour the SAME batch cap the resolvers enforce. Without it, an oversized batch that the resolvers
-	// rejected outright would still be answered frame-by-frame here — spending real CPU building thousands of
-	// replies to a request that was already refused.
-	if (!frames?.length || frames.length > DNS_MAX_FRAMES_PER_REQUEST) return null;
-	// A valid prefix followed by malformed/incomplete trailing bytes isn't a batch we should answer.
-	const consumed = frames.reduce((sum, frame) => sum + 2 + frame.byteLength, 0);
-	if (consumed !== input.byteLength) return null;
+	try { frames = 解析并验证DNS查询帧(requestData); } catch (e) { return null; }
 	const out = [];
 	for (const query of frames) {
 		const 问题结束 = DNS问题段结束(query);
@@ -3522,9 +3546,7 @@ function 构建DNS服务失败响应(requestData) {
 }
 
 async function DNS经DoH转发(requestData, env, timeoutMs) {
-	const frames = 解析DNS_TCP帧(requestData);
-	if (!frames.length) throw new Error('no DNS query frames to forward via DoH');
-	if (frames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
+	const frames = 解析并验证DNS查询帧(requestData);
 	const dohUrls = getDohLookupUrls(env);
 	let lastErr = null;
 	// Per-frame results preserved across DoH-URL attempts: a fallback URL (or a later batch) only
@@ -3600,16 +3622,41 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 		const { env } = getWorkerRequestContext(request);
 		const dnsEndpoint = getDnsTcpEndpoint(env);
 		log(`[UDP forwarding] DNS-over-TCP fallback -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
-		const queryFrames = 解析DNS_TCP帧(requestData);
-		if (!queryFrames.length) throw new Error('no DNS query frames to forward');
-		if (queryFrames.length > DNS_MAX_FRAMES_PER_REQUEST) throw new Error('too many DNS query frames');
+		const queryFrames = 解析并验证DNS查询帧(requestData);
 		tcpSocket = TCP连接(dnsEndpoint);
 		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
 		writer = tcpSocket.writable.getWriter();
 		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
 		try { writer.releaseLock() } catch (e) { }
 		writer = null;
-		return await readMultipleDnsTcpFrames(tcpSocket, queryFrames.length, timeoutMs);
+		const 原始应答 = await readMultipleDnsTcpFrames(tcpSocket, queryFrames.length, timeoutMs);
+		// Match every reply to an outstanding query. A DNS-over-TCP server may pipeline replies OUT OF ORDER
+		// (RFC 7766), so "read N frames and forward them" can hand the client an answer for the wrong question,
+		// or accept an unsolicited/duplicate reply in place of a real one. DoH answers are correlated; this
+		// path must be too, especially since it is the fallback when DoH fails.
+		const 应答帧 = 解析DNS_TCP帧(原始应答);
+		const 有序应答 = new Array(queryFrames.length);
+		const 已匹配 = new Set();
+		for (const 应答 of 应答帧) {
+			let 命中 = -1;
+			for (let i = 0; i < queryFrames.length; i++) {
+				if (已匹配.has(i)) continue;
+				const 查询 = queryFrames[i];
+				if (应答.byteLength >= 12 && 应答[0] === 查询[0] && 应答[1] === 查询[1]) {
+					try { 验证DNS响应(查询, 应答); 命中 = i; } catch (e) { /* same ID, wrong content — keep looking */ }
+					if (命中 >= 0) break;
+				}
+			}
+			if (命中 < 0) throw new Error('unsolicited or mismatched DNS-over-TCP response');
+			已匹配.add(命中);
+			const framed = new Uint8Array(2 + 应答.byteLength);
+			framed[0] = (应答.byteLength >>> 8) & 0xff;
+			framed[1] = 应答.byteLength & 0xff;
+			framed.set(应答, 2);
+			有序应答[命中] = framed;
+		}
+		if (已匹配.size !== queryFrames.length) throw new Error('missing DNS-over-TCP response');
+		return 有序应答.length === 1 ? 有序应答[0] : 拼接字节数据(...有序应答);
 	} finally {
 		try { writer?.releaseLock?.() } catch (e) { }
 		try { tcpSocket?.close?.() } catch (e) { }
@@ -3740,13 +3787,30 @@ function getWsBufferedAmountMaxWaitMs(env) {
 // Hard ceiling for a client that never drains: 8x the soft limit, floored at 8 MiB so it can only fire on a
 // genuinely stuck consumer, never on an ordinary slow one.
 function 下行硬上限字节(软上限) {
-	// Capped at 16 MiB: the soft limit itself is configurable up to 8 MiB, and an uncapped multiple of it
-	// would derive a 64 MiB ceiling — half the isolate's 128 MiB, before upload queues, gRPC reassembly and
-	// any concurrent tunnel are accounted for.
+	// 4x the soft limit, floored at 8 MiB and capped at 16 MiB. The cap matters because the soft limit is
+	// itself configurable up to 8 MiB, and an uncapped multiple would derive a 64 MiB ceiling — half the
+	// isolate's 128 MiB, before upload queues, gRPC reassembly and any concurrent tunnel are accounted for.
 	return Math.min(16 * 1024 * 1024, Math.max(8 * 1024 * 1024, 软上限 * 4));
 }
 
 async function WebSocket发送并等待(webSocket, payload, limits = null) {
+	// Pace BEFORE adding more bytes. Waiting only after the send meant an already-congested socket was handed
+	// another chunk first, so the buffer could climb a chunk at a time even while pacing was "working".
+	{
+		const 软上限 = limits?.bufferedLimitBytes ?? WS缓冲上限字节;
+		const 最长等待 = limits?.maxWaitMs ?? WS缓冲最大等待毫秒;
+		if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > 软上限) {
+			let 已等待 = 0, 间隔 = 5;
+			while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 软上限 && 已等待 < 最长等待) {
+				await new Promise(r => setTimeout(r, 间隔));
+				已等待 += 间隔;
+				间隔 = Math.min(40, 间隔 * 2); // back off instead of polling every 5ms for the whole window
+			}
+			if (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 下行硬上限字节(软上限)) {
+				throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
+			}
+		}
+	}
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
 	// Real-WebSocket downstream pacing: gRPC/XHTTP bridges signal backpressure via the awaited
@@ -8595,11 +8659,12 @@ function getDialStaggerMs(env) {
 // by default, so a remote writer that never settles would keep a teardown pending forever and hold its socket
 // open. Applies at teardown only — normal uploads are never timed by this.
 async function 有限排空上行队列(队列, timeoutMs = 5000) {
-	if (!队列) return;
-	try { await withOperationTimeout(队列.等待空(), timeoutMs, 'Upload teardown drain timed out'); }
+	if (!队列) return true;
+	try { await withOperationTimeout(队列.等待空(), timeoutMs, 'Upload teardown drain timed out'); return true; }
 	catch (error) {
 		log(`[Teardown] ${error?.message || error}`);
 		try { 队列.清空() } catch (e) { }
+		return false; // caller should force-close now rather than spend another deadline on a graceful close
 	}
 }
 
