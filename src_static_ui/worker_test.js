@@ -18,6 +18,7 @@ const USER_CONFIG = {
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
 	DNS_TOTAL_TIMEOUT_MS: undefined,
+	DOH_SUBREQUEST_BUDGET: undefined,
 	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
@@ -609,6 +610,8 @@ export default {
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								debugError('Failed to save configuration:', error);
+								const 体错误响应 = 管理请求体错误响应(error);
+								if (体错误响应) return 体错误响应;
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (访问路径 === 'admin/cf.json') {
@@ -635,6 +638,8 @@ export default {
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								debugError('Failed to save configuration:', error);
+								const 体错误响应 = 管理请求体错误响应(error);
+								if (体错误响应) return 体错误响应;
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (访问路径 === 'admin/tg.json') {
@@ -651,6 +656,8 @@ export default {
 								return new Response(JSON.stringify({ success: true, message: 'Configuration saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								debugError('Failed to save configuration:', error);
+								const 体错误响应 = 管理请求体错误响应(error);
+								if (体错误响应) return 体错误响应;
 								return new Response(JSON.stringify({ error: 'Failed to save configuration: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else if (区分大小写访问路径 === 'admin/ADD.txt') {
@@ -661,6 +668,8 @@ export default {
 								return new Response(JSON.stringify({ success: true, message: 'Custom IP list saved' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							} catch (error) {
 								debugError('Failed to save custom IP list:', error);
+								const 体错误响应 = 管理请求体错误响应(error);
+								if (体错误响应) return 体错误响应;
 								return new Response(JSON.stringify({ error: 'Failed to save custom IP list: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 							}
 						} else return new Response(JSON.stringify({ error: 'Unsupported POST request path' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
@@ -2460,6 +2469,16 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	return total === output.byteLength ? output : output.slice(0, total);
 }
 
+// Map a body-read failure to the status it deserves. An oversized body is the CLIENT's error (413) and
+// malformed JSON is 400; returning 500 for either told the caller the worker had broken, and a panel
+// retrying a "server error" would keep re-sending the same too-large payload.
+function 管理请求体错误响应(error) {
+	const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+	if (error?.请求体过大) return json(413, { error: 'Request body too large' });
+	if (error instanceof SyntaxError) return json(400, { error: 'Invalid JSON' });
+	return null;
+}
+
 async function 读取有限请求文本(request, 最大字节) {
 	return new TextDecoder().decode(await 读取有限请求体(request, 最大字节));
 }
@@ -2947,7 +2966,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 	async function 打开TCP连接(address, port, signal = null) {
 		const remoteSock = TCP连接({ hostname: address, port });
-		const abort = () => { try { remoteSock?.close?.() } catch (e) { } };
+		const abort = () => { closeRemoteSocketQuietly(remoteSock); };
 		if (signal?.aborted) {
 			abort();
 			throw new Error('dial aborted');
@@ -3025,7 +3044,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			await 写入首包(socket, data);
 			return socket;
 		} catch (err) {
-			try { socket?.close?.() } catch (e) { }
+			closeRemoteSocketQuietly(socket);
 			if (预加载候选列表) log(`[TCP direct] Preload race failed: ${err.message || err}`);
 			throw err;
 		}
@@ -3064,7 +3083,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					setProxyEndpointCursor(proxyIP, host, candidate.index, 所有反代数组.length);
 					return socket;
 				} catch (err) {
-					try { socket?.close?.() } catch (e) { }
+					closeRemoteSocketQuietly(socket);
 					if (candidate) rememberProxyEndpointResult(env, ctx, proxyIP, [candidate.hostname, candidate.port], false, null, Date.now(), host, yourUUID);
 					else for (const 候选 of 候选列表) rememberProxyEndpointResult(env, ctx, proxyIP, [候选.hostname, 候选.port], false, null, Date.now(), host, yourUUID);
 					// If the first-packet WRITE was attempted (socket opened, then 写入首包 rejected), delivery is
@@ -3594,12 +3613,12 @@ function 构建DNS服务失败响应(requestData) {
 
 async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null, 预算持有者 = null) {
 	const frames = 解析并验证DNS查询帧(requestData);
-	// Refuse up front once this invocation's DoH allowance is gone, so the caller falls straight through to
-	// DNS-over-TCP instead of spending a subrequest that the platform is going to reject anyway.
-	if (预算持有者 && (预算持有者.dohSubrequests || 0) >= DOH_SUBREQUEST_BUDGET) {
-		throw new Error('DoH subrequest budget exhausted for this invocation');
-	}
+	// NOTE: there is deliberately NO budget pre-check here. An earlier revision refused the whole call up
+	// front once the counter was spent, which rejected queries the DNS wire cache could have answered for
+	// free and pushed them onto plaintext DNS-over-TCP for the rest of the session. The budget is spent
+	// per actual network lookup, inside 查询单帧, after the cache miss.
 	const dohUrls = getDohLookupUrls(env);
+	const doh预算 = getDohSubrequestBudget(env);
 	let lastErr = null;
 	// Per-frame results preserved across DoH-URL attempts: a fallback URL (or a later batch) only
 	// re-fetches frames still missing, so a partial-batch failure never re-spends subrequests on frames
@@ -3618,9 +3637,10 @@ async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null, �
 			const hit = 读取DNS线缓存(缓存键, query);
 			if (hit) return 封装响应(hit);
 		}
-		// Count only real network lookups — a wire-cache hit above costs no subrequest.
-		if (预算持有者) {
-			if ((预算持有者.dohSubrequests || 0) >= DOH_SUBREQUEST_BUDGET) {
+		// Count only real network lookups — the wire-cache hit above returns before reaching here, so a
+		// cached answer stays free no matter how much of the budget has been spent.
+		if (预算持有者 && doh预算 > 0) {
+			if ((预算持有者.dohSubrequests || 0) >= doh预算) {
 				throw new Error('DoH subrequest budget exhausted for this invocation');
 			}
 			预算持有者.dohSubrequests = (预算持有者.dohSubrequests || 0) + 1;
@@ -4403,7 +4423,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	}
 	// A stale pipe (a reconnect installed a different socket) must not touch the shared client transport or
 	// route health — connecttoPry already closed its socket; just exit and let the current pipe own teardown.
-	if (!仍为当前管道()) { try { remoteSocket?.close?.() } catch (e) { } return; }
+	if (!仍为当前管道()) { closeRemoteSocketQuietly(remoteSocket); return; }
 	// A client that closed/cancelled before the first downlink byte is not a route failure — don't poison the
 	// direct-route cache (onNoData) and don't spend a ProxyIP fallback dial on a connection the client already
 	// abandoned. And if a later uplink chunk (beyond the replayable first packet) already reached the remote,
@@ -4423,7 +4443,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// ClientHello) — replaying it on a fallback is unsafe, so close instead of retrying.
 	if (!hasData && retryFunc && 请求已发送值 && !首字节超时触发关闭 && !客户端已关闭 && !后续上行已送达 && pipeMeta?.可重放首包 !== false) {
 		try {
-			try { remoteSocket?.close?.() } catch (e) { }
+			closeRemoteSocketQuietly(remoteSocket);
 			await retryFunc();
 			return;
 		} catch (retryError) {
@@ -4431,7 +4451,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			throw retryError;
 		}
 	}
-	if (!hasData) { try { remoteSocket?.close?.() } catch (e) { } }
+	if (!hasData) { closeRemoteSocketQuietly(remoteSocket); }
 	if (readError) {
 		closeSocketQuietly(webSocket);
 		throw readError;
@@ -5664,8 +5684,8 @@ async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
 	const turnHost = stripIPv6Brackets(proxy.hostname);
 	let controlSocket = null, dataSocket = null, controlWriter = null, controlReader = null, dataWriter = null, dataReader = null, dataReaderReleased = false;
 	const close = () => {
-		try { controlSocket?.close?.() } catch (e) { }
-		try { dataSocket?.close?.() } catch (e) { }
+		closeRemoteSocketQuietly(controlSocket);
+		closeRemoteSocketQuietly(dataSocket);
 	};
 	const releaseDataReader = () => {
 		if (dataReaderReleased) return;
@@ -5854,7 +5874,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		try { reader?.releaseLock?.() } catch (e) { }
 		try { writer?.close?.().catch?.(() => { }) } catch (e) { }
 		try { writer?.releaseLock?.() } catch (e) { }
-		try { socket?.close?.() } catch (e) { }
+		closeRemoteSocketQuietly(socket);
 		settleClosed(resolveClosed);
 	};
 
@@ -6210,7 +6230,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 					try { controller.error(error) } catch (e) { }
 				}
 				settleClosed(rejectClosed, error);
-				try { socket?.close?.() } catch (e) { }
+				closeRemoteSocketQuietly(socket);
 			}
 		})();
 
@@ -8667,6 +8687,16 @@ function 剩余DNS时间(截止, 阶段超时) {
 // TCP connect, TCP write, TCP read) previously restarted its own timer, so a total-failure path stacked to
 // ~8.4s for a single query — longer than a typical client's own ~5s DNS timeout, which meant the SERVFAIL
 // fast-fail arrived after the client had already given up and the page just hung. Clamped to [1s, 10s].
+// DOH_SUBREQUEST_BUDGET env override. 0 disables the cap entirely — correct on a Paid plan, where the
+// allowance is 10,000 rather than 50 and capping tunneled DoH at 40 would downgrade it to plaintext TCP
+// for no reason. The plan cannot be detected at runtime, so this is deployment configuration.
+function getDohSubrequestBudget(env = {}) {
+	const configured = Number(env?.DOH_SUBREQUEST_BUDGET);
+	if (!Number.isFinite(configured) || configured < 0) return DOH_SUBREQUEST_BUDGET;
+	if (configured === 0) return 0;
+	return Math.max(1, Math.min(10000, Math.round(configured)));
+}
+
 function getDnsTotalTimeoutMs(env) {
 	const configured = Number(env?.DNS_TOTAL_TIMEOUT_MS);
 	if (!Number.isFinite(configured) || configured <= 0) return DNS_TOTAL_TIMEOUT_DEFAULT_MS;
@@ -8818,7 +8848,7 @@ async function writeWithOperationTimeout(writer, chunk, timeoutMs, message) {
 async function socketOpenedWithTimeout(socket, timeoutMs, message) {
 	if (!socket?.opened) return;
 	return withOperationTimeout(socket.opened, timeoutMs, message, () => {
-		try { socket?.close?.() } catch (e) { }
+		closeRemoteSocketQuietly(socket);
 	});
 }
 
@@ -9525,6 +9555,7 @@ function 构建生效设置视图(env) {
 		DNS_SERVER: { effective: raw('DNS_SERVER', 'DNS_TCP_SERVER') || '8.8.4.4:53', env: raw('DNS_SERVER', 'DNS_TCP_SERVER') },
 		DNS_TIMEOUT_MS: { effective: getDnsTcpResponseTimeoutMs(e), env: raw('DNS_TIMEOUT_MS') },
 		DNS_TOTAL_TIMEOUT_MS: { effective: getDnsTotalTimeoutMs(e), env: raw('DNS_TOTAL_TIMEOUT_MS') },
+		DOH_SUBREQUEST_BUDGET: { effective: getDohSubrequestBudget(e) || '(unlimited)', env: raw('DOH_SUBREQUEST_BUDGET') },
 		DOWNLINK_GRAIN_PACKET_BYTES: { effective: getDownlinkGrainBytes(e), env: raw('DOWNLINK_GRAIN_PACKET_BYTES') },
 		DOWNLINK_BACKPRESSURE_HWM_BYTES: { effective: getDownlinkBackpressureHwm(e), env: raw('DOWNLINK_BACKPRESSURE_HWM_BYTES') },
 		WS_BUFFERED_AMOUNT_LIMIT_BYTES: { effective: getWsBufferedAmountLimitBytes(e), env: raw('WS_BUFFERED_AMOUNT_LIMIT_BYTES') },
@@ -9920,6 +9951,7 @@ var ENV_SETTINGS=[
  {k:'DNS_SERVER',d:'8.8.4.4:53',h:'DNS-over-TCP upstream (host:port), the last-resort resolver.'},
  {k:'DNS_TIMEOUT_MS',d:'1200',h:'Per-stage timeout (ms) for tunneled DNS — applies to each DoH request, each DoH body read, and each DNS-over-TCP connect/write/read. Clamped 400-5000. No longer inherited from CONNECT_TIMEOUT_MS.'},
  {k:'DNS_TOTAL_TIMEOUT_MS',d:'4000',h:'ONE total budget (ms) for a whole tunneled DNS lookup, shared across every DoH attempt AND the DNS-over-TCP fallback. When it runs out the worker answers SERVFAIL immediately instead of stacking per-stage timeouts. Clamped 1000-10000. Lower (2000-3000) hands back to your client resolver sooner; raise only if your resolvers are genuinely slow rather than broken.'},
+ {k:'DOH_SUBREQUEST_BUDGET',d:'40',h:'How many DNS-over-HTTPS lookups one connection may make before tunneled DNS switches to plaintext DNS-over-TCP. The free plan allows 50 external subrequests PER INVOCATION and a WebSocket tunnel is ONE invocation, so an unbounded session would spend them all on DNS and leave none for anything else. Cached answers are always free and never count. Set 0 to remove the cap (correct on a paid plan, which allows 10000).'},
  {g:'Throughput'},
  {k:'DOWNLINK_GRAIN_PACKET_BYTES',d:'32768',h:'Download coalescing size. Smaller (8-16k) feels snappier for browsing; larger (64k) is better for big downloads.'},
  {k:'DOWNLINK_BACKPRESSURE_HWM_BYTES',d:'262144',h:'How much undelivered data may buffer before the remote read is paused. Raise on fast links with memory headroom; too high risks isolate memory pressure. Clamped 64k-8M.'},
