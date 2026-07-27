@@ -229,8 +229,13 @@ function isKvRequestLoggingEnabled(env = {}) {
 }
 
 function isProxyResolutionKvCacheEnabled(env = {}) {
-	// On by default (writes are globally throttled and TTL'd, so they cannot exhaust the KV
-	// quota or drop connections). Explicitly disable with OFF_PROXY_CACHE=1 or ENABLE_KV_PROXY_CACHE=0.
+	// On by default: a warm proxy-resolution cache removes a DoH round-trip from cold-isolate connects,
+	// which is the latency this tunnel is tuned for. Writes are TTL'd and throttled, but note the throttle
+	// (上次代理缓存KV写入) is a MODULE variable, so it is per-isolate, NOT account-wide — several isolates or
+	// colos each keep their own clock. At the 3-minute floor that is ~480 writes/day per isolate, so on a
+	// Free plan (1000 writes/day) enough concurrent isolates CAN approach the quota. If this namespace is
+	// shared with panel config, disable with OFF_PROXY_CACHE=1 or ENABLE_KV_PROXY_CACHE=0; the bounded
+	// in-memory L1 cache keeps working either way.
 	if (isEnabledEnvFlag(env.OFF_PROXY_CACHE) || isEnabledEnvFlag(env.DISABLE_KV_PROXY_CACHE)) return false;
 	const explicit = String(env.ENABLE_KV_PROXY_CACHE ?? env.KV_PROXY_CACHE ?? '').trim().toLowerCase();
 	if (['0', 'false', 'no', 'off'].includes(explicit)) return false;
@@ -1522,11 +1527,15 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (已认证 || !parsedFrames.consumed) break;
 					}
 				}
-				await 有限排空上行队列(上行写入队列);
+				// Same rule as the XHTTP path: if the queue never drained the writer is wedged, so force the
+				// socket shut instead of queuing a half-close behind that same stuck write and burning a
+				// second deadline on it.
+				const 已排空 = await 有限排空上行队列(上行写入队列);
+				if (!已排空) closeRemoteSocketQuietly(remoteConnWrapper.socket);
 				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
 				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
 				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
-				if (正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
+				if (已排空 && 正常结束 && !isDnsQuery && remoteConnWrapper.socket && isGrpcHalfCloseOnEof(getWorkerRequestContext(request).env)) {
 					// Capture the EXACT socket + pipe up front: a concurrent reconnect can swap remoteConnWrapper.socket
 					// while we're half-closing, and re-reading the mutable property could close the REPLACEMENT socket or
 					// await the wrong pipe. Operate only on the socket whose upload just ended.
@@ -2126,7 +2135,10 @@ async function 处理WS请求(request, yourUUID, url) {
 	if (!SS模式禁用EarlyData && earlyDataHeader) {
 		try {
 			const bytes = 解码WS早期数据(earlyDataHeader, yourUUID);
-			if (bytes?.byteLength) 入队WS显式传输(bytes.buffer);
+			// Pass the VIEW, not .buffer: the decoders happen to return exact-size arrays today, so .buffer is
+			// currently equivalent, but any future decode that returns a subarray would silently ship the whole
+			// backing buffer as early data.
+			if (bytes?.byteLength) 入队WS显式传输(bytes);
 		} catch (error) {
 			处理WS显式传输错误(error);
 		}
@@ -2362,8 +2374,11 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	const 截止时刻 = Date.now() + 期限毫秒;
 	// A byte cap alone doesn't bound WORK: 65535 one-byte chunks stay under the cap yet cost 65535 reads.
 	// Copy into one preallocated buffer and cap the chunk count too.
+	// Collect chunks and size the result EXACTLY. Preallocating 最大字节 up front meant every DoH lookup
+	// allocated and zeroed 64 KiB to hold a ~100-byte DNS answer, on the latency-critical DNS path. The
+	// caps below still bound both bytes and work.
 	const 最大分片数 = 256;
-	const output = new Uint8Array(最大字节);
+	const 分片 = [];
 	let total = 0, 分片数 = 0;
 	try {
 		for (; ;) {
@@ -2377,13 +2392,20 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 			if (!chunk.byteLength) continue;
 			if (++分片数 > 最大分片数) throw new Error(`${label}: too many response body chunks`);
 			if (total + chunk.byteLength > 最大字节) throw new Error(`${label}: response body too large`);
-			output.set(chunk, total); total += chunk.byteLength;
+			// Safe to retain: a default (non-BYOB) reader hands out a fresh array per chunk, so nothing
+			// reuses this backing buffer behind us.
+			分片.push(chunk); total += chunk.byteLength;
 		}
 	} finally {
 		cancelReaderQuietly(reader, `${label} body read finished`);
 		try { reader.releaseLock() } catch (e) { }
 	}
-	return output.slice(0, total);
+	if (!分片.length) return new Uint8Array(0);
+	if (分片.length === 1) return 分片[0]; // the overwhelmingly common case: one chunk, zero copies
+	const output = new Uint8Array(total);
+	let 偏移 = 0;
+	for (const c of 分片) { output.set(c, 偏移); 偏移 += c.byteLength; }
+	return output;
 }
 
 async function 读取有限请求文本(request, 最大字节) {
@@ -3753,7 +3775,7 @@ function getWsBufferedAmountMaxWaitMs(env) {
 	return Math.max(100, Math.min(10000, Math.round(configured)));
 }
 
-// Hard ceiling for a client that never drains: 8x the soft limit, floored at 8 MiB so it can only fire on a
+// Hard ceiling for a client that never drains: 4x the soft limit, floored at 8 MiB so it can only fire on a
 // genuinely stuck consumer, never on an ordinary slow one.
 function 下行硬上限字节(软上限) {
 	// 4x the soft limit, floored at 8 MiB and capped at 16 MiB. The cap matters because the soft limit is
@@ -3763,45 +3785,33 @@ function 下行硬上限字节(软上限) {
 }
 
 async function WebSocket发送并等待(webSocket, payload, limits = null) {
-	// Pace BEFORE adding more bytes. Waiting only after the send meant an already-congested socket was handed
-	// another chunk first, so the buffer could climb a chunk at a time even while pacing was "working".
-	{
-		const 软上限 = limits?.bufferedLimitBytes ?? WS缓冲上限字节;
-		const 最长等待 = limits?.maxWaitMs ?? WS缓冲最大等待毫秒;
-		if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > 软上限) {
-			let 已等待 = 0, 间隔 = 5;
-			while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 软上限 && 已等待 < 最长等待) {
-				await new Promise(r => setTimeout(r, 间隔));
-				已等待 += 间隔;
-				间隔 = Math.min(40, 间隔 * 2); // back off instead of polling every 5ms for the whole window
-			}
-			if (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 下行硬上限字节(软上限)) {
-				throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
-			}
-		}
-	}
-	const sendResult = webSocket.send(payload);
-	if (sendResult && typeof sendResult.then === 'function') await sendResult;
-	// Real-WebSocket downstream pacing: gRPC/XHTTP bridges signal backpressure via the awaited
-	// promise above; a native WebSocket has no such signal, so when the runtime exposes
-	// bufferedAmount we pause until its outbound buffer drains. Bounded so it can never hang.
+	// Pace BEFORE adding more bytes. Waiting only AFTER the send handed an already-congested socket another
+	// chunk first, so the buffer could climb a chunk at a time while pacing looked like it was working. There
+	// is exactly ONE wait per chunk: an earlier revision added this block without removing the post-send one,
+	// which doubled the pacing delay for every chunk on a congested link.
 	const bufferedLimit = limits?.bufferedLimitBytes ?? WS缓冲上限字节;
 	const maxWaitMs = limits?.maxWaitMs ?? WS缓冲最大等待毫秒;
 	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > bufferedLimit) {
-		let 已等待 = 0;
-		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit && 已等待 < maxWaitMs) {
-			await new Promise(r => setTimeout(r, 5));
-			已等待 += 5;
-		}
-		// After the bounded wait we deliberately keep sending: a phone on a weak link can sit above the soft
-		// limit for seconds during a burst, and tearing that connection down would cause the very drops this
-		// tunnel is tuned to avoid. But "send anyway" forever is not a bound, so a HARD ceiling well above the
-		// soft limit ends a client that is not draining at all — by then it is effectively dead, and stopping
-		// protects the other tunnels sharing the isolate's memory.
-		if (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > 下行硬上限字节(bufferedLimit)) {
-			throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
+		const 截止 = Date.now() + maxWaitMs;
+		let 间隔 = 5;
+		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit && Date.now() < 截止) {
+			await new Promise(r => setTimeout(r, 间隔));
+			间隔 = Math.min(40, 间隔 * 2); // back off instead of polling every 5ms for the whole window
 		}
 	}
+	// The socket can close while we wait; sending into a closed socket is not useful and hides the real reason
+	// the stream ended.
+	if (webSocket.readyState !== WebSocket.OPEN) throw new Error('WebSocket closed while waiting to send');
+	// After the bounded wait we deliberately keep sending: a phone on a weak link can sit above the soft limit
+	// for seconds during a burst, and tearing that connection down would cause the very drops this tunnel is
+	// tuned to avoid. But "send anyway" forever is not a bound, so a HARD ceiling well above the soft limit
+	// ends a client that is not draining at all — by then it is effectively dead, and stopping protects the
+	// other tunnels sharing the isolate's memory.
+	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > 下行硬上限字节(bufferedLimit)) {
+		throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
+	}
+	const sendResult = webSocket.send(payload);
+	if (sendResult && typeof sendResult.then === 'function') await sendResult;
 }
 
 function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
@@ -4087,7 +4097,13 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 					flush().catch(() => closeSocketQuietly(webSocket));
 					return;
 				}
-				if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
+				// Wait for more ONLY if more actually arrived during the last round. The old condition also
+				// waited whenever pendingBytes < lowWaterBytes, which meant a small response from an origin
+				// that had already gone quiet sat here for up to 2 extra rounds waiting for bytes that were
+				// never coming — pure added latency on exactly the small interactive responses (HTML, JSON,
+				// API replies) where it hurts most. Bulk transfers fill packetCap and take the immediate
+				// flush path above, so coalescing still applies where it actually pays.
+				if (waitRounds < 2 && generation !== scheduledGeneration) {
 					waitRounds++;
 					scheduledGeneration = generation;
 					scheduleFlush();
