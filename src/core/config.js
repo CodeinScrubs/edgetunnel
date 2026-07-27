@@ -15,6 +15,7 @@ export const USER_CONFIG = {
 	PRELOAD_RACE_DIAL: undefined,
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
+	DNS_TOTAL_TIMEOUT_MS: undefined,
 	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
@@ -63,8 +64,10 @@ export const ENGINE_DEFAULTS = {
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS: 60 * 1000,
-	// Global floor between ANY two proxy-cache KV writes per isolate. Caps total writes so
-	// active browsing can't exhaust the free-plan 1000/day KV write quota (3 min => <=480/day).
+	// Floor between ANY two proxy-cache KV writes IN ONE ISOLATE (3 min => <=480/day/isolate). This is a
+	// per-isolate clock, NOT an account-wide one: several isolates or colos each keep their own, so this
+	// bounds write RATE but cannot by itself guarantee the free-plan 1000/day account quota. Set
+	// ENABLE_KV_PROXY_CACHE=0 if this namespace is shared with panel config.
 	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS: 3 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_MS: 10 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD: 2,

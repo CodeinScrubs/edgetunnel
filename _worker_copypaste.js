@@ -17,6 +17,7 @@ const USER_CONFIG = {
 	PRELOAD_RACE_DIAL: undefined,
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
+	DNS_TOTAL_TIMEOUT_MS: undefined,
 	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
@@ -65,8 +66,10 @@ const ENGINE_DEFAULTS = {
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_STALE_TTL_MS: 6 * 60 * 60 * 1000,
 	PROXY_RESOLUTION_CACHE_KV_WRITE_COOLDOWN_MS: 60 * 1000,
-	// Global floor between ANY two proxy-cache KV writes per isolate. Caps total writes so
-	// active browsing can't exhaust the free-plan 1000/day KV write quota (3 min => <=480/day).
+	// Floor between ANY two proxy-cache KV writes IN ONE ISOLATE (3 min => <=480/day/isolate). This is a
+	// per-isolate clock, NOT an account-wide one: several isolates or colos each keep their own, so this
+	// bounds write RATE but cannot by itself guarantee the free-plan 1000/day account quota. Set
+	// ENABLE_KV_PROXY_CACHE=0 if this namespace is shared with panel config.
 	PROXY_RESOLUTION_CACHE_KV_MIN_GLOBAL_INTERVAL_MS: 3 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_MS: 10 * 60 * 1000,
 	PROXY_ENDPOINT_FAILURE_COOLDOWN_THRESHOLD: 2,
@@ -255,14 +258,20 @@ function getDohLookupUrl(env = {}) {
 
 // Ordered DoH endpoints to try for tunneled DNS: primary (DOH_URL) then a secondary
 // (DOH_URL_FALLBACK, default Google) before falling back to plaintext DNS-over-TCP.
+const DEFAULT_DOH_FALLBACK_URL = 'https://dns.google/dns-query';
 function getDohLookupUrls(env = {}) {
 	const primary = getDohLookupUrl(env);
 	const urls = [primary];
-	const fallbackRaw = String(env?.DOH_URL_FALLBACK || 'https://dns.google/dns-query').trim();
-	try {
-		const u = new URL(fallbackRaw);
-		if (u.protocol === 'https:' && u.href !== primary) urls.push(u.href);
-	} catch (error) { }
+	// 'off'/'none'/'0' explicitly disables the secondary resolver. Without this, the only way to express
+	// "don't use a fallback" was an empty value — which selected the Google default instead of disabling it.
+	const 显式值 = String(env?.DOH_URL_FALLBACK ?? '').trim();
+	if (!['off', 'none', '0', 'false', 'disabled'].includes(显式值.toLowerCase())) {
+		const fallbackRaw = 显式值 || DEFAULT_DOH_FALLBACK_URL;
+		try {
+			const u = new URL(fallbackRaw);
+			if (u.protocol === 'https:' && u.href !== primary) urls.push(u.href);
+		} catch (error) { }
+	}
 	return urls;
 }
 
@@ -2341,20 +2350,30 @@ async function 读取有限请求体(request, 最大字节) {
 	if (Number.isFinite(declared) && declared > 最大字节) throw 过大();
 	if (!request.body) return new Uint8Array(0);
 	const reader = request.body.getReader();
-	const chunks = [];
+	// Copy into an OWNED buffer rather than retaining the returned views: a default reader hands back
+	// whatever the source enqueued, so the source may reuse that buffer on a later read. Same ownership
+	// rule as 读取有限响应体 below — the two helpers should not have different guarantees.
+	let 容量 = Number.isInteger(declared) && declared > 0 && declared <= 最大字节 ? declared : Math.min(1024, 最大字节);
+	let output = new Uint8Array(容量);
 	let total = 0;
 	try {
 		for (; ;) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			const chunk = 数据转Uint8Array(value);
-			total += chunk.byteLength;
-			if (total > 最大字节) { try { await reader.cancel('request body too large') } catch (e) { } throw 过大(); }
-			if (chunk.byteLength) chunks.push(chunk);
+			if (!chunk.byteLength) continue;
+			const 需要 = total + chunk.byteLength;
+			if (需要 > 最大字节) { try { await reader.cancel('request body too large') } catch (e) { } throw 过大(); }
+			if (需要 > output.byteLength) {
+				const grown = new Uint8Array(Math.min(最大字节, Math.max(需要, output.byteLength * 2)));
+				grown.set(output.subarray(0, total));
+				output = grown;
+			}
+			output.set(chunk, total); total = 需要;
 		}
 	} finally { try { reader.releaseLock() } catch (e) { } }
-	if (!chunks.length) return new Uint8Array(0);
-	return chunks.length === 1 ? chunks[0] : 拼接字节数据(...chunks);
+	if (!total) return new Uint8Array(0);
+	return total === output.byteLength ? output : output.slice(0, total);
 }
 
 // Response-body counterpart of 读取有限请求体, with its own deadline. fetch()'s AbortSignal stops applying
@@ -3544,8 +3563,13 @@ function 构建DNS服务失败响应(requestData) {
 	return out.length === 1 ? out[0] : 拼接字节数据(...out);
 }
 
-async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null) {
+async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null, 预算持有者 = null) {
 	const frames = 解析并验证DNS查询帧(requestData);
+	// Refuse up front once this invocation's DoH allowance is gone, so the caller falls straight through to
+	// DNS-over-TCP instead of spending a subrequest that the platform is going to reject anyway.
+	if (预算持有者 && (预算持有者.dohSubrequests || 0) >= DOH_SUBREQUEST_BUDGET) {
+		throw new Error('DoH subrequest budget exhausted for this invocation');
+	}
 	const dohUrls = getDohLookupUrls(env);
 	let lastErr = null;
 	// Per-frame results preserved across DoH-URL attempts: a fallback URL (or a later batch) only
@@ -3564,6 +3588,13 @@ async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null) {
 		if (缓存键) {
 			const hit = 读取DNS线缓存(缓存键, query);
 			if (hit) return 封装响应(hit);
+		}
+		// Count only real network lookups — a wire-cache hit above costs no subrequest.
+		if (预算持有者) {
+			if ((预算持有者.dohSubrequests || 0) >= DOH_SUBREQUEST_BUDGET) {
+				throw new Error('DoH subrequest budget exhausted for this invocation');
+			}
+			预算持有者.dohSubrequests = (预算持有者.dohSubrequests || 0) + 1;
 		}
 		const resp = await fetchWithTimeout(dohUrl, {
 			method: 'POST',
@@ -3674,6 +3705,13 @@ async function DNS经TCP转发(requestData, request, timeoutMs, 总截止 = null
 const DNS_QUERY_MAX_BYTES = 4096;
 const DNS_REASSEMBLY_MAX_BYTES = 128 * 1024;
 const DNS_TOTAL_TIMEOUT_DEFAULT_MS = 4000;
+// Free plan allows 50 external subrequests PER INVOCATION, and a WebSocket tunnel is ONE long-lived
+// invocation — so every DoH lookup spends from a budget shared by the whole session. A client that routes
+// its DNS through the tunnel exhausts that in a normal browsing session, after which every further fetch()
+// throws and DNS only works via the DNS-over-TCP fallback anyway, after paying a failed subrequest first.
+// Stop at 40 and switch to TCP proactively: same outcome, without burning a doomed fetch (and its latency)
+// on every query, and leaving headroom for ProxyIP resolution which draws on the same budget.
+const DOH_SUBREQUEST_BUDGET = 40;
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
 	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
@@ -3702,7 +3740,10 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	// try: if a send throws after a real answer has already gone out (downstream congestion can now throw),
 	// treating it as a resolver failure would put a contradictory SERVFAIL on the wire for the same query.
 	try {
-		const { env } = getWorkerRequestContext(request);
+		// The context object is per-invocation (WeakMap keyed by request), which is exactly the scope the
+		// platform's 50-subrequest allowance uses, so it is the right place to carry the DoH counter.
+		const 请求上下文 = getWorkerRequestContext(request);
+		const { env } = 请求上下文;
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
 		// ONE budget for every stage below, including the fallback resolver. Without it the stage timeouts
 		// stack (~8.4s for a single query, far more for a batch) and the client times out first.
@@ -3718,11 +3759,11 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs, 总截止);
 			} catch (tcpError) {
 				log(`[UDP forwarding] DNS-over-TCP failed (${tcpError?.message || tcpError}); falling back to DoH`);
-				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止, 请求上下文);
 			}
 		} else {
 			try {
-				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止, 请求上下文);
 			} catch (dohError) {
 				log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
 				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs, 总截止);
@@ -6428,7 +6469,8 @@ function 绑定请求中止(request, wrapper) {
 		wrapper.客户端已关闭 = true;
 		if (!wrapper.closeHint) wrapper.closeHint = 'client_abort';
 		追踪关闭(wrapper.追踪, wrapper); // synchronous close emit before the invocation is torn down
-		try { wrapper.socket?.close?.(); } catch (e) { }
+		// close() returns a Promise; a bare try/catch leaves its rejection unhandled.
+		closeRemoteSocketQuietly(wrapper.socket);
 	};
 	if (signal.aborted) { onAbort(); return; }
 	try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) { }
