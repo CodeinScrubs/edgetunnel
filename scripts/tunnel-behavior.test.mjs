@@ -2056,7 +2056,11 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		0xc0, 0x0c, 0, 1, 0, 1, ...ttlBytes, 0, 4, 1, 2, 3, 4,   // answer: ptr, A, IN, TTL, rdlen=4, 1.2.3.4
 	]);
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 1, 0x2c])), 300000, 'a 300s record TTL caches for 300s');
-	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 10])), 30000, 'a below-floor TTL clamps up to the 30s minimum');
+	// CHANGED (was: a below-floor TTL clamps UP to the 30s minimum). Holding a 10s answer for 30s meant
+	// handing out an address up to 20s after its authority retired it — for a rotating CDN that surfaces as
+	// a connection to a dead endpoint. A parsed TTL is now honoured exactly; the 30s constant survives only
+	// as the fail-safe for messages we could not parse (asserted below).
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 10])), 10000, 'a short TTL is honoured, never extended past what the authority allowed');
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 1, 0x38, 0x80])), 300000, 'an above-cap TTL (80000s) clamps down to the 5min maximum');
 	assert.equal(dnsAnswerMinTtlMs(new Uint8Array([0, 0, 0x81, 0x80, 0, 1])), 30000, 'a truncated/malformed message fails safe to the 30s floor');
 	// RFC 1035: a TTL-0 answer (a well-formed response, distinct from malformed) must NOT be cached -> 0,

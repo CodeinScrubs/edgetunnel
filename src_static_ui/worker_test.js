@@ -3369,14 +3369,47 @@ function dns线缓存键(dohUrl, query) {
 	for (let i = 2; i < q.byteLength; i++) key += String.fromCharCode(q[i]);
 	return key;
 }
+// Subtract the time an answer has already spent in our cache from every record's TTL. Replaying the
+// ORIGINAL TTL made the client start its own full TTL over again: a 60s answer served from our cache at
+// t=30s was cached by the client until t=90s, so an address could outlive what its authority intended by
+// up to double. Walks answer + authority + additional records; on any parse trouble it leaves the message
+// untouched, which is never worse than the old behavior.
+function 老化DNS_TTL(out, 已存在毫秒) {
+	const 已过秒 = Math.floor(已存在毫秒 / 1000);
+	if (已过秒 <= 0) return;
+	const 记录数 = ((out[6] << 8) | out[7]) + ((out[8] << 8) | out[9]) + ((out[10] << 8) | out[11]);
+	if (记录数 <= 0) return;
+	let p = 12;
+	const qd = (out[4] << 8) | out[5];
+	for (let i = 0; i < qd; i++) {
+		p = 跳过DNS名称(out, p);
+		p += 4; // QTYPE + QCLASS
+	}
+	for (let i = 0; i < 记录数; i++) {
+		p = 跳过DNS名称(out, p);
+		if (p + 10 > out.byteLength) return;
+		p += 4; // TYPE + CLASS
+		const ttl = ((out[p] << 24) | (out[p + 1] << 16) | (out[p + 2] << 8) | out[p + 3]) >>> 0;
+		const 剩余 = Math.max(0, ttl - 已过秒);
+		out[p] = (剩余 >>> 24) & 0xff; out[p + 1] = (剩余 >>> 16) & 0xff;
+		out[p + 2] = (剩余 >>> 8) & 0xff; out[p + 3] = 剩余 & 0xff;
+		p += 4;
+		const rdlen = (out[p] << 8) | out[p + 1];
+		p += 2 + rdlen;
+		if (p > out.byteLength) return;
+	}
+}
+
 function 读取DNS线缓存(key, query) {
 	const cached = DNS_WIRE_CACHE.get(key);
 	if (!cached) return null;
-	if (cached.expiresAt <= Date.now()) { DNS_WIRE_CACHE.delete(key); return null; }
+	const now = Date.now();
+	if (cached.expiresAt <= now) { DNS_WIRE_CACHE.delete(key); return null; }
 	DNS_WIRE_CACHE.delete(key); DNS_WIRE_CACHE.set(key, cached); // LRU touch
 	const q = 数据转Uint8Array(query);
 	const out = new Uint8Array(cached.msg);
 	out[0] = q[0]; out[1] = q[1]; // restore the caller's transaction ID into the cached response
+	try { 老化DNS_TTL(out, now - (cached.cachedAt || now)); } catch (e) { /* leave TTLs as stored */ }
 	return out;
 }
 // Minimum TTL across a DNS response's answer records, so a positive answer can be cached for its real
@@ -3422,7 +3455,11 @@ function 解析DNS应答最小TTL毫秒(msg) {
 	}
 	if (!Number.isFinite(最小TTL秒)) return DNS_RESULT_CACHE_MIN_TTL_MS;
 	if (最小TTL秒 <= 0) return 0; // RFC 1035: a TTL-0 answer is for the current transaction only — must not be cached
-	return Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, 最小TTL秒 * 1000));
+	// Never hold an answer LONGER than its authority allowed. This used to floor the lifetime at
+	// DNS_RESULT_CACHE_MIN_TTL_MS (30s), so a 5s answer was served for 30s — long enough to keep handing out
+	// an address a CDN had already rotated away, which shows up as connections to dead endpoints. The floor
+	// only ever applies to the fail-safe paths above (where the real TTL could not be parsed).
+	return Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, 最小TTL秒 * 1000);
 }
 
 function 写入DNS线缓存(key, msg) {
@@ -3433,7 +3470,9 @@ function 写入DNS线缓存(key, msg) {
 	if (ttlMs <= 0) return; // TTL-0 answer (e.g. per-query CDN rotation) — must not be cached
 	const stored = new Uint8Array(msg);
 	stored[0] = 0; stored[1] = 0;
-	DNS_WIRE_CACHE.set(key, { msg: stored, expiresAt: Date.now() + ttlMs });
+	const now = Date.now();
+	// cachedAt lets 读取DNS线缓存 age each record's TTL by the time already spent here.
+	DNS_WIRE_CACHE.set(key, { msg: stored, cachedAt: now, expiresAt: now + ttlMs });
 	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
 }
 
@@ -6343,6 +6382,9 @@ function debugError(...args) {
 // Byte fields are raw integers (bytes / bytes-per-second); the analysis tool formats, not the Worker.
 let 连接追踪序号 = 0;
 const 连接追踪心跳毫秒默认 = 15000; // periodic `stat` so a long-lived (gRPC "gun") connection stays visible even if the tail attaches mid-stream
+// Hard ceiling on how long the DEBUG heartbeat may keep beating. A pending interval holds the invocation
+// open, so this bounds the damage if a tracer is ever created on a path that never closes it.
+const 连接追踪最长心跳毫秒 = 30 * 60 * 1000;
 function 格式化字节数(n) {
 	// Retained for the test suite / any human-readable callers; the tracer itself emits raw integers.
 	if (!Number.isFinite(n) || n < 0) return '0B';
@@ -6407,8 +6449,16 @@ function 创建连接追踪器(transport, request = null, env = null) {
 		edge_bps: cf.edgeL4?.deliveryRate ?? null,
 	});
 	try {
+		// A repeating interval keeps a Worker invocation ALIVE. If any path ever creates a tracer whose
+		// 追踪关闭 never runs, this heartbeat alone can hold the invocation open until the runtime kills it
+		// with "your Worker's code had hung and would never generate a response" — which is exactly what a
+		// DEBUG=1 capture showed. Bound the number of beats so the timer can never outlive a real session,
+		// and let the normal clearInterval in 追踪关闭 do the fast path. DEBUG-only: 创建连接追踪器 returns
+		// null when DEBUG is off, so production never arms this.
+		let 心跳次数 = 0;
+		const 最多心跳 = Math.max(1, Math.ceil(连接追踪最长心跳毫秒 / 心跳毫秒));
 		s.hb = setInterval(() => {
-			if (s.closed) { try { clearInterval(s.hb) } catch (e) { } return; }
+			if (s.closed || ++心跳次数 > 最多心跳) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; return; }
 			const { upBps, downBps, moved } = 更新追踪速率峰值(s);
 			// Skip a fully-idle heartbeat once a route exists, so an idle DoT/API/DNS connection doesn't flood the tail.
 			if (!moved && s.route !== 'pending') return;
@@ -8691,10 +8741,16 @@ function 剩余DNS时间(截止, 阶段超时) {
 // allowance is 10,000 rather than 50 and capping tunneled DoH at 40 would downgrade it to plaintext TCP
 // for no reason. The plan cannot be detected at runtime, so this is deployment configuration.
 function getDohSubrequestBudget(env = {}) {
-	const configured = Number(env?.DOH_SUBREQUEST_BUDGET);
+	// Trim and require a non-empty value: Number('') and Number(' ') are both 0, so an env var set to blank
+	// or whitespace would have read as "0 = unlimited" and silently removed the cap.
+	const raw = String(env?.DOH_SUBREQUEST_BUDGET ?? '').trim();
+	if (!raw) return DOH_SUBREQUEST_BUDGET;
+	const configured = Number(raw);
 	if (!Number.isFinite(configured) || configured < 0) return DOH_SUBREQUEST_BUDGET;
 	if (configured === 0) return 0;
-	return Math.max(1, Math.min(10000, Math.round(configured)));
+	// Paid Workers allow far more than 10000 subrequests per invocation, so don't cap the knob below what
+	// the platform can actually grant.
+	return Math.max(1, Math.min(10_000_000, Math.round(configured)));
 }
 
 function getDnsTotalTimeoutMs(env) {

@@ -47,3 +47,6 @@ _worker - Copy.js
 
 # 1101 bisection scratch (kept on disk, not tracked)
 reason_new/
+
+# wrangler tail captures (large, local debugging artifacts)
+worker-debug-*.jsonl
