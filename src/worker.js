@@ -2270,11 +2270,16 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	const 截止时刻 = Date.now() + 期限毫秒;
 	// A byte cap alone doesn't bound WORK: 65535 one-byte chunks stay under the cap yet cost 65535 reads.
 	// Copy into one preallocated buffer and cap the chunk count too.
-	// Collect chunks and size the result EXACTLY. Preallocating 最大字节 up front meant every DoH lookup
-	// allocated and zeroed 64 KiB to hold a ~100-byte DNS answer, on the latency-critical DNS path. The
-	// caps below still bound both bytes and work.
+	// Grow an OWNED buffer geometrically instead of preallocating 最大字节. Preallocating meant every DoH
+	// lookup allocated and zeroed 64 KiB to hold a ~100-byte answer on the latency-critical DNS path; an
+	// earlier attempt at this instead retained the chunk views, which is wrong — a default reader hands back
+	// whatever the source enqueued, so the source may reuse and overwrite that buffer before the next read.
+	// Copying on arrival keeps the bytes owned while still right-sizing the allocation. The caps below bound
+	// both total bytes and total work.
 	const 最大分片数 = 256;
-	const 分片 = [];
+	const 声明长度 = Number(response.headers?.get?.('content-length'));
+	let 容量 = Number.isInteger(声明长度) && 声明长度 > 0 && 声明长度 <= 最大字节 ? 声明长度 : Math.min(1024, 最大字节);
+	let output = new Uint8Array(容量);
 	let total = 0, 分片数 = 0;
 	try {
 		for (; ;) {
@@ -2287,21 +2292,21 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 			// 最大分片数 chunks was rejected on the final read that would have reported EOF.
 			if (!chunk.byteLength) continue;
 			if (++分片数 > 最大分片数) throw new Error(`${label}: too many response body chunks`);
-			if (total + chunk.byteLength > 最大字节) throw new Error(`${label}: response body too large`);
-			// Safe to retain: a default (non-BYOB) reader hands out a fresh array per chunk, so nothing
-			// reuses this backing buffer behind us.
-			分片.push(chunk); total += chunk.byteLength;
+			const 需要 = total + chunk.byteLength;
+			if (需要 > 最大字节) throw new Error(`${label}: response body too large`);
+			if (需要 > output.byteLength) {
+				const grown = new Uint8Array(Math.min(最大字节, Math.max(需要, output.byteLength * 2)));
+				grown.set(output.subarray(0, total));
+				output = grown;
+			}
+			// Copy NOW, so the bytes are ours before the next read can let the source reuse that buffer.
+			output.set(chunk, total); total = 需要;
 		}
 	} finally {
 		cancelReaderQuietly(reader, `${label} body read finished`);
 		try { reader.releaseLock() } catch (e) { }
 	}
-	if (!分片.length) return new Uint8Array(0);
-	if (分片.length === 1) return 分片[0]; // the overwhelmingly common case: one chunk, zero copies
-	const output = new Uint8Array(total);
-	let 偏移 = 0;
-	for (const c of 分片) { output.set(c, 偏移); 偏移 += c.byteLength; }
-	return output;
+	return total === output.byteLength ? output : output.slice(0, total);
 }
 
 async function 读取有限请求文本(request, 最大字节) {
@@ -3274,6 +3279,10 @@ function 跳过DNS名称(message, start) {
 			if (cursor + 1 >= message.byteLength) throw new Error('truncated DNS compression pointer');
 			const pointer = ((length & 0x3f) << 8) | message[cursor + 1];
 			if (pointer >= message.byteLength) throw new Error('invalid DNS compression pointer');
+			// RFC 1035: a pointer refers to a PRIOR occurrence. A forward pointer is malformed, and accepting
+			// it here while the question-copier and matcher reject it left the "structurally valid" gate
+			// disagreeing with everything downstream.
+			if (pointer >= cursor) throw new Error('DNS compression pointer is not backward');
 			if (encodedEnd < 0) encodedEnd = cursor + 2;
 			if (seen.has(pointer) || ++jumps > 32) throw new Error('DNS compression loop');
 			seen.add(pointer);
@@ -3432,7 +3441,7 @@ function 构建DNS服务失败响应(requestData) {
 	return out.length === 1 ? out[0] : 拼接字节数据(...out);
 }
 
-async function DNS经DoH转发(requestData, env, timeoutMs) {
+async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null) {
 	const frames = 解析并验证DNS查询帧(requestData);
 	const dohUrls = getDohLookupUrls(env);
 	let lastErr = null;
@@ -3457,7 +3466,7 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 			method: 'POST',
 			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
 			body: query,
-		}, timeoutMs);
+		}, 剩余DNS时间(总截止, timeoutMs));
 		if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
 		// Reject a declared-oversized body before buffering it (a DNS message can't exceed 64KB; a
 		// misbehaving/hostile DoH endpoint shouldn't get to spike isolate memory via arrayBuffer()).
@@ -3476,7 +3485,7 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 			try { resp.body?.cancel() } catch (e) { }
 			throw new Error(`unexpected DoH content-type: ${内容类型}`);
 		}
-		const msg = await 读取有限响应体(resp, 65535, timeoutMs, 'DoH');
+		const msg = await 读取有限响应体(resp, 65535, 剩余DNS时间(总截止, timeoutMs), 'DoH');
 		if (!msg.byteLength) throw new Error('empty DoH response');
 		验证DNS响应(query, msg);
 		if (msg.byteLength > 65535) throw new Error('DoH response too large'); // a DNS message can't exceed 64KB
@@ -3487,7 +3496,11 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 		const 待查询索引 = [];
 		for (let i = 0; i < frames.length; i++) if (!results[i]) 待查询索引.push(i);
 		if (!待查询索引.length) break;
+		// Stop starting new waves once the total budget is gone: a 16-query batch runs ceil(16/3)=6 sequential
+		// waves per URL, so without this the per-wave timeouts multiply instead of sharing one budget.
+		if (总截止 != null && Date.now() >= 总截止) break;
 		for (let offset = 0; offset < 待查询索引.length; offset += 3) {
+			if (总截止 != null && Date.now() >= 总截止) break;
 			const batch = 待查询索引.slice(offset, offset + 3);
 			const settled = await Promise.allSettled(batch.map(i => 查询单帧(dohUrl, frames[i])));
 			for (let k = 0; k < batch.length; k++) {
@@ -3502,7 +3515,7 @@ async function DNS经DoH转发(requestData, env, timeoutMs) {
 }
 
 // Fallback tunneled-DNS path: one DNS-over-TCP round trip (legacy behavior) if DoH is unreachable.
-async function DNS经TCP转发(requestData, request, timeoutMs) {
+async function DNS经TCP转发(requestData, request, timeoutMs, 总截止 = null) {
 	let tcpSocket = null, writer = null;
 	try {
 		const TCP连接 = 创建请求TCP连接器(request);
@@ -3511,12 +3524,12 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 		log(`[UDP forwarding] DNS-over-TCP fallback -> ${dnsEndpoint.hostname}:${dnsEndpoint.port}`);
 		const queryFrames = 解析并验证DNS查询帧(requestData);
 		tcpSocket = TCP连接(dnsEndpoint);
-		await socketOpenedWithTimeout(tcpSocket, timeoutMs, 'DNS TCP connect timed out');
+		await socketOpenedWithTimeout(tcpSocket, 剩余DNS时间(总截止, timeoutMs), 'DNS TCP connect timed out');
 		writer = tcpSocket.writable.getWriter();
-		await writeWithOperationTimeout(writer, requestData, timeoutMs, 'DNS TCP request write timed out');
+		await writeWithOperationTimeout(writer, requestData, 剩余DNS时间(总截止, timeoutMs), 'DNS TCP request write timed out');
 		try { writer.releaseLock() } catch (e) { }
 		writer = null;
-		const 原始应答 = await readMultipleDnsTcpFrames(tcpSocket, queryFrames.length, timeoutMs);
+		const 原始应答 = await readMultipleDnsTcpFrames(tcpSocket, queryFrames.length, 剩余DNS时间(总截止, timeoutMs));
 		// Match every reply to an outstanding query. A DNS-over-TCP server may pipeline replies OUT OF ORDER
 		// (RFC 7766), so "read N frames and forward them" can hand the client an answer for the wrong question,
 		// or accept an unsolicited/duplicate reply in place of a real one. DoH answers are correlated; this
@@ -3546,7 +3559,9 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 		return 有序应答.length === 1 ? 有序应答[0] : 拼接字节数据(...有序应答);
 	} finally {
 		try { writer?.releaseLock?.() } catch (e) { }
-		try { tcpSocket?.close?.() } catch (e) { }
+		// close() returns a Promise, so a bare try/catch does not catch its rejection — that surfaces as an
+		// unhandled rejection rather than being swallowed here.
+		closeRemoteSocketQuietly(tcpSocket);
 	}
 }
 
@@ -3555,6 +3570,7 @@ async function DNS经TCP转发(requestData, request, timeoutMs) {
 // ~1.3MiB). Reject the malformed frame and drop the buffer instead.
 const DNS_QUERY_MAX_BYTES = 4096;
 const DNS_REASSEMBLY_MAX_BYTES = 128 * 1024;
+const DNS_TOTAL_TIMEOUT_DEFAULT_MS = 4000;
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
 	// own chunk and silently dropped any trailing incomplete frame — a query split across two WS
@@ -3585,6 +3601,9 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	try {
 		const { env } = getWorkerRequestContext(request);
 		const timeoutMs = getDnsTcpResponseTimeoutMs(env);
+		// ONE budget for every stage below, including the fallback resolver. Without it the stage timeouts
+		// stack (~8.4s for a single query, far more for a batch) and the client times out first.
+		const 总截止 = Date.now() + getDnsTotalTimeoutMs(env);
 		log(`[UDP forwarding] Received DNS request: ${requestBytes}B`);
 		// DNS_TUNNEL_TCP_FIRST=1 prefers DNS-over-TCP (connect(), no subrequest cost) over DoH (fetch(), one
 		// subrequest per query). Useful on the Free plan: a long-lived WS connection shares a 50-subrequest
@@ -3593,17 +3612,17 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 		const 隧道DNS优先TCP = ['1', 'true'].includes(String(env?.DNS_TUNNEL_TCP_FIRST || '').toLowerCase());
 		if (隧道DNS优先TCP) {
 			try {
-				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs, 总截止);
 			} catch (tcpError) {
 				log(`[UDP forwarding] DNS-over-TCP failed (${tcpError?.message || tcpError}); falling back to DoH`);
-				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止);
 			}
 		} else {
 			try {
-				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs);
+				dnsResolver = 'doh'; rawResponse = await DNS经DoH转发(requestData, env, timeoutMs, 总截止);
 			} catch (dohError) {
 				log(`[UDP forwarding] DoH failed (${dohError?.message || dohError}); falling back to DNS-over-TCP`);
-				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs);
+				dnsResolver = 'tcp'; rawResponse = await DNS经TCP转发(requestData, request, timeoutMs, 总截止);
 			}
 		}
 	} catch (error) {
@@ -3690,8 +3709,12 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > bufferedLimit) {
 		const 截止 = Date.now() + maxWaitMs;
 		let 间隔 = 5;
-		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit && Date.now() < 截止) {
-			await new Promise(r => setTimeout(r, 间隔));
+		while (webSocket.readyState === WebSocket.OPEN && webSocket.bufferedAmount > bufferedLimit) {
+			// Clamp the sleep to the time actually left, or the backoff overshoots the configured bound
+			// (5+10+20+40 sleeps against a 100ms budget measured ~116ms).
+			const 剩余 = 截止 - Date.now();
+			if (剩余 <= 0) break;
+			await new Promise(r => setTimeout(r, Math.min(间隔, 剩余)));
 			间隔 = Math.min(40, 间隔 * 2); // back off instead of polling every 5ms for the whole window
 		}
 	}
@@ -3708,6 +3731,12 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 	const sendResult = webSocket.send(payload);
 	if (sendResult && typeof sendResult.then === 'function') await sendResult;
+	// Re-check the HARD ceiling only (never the soft limit — a post-send soft wait is what caused the
+	// double-pacing regression). Checking only before the send let one chunk carry the buffer from just
+	// under the ceiling to over it and return without noticing.
+	if (typeof webSocket.bufferedAmount === 'number' && webSocket.bufferedAmount > 下行硬上限字节(bufferedLimit)) {
+		throw new Error(`WebSocket downstream congestion: ${webSocket.bufferedAmount}B buffered`);
+	}
 }
 
 function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
@@ -3934,7 +3963,6 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 	const packetCapCandidate = Number(packetCapInput);
 	const packetCap = Number.isFinite(packetCapCandidate) && packetCapCandidate > 0 ? Math.round(packetCapCandidate) : 下行Grain包字节;
 	const tailBytes = packetCap === 下行Grain包字节 ? 下行Grain尾部阈值 : Math.max(512, Math.min(16384, Math.round(packetCap / 32)));
-	const lowWaterBytes = Math.max(4096, tailBytes << 3);
 	let header = headerData;
 	let pendingBuffer = new Uint8Array(packetCap);
 	let pendingBytes = 0;
@@ -3994,7 +4022,8 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 					return;
 				}
 				// Wait for more ONLY if more actually arrived during the last round. The old condition also
-				// waited whenever pendingBytes < lowWaterBytes, which meant a small response from an origin
+				// also waited whenever pendingBytes was below a low-water mark, which meant a small response
+				// from an origin
 				// that had already gone quiet sat here for up to 2 extra rounds waiting for bytes that were
 				// never coming — pure added latency on exactly the small interactive responses (HTML, JSON,
 				// API replies) where it hurts most. Bulk transfers fill packetCap and take the immediate
@@ -9243,9 +9272,32 @@ function getProxyHandshakeTimeoutMs(proxyAddress = {}) {
 }
 
 function getDnsTcpResponseTimeoutMs(env) {
-	const configured = Number(env?.DNS_TIMEOUT_MS || env?.CONNECT_TIMEOUT_MS);
+	// DNS_TIMEOUT_MS only. This used to fall back to CONNECT_TIMEOUT_MS, which silently coupled every DNS
+	// stage to the proxy dial timeout: raising CONNECT_TIMEOUT_MS to 5s turned each of the seven DNS stages
+	// into a 5s wait, so one failed lookup could stall a page for ~35s. The two settings govern unrelated
+	// things and are now independent.
+	const configured = Number(env?.DNS_TIMEOUT_MS);
 	if (!Number.isFinite(configured) || configured <= 0) return DNS_TCP_RESPONSE_TIMEOUT_MS;
 	return Math.max(PROXY_CONNECT_TIMEOUT_MIN_MS, Math.min(PROXY_CONNECT_TIMEOUT_MAX_MS, Math.round(configured)));
+}
+
+// ONE absolute budget for a whole tunneled-DNS lookup. Each stage (DoH headers, DoH body, fallback URL,
+// TCP connect, TCP write, TCP read) previously restarted its own timer, so a total-failure path stacked to
+// ~8.4s for a single query — longer than a typical client's own ~5s DNS timeout, which meant the SERVFAIL
+// fast-fail arrived after the client had already given up and the page just hung. Clamped to [1s, 10s].
+function getDnsTotalTimeoutMs(env) {
+	const configured = Number(env?.DNS_TOTAL_TIMEOUT_MS);
+	if (!Number.isFinite(configured) || configured <= 0) return DNS_TOTAL_TIMEOUT_DEFAULT_MS;
+	return Math.max(1000, Math.min(10000, Math.round(configured)));
+}
+
+// Remaining budget, or throw so the caller stops burning stages it can no longer afford. 截止 == null means
+// "no total budget" (callers that have not been given one), which preserves the per-stage timeout unchanged.
+function 剩余DNS时间(截止, 阶段超时) {
+	if (截止 == null) return 阶段超时;
+	const 剩余 = 截止 - Date.now();
+	if (剩余 <= 0) throw new Error('DNS total deadline exceeded');
+	return Math.min(阶段超时, 剩余);
 }
 
 // Downstream backpressure high-water mark, env-overridable for per-network benchmarking.
