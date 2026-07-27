@@ -2011,7 +2011,11 @@ async function 处理WS请求(request, yourUUID, url) {
 		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
 		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
 		remoteConnWrapper.客户端已关闭 = true;
-		remoteConnWrapper.closeHint = 'client_close';
+		// Do NOT overwrite a hint an earlier stage already set. Unconditionally stamping 'client_close' here
+		// relabelled remote_eof / first_byte_timeout / idle_timeout closes as client-initiated, which is why a
+		// debug capture showed 515 of 515 closes as 'client_close' across hundreds of unrelated destinations —
+		// telemetry that cannot distinguish who hung up is worse than useless when diagnosing a stall.
+		if (!remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'client_close';
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 		closeSocketQuietly(serverSock);
 		// Arm the force-close deadline HERE, in the event handler, so it runs even when the serialized chain is
@@ -3236,31 +3240,45 @@ function dns线缓存键(dohUrl, query) {
 // Subtract the time an answer has already spent in our cache from every record's TTL. Replaying the
 // ORIGINAL TTL made the client start its own full TTL over again: a 60s answer served from our cache at
 // t=30s was cached by the client until t=90s, so an address could outlive what its authority intended by
-// up to double. Walks answer + authority + additional records; on any parse trouble it leaves the message
-// untouched, which is never worse than the old behavior.
+// up to double.
+//
+// TWO PASSES on purpose. Pass 1 only walks and collects the TTL offsets; pass 2 writes. A single
+// mutate-as-you-walk pass left earlier records already aged when a later record failed to parse, which
+// contradicted the promise that a parse failure changes nothing.
+//
+// EDNS OPT (TYPE 41) is SKIPPED. RFC 6891 reuses the TTL slot of an OPT pseudo-record for extended RCODE,
+// EDNS version and flags — including DNSSEC's DO bit — so decrementing it as if it were a TTL turns a
+// valid 0x00008000 into 0x00007fff and corrupts the record.
+const DNS_TYPE_OPT = 41;
 function 老化DNS_TTL(out, 已存在毫秒) {
 	const 已过秒 = Math.floor(已存在毫秒 / 1000);
 	if (已过秒 <= 0) return;
 	const 记录数 = ((out[6] << 8) | out[7]) + ((out[8] << 8) | out[9]) + ((out[10] << 8) | out[11]);
 	if (记录数 <= 0) return;
+	const 待老化 = [];
 	let p = 12;
 	const qd = (out[4] << 8) | out[5];
 	for (let i = 0; i < qd; i++) {
 		p = 跳过DNS名称(out, p);
 		p += 4; // QTYPE + QCLASS
+		if (p > out.byteLength) return;
 	}
 	for (let i = 0; i < 记录数; i++) {
 		p = 跳过DNS名称(out, p);
 		if (p + 10 > out.byteLength) return;
+		const 类型 = (out[p] << 8) | out[p + 1];
 		p += 4; // TYPE + CLASS
-		const ttl = ((out[p] << 24) | (out[p + 1] << 16) | (out[p + 2] << 8) | out[p + 3]) >>> 0;
-		const 剩余 = Math.max(0, ttl - 已过秒);
-		out[p] = (剩余 >>> 24) & 0xff; out[p + 1] = (剩余 >>> 16) & 0xff;
-		out[p + 2] = (剩余 >>> 8) & 0xff; out[p + 3] = 剩余 & 0xff;
-		p += 4;
+		if (类型 !== DNS_TYPE_OPT) 待老化.push(p);
+		p += 4; // TTL
 		const rdlen = (out[p] << 8) | out[p + 1];
 		p += 2 + rdlen;
 		if (p > out.byteLength) return;
+	}
+	for (const off of 待老化) {
+		const ttl = ((out[off] << 24) | (out[off + 1] << 16) | (out[off + 2] << 8) | out[off + 3]) >>> 0;
+		const 剩余 = Math.max(0, ttl - 已过秒);
+		out[off] = (剩余 >>> 24) & 0xff; out[off + 1] = (剩余 >>> 16) & 0xff;
+		out[off + 2] = (剩余 >>> 8) & 0xff; out[off + 3] = 剩余 & 0xff;
 	}
 }
 
@@ -3276,48 +3294,43 @@ function 读取DNS线缓存(key, query) {
 	try { 老化DNS_TTL(out, now - (cached.cachedAt || now)); } catch (e) { /* leave TTLs as stored */ }
 	return out;
 }
-// Minimum TTL across a DNS response's answer records, so a positive answer can be cached for its real
-// lifetime (clamped to [MIN, MAX]) instead of a flat 30s — far fewer repeat DoH lookups on stable domains
-// during a session (less latency + fewer free-plan subrequests). Fail-safe: any short/compressed-mid-name/
-// malformed record just returns MIN, i.e. the previous fixed-30s behavior — a parse issue can never cache
-// longer than the cap or serve wrong data.
+// Minimum TTL across a DNS response's answer records, so a positive answer is cached for its real
+// lifetime rather than a flat 30s — far fewer repeat DoH lookups on stable domains during a session.
+//
+// Returns null when the TTL cannot be determined, and the caller then DOES NOT CACHE. This used to fall
+// back to DNS_RESULT_CACHE_MIN_TTL_MS (30s), which quietly turned "I could not read this" into "hold it
+// for 30 seconds" — the opposite of fail-safe.
+//
+// Name walking is delegated to 跳过DNS名称 rather than a second hand-rolled parser. The old local walker
+// rejected any name that mixed labels with a compression pointer (e.g. "www" + pointer to "example.com"),
+// which is perfectly legal, so a valid 5s answer silently took the 30s fallback.
 function 解析DNS应答最小TTL毫秒(msg) {
 	const q = 数据转Uint8Array(msg);
-	if (q.byteLength < 12) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	if (q.byteLength < 12) return null;
 	const qd = (q[4] << 8) | q[5];
 	const an = (q[6] << 8) | q[7];
-	if (qd !== 1 || an < 1) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	if (qd !== 1 || an < 1) return null;
 	let p = 12;
-	// question name: labels ended by a 0 byte; bail on any compression pointer (rare in a question)
-	while (p < q.byteLength && q[p] !== 0) {
-		if ((q[p] & 0xc0) !== 0) return DNS_RESULT_CACHE_MIN_TTL_MS;
-		p += 1 + q[p];
-	}
-	p += 1 + 4; // terminating 0 label + QTYPE + QCLASS
 	let 最小TTL秒 = Infinity;
-	for (let i = 0; i < an; i++) {
-		if (p + 1 > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
-		// answer NAME: a compression pointer (2 bytes) or raw labels ending in 0
-		if ((q[p] & 0xc0) === 0xc0) {
+	try {
+		p = 跳过DNS名称(q, p);
+		p += 4; // QTYPE + QCLASS
+		for (let i = 0; i < an; i++) {
+			p = 跳过DNS名称(q, p);
+			if (p + 10 > q.byteLength) return null; // TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
+			const 类型 = (q[p] << 8) | q[p + 1];
+			p += 4; // skip TYPE + CLASS
+			const ttl = ((q[p] << 24) | (q[p + 1] << 16) | (q[p + 2] << 8) | q[p + 3]) >>> 0;
+			p += 4;
+			const rdlen = (q[p] << 8) | q[p + 1];
 			p += 2;
-		} else {
-			while (p < q.byteLength && q[p] !== 0) {
-				if ((q[p] & 0xc0) !== 0) return DNS_RESULT_CACHE_MIN_TTL_MS;
-				p += 1 + q[p];
-			}
-			p += 1;
+			if (p + rdlen > q.byteLength) return null;
+			p += rdlen;
+			// OPT carries flags, not a TTL (RFC 6891) — it must never influence the cache lifetime.
+			if (类型 !== DNS_TYPE_OPT) 最小TTL秒 = Math.min(最小TTL秒, ttl); // TTL 0 counts: RRSet TTL is the record minimum
 		}
-		if (p + 10 > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS; // TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
-		p += 4; // skip TYPE + CLASS
-		const ttl = ((q[p] << 24) | (q[p + 1] << 16) | (q[p + 2] << 8) | q[p + 3]) >>> 0;
-		p += 4;
-		const rdlen = (q[p] << 8) | q[p + 1];
-		p += 2;
-		if (p + rdlen > q.byteLength) return DNS_RESULT_CACHE_MIN_TTL_MS;
-		p += rdlen;
-		最小TTL秒 = Math.min(最小TTL秒, ttl); // include TTL 0 in the minimum (RRSet TTL is the record minimum)
-	}
-	if (!Number.isFinite(最小TTL秒)) return DNS_RESULT_CACHE_MIN_TTL_MS;
+	} catch (e) { return null; }
+	if (!Number.isFinite(最小TTL秒)) return null;
 	if (最小TTL秒 <= 0) return 0; // RFC 1035: a TTL-0 answer is for the current transaction only — must not be cached
 	// Never hold an answer LONGER than its authority allowed. This used to floor the lifetime at
 	// DNS_RESULT_CACHE_MIN_TTL_MS (30s), so a 5s answer was served for 30s — long enough to keep handing out
@@ -3331,7 +3344,8 @@ function 写入DNS线缓存(key, msg) {
 	// / NODATA blip can't be served stale for the TTL. Header: byte3 low nibble = rcode, bytes 6-7 = ANCOUNT.
 	if (msg.byteLength < 12 || (msg[3] & 0x0f) !== 0 || ((msg[6] << 8) | msg[7]) === 0) return;
 	const ttlMs = 解析DNS应答最小TTL毫秒(msg);
-	if (ttlMs <= 0) return; // TTL-0 answer (e.g. per-query CDN rotation) — must not be cached
+	// null = TTL unreadable -> don't cache at all; 0 = TTL-0 answer (per-query CDN rotation) -> must not cache.
+	if (ttlMs == null || ttlMs <= 0) return;
 	const stored = new Uint8Array(msg);
 	stored[0] = 0; stored[1] = 0;
 	const now = Date.now();
@@ -7436,8 +7450,11 @@ function writeDohCache(cacheKey, answers, now = Date.now()) {
 		.filter(ttl => Number.isFinite(ttl) && ttl >= 0) // include TTL 0 so an all-0 answer isn't floored to 30s
 		.map(ttl => ttl * 1000);
 	if (ttlValues.length && Math.min(...ttlValues) <= 0) return; // RFC 1035: a TTL-0 answer must not be cached
+	// Same rule as the wire cache: never hold an answer longer than its authority allowed. Flooring this at
+	// 30s kept a 5s ProxyIP-resolution answer for 30s, so a rotated-away relay address stayed in play. The
+	// floor still applies only when the response carried no readable TTL at all.
 	const dnsTtlMs = ttlValues.length ? Math.min(...ttlValues) : DNS_RESULT_CACHE_MIN_TTL_MS;
-	const ttlMs = Math.max(DNS_RESULT_CACHE_MIN_TTL_MS, Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs));
+	const ttlMs = Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs);
 	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
 		expiresAt: now + ttlMs,
 		answers: (answers || []).map(cloneDohAnswer),

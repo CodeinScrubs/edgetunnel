@@ -2058,14 +2058,25 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 1, 0x2c])), 300000, 'a 300s record TTL caches for 300s');
 	// CHANGED (was: a below-floor TTL clamps UP to the 30s minimum). Holding a 10s answer for 30s meant
 	// handing out an address up to 20s after its authority retired it — for a rotating CDN that surfaces as
-	// a connection to a dead endpoint. A parsed TTL is now honoured exactly; the 30s constant survives only
-	// as the fail-safe for messages we could not parse (asserted below).
+	// a connection to a dead endpoint. A parsed TTL is now honoured exactly.
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 10])), 10000, 'a short TTL is honoured, never extended past what the authority allowed');
 	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 1, 0x38, 0x80])), 300000, 'an above-cap TTL (80000s) clamps down to the 5min maximum');
-	assert.equal(dnsAnswerMinTtlMs(new Uint8Array([0, 0, 0x81, 0x80, 0, 1])), 30000, 'a truncated/malformed message fails safe to the 30s floor');
-	// RFC 1035: a TTL-0 answer (a well-formed response, distinct from malformed) must NOT be cached -> 0,
-	// which 写入DNS线缓存 treats as "skip caching" (vs the 30s fail-safe for malformed input above).
-	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 0])), 0, 'a TTL-0 answer returns 0 (do not cache), not the 30s floor');
+	// CHANGED (was: falls back to the 30s floor). "I could not read the TTL" now means DO NOT CACHE rather
+	// than "hold it for 30 seconds", which was the opposite of fail-safe.
+	assert.equal(dnsAnswerMinTtlMs(new Uint8Array([0, 0, 0x81, 0x80, 0, 1])), null, 'an unreadable TTL returns null so the caller skips caching');
+	// RFC 1035: a TTL-0 answer (well-formed, distinct from unreadable) must NOT be cached -> 0.
+	assert.equal(dnsAnswerMinTtlMs(mkResp([0, 0, 0, 0])), 0, 'a TTL-0 answer returns 0 (do not cache)');
+	// A legal owner name that mixes labels with a compression pointer ("www" + ptr) used to trip the old
+	// hand-rolled walker and silently take the 30s fallback; the shared walker parses it.
+	{
+		const mixed = new Uint8Array([
+			0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,
+			3, 0x66, 0x6f, 0x6f, 3, 0x63, 0x6f, 0x6d, 0, 0, 1, 0, 1,   // question foo.com A IN
+			3, 0x77, 0x77, 0x77, 0xc0, 0x0c,                            // answer name: "www" + ptr -> foo.com
+			0, 1, 0, 1, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4,                   // A IN TTL=5 rdlen=4
+		]);
+		assert.equal(dnsAnswerMinTtlMs(mixed), 5000, 'a label+pointer owner name parses to its real 5s TTL');
+	}
 }
 
 {
