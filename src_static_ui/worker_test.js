@@ -9968,6 +9968,14 @@ function 构建生效设置视图(env) {
 		DNS_TIMEOUT_MS: { effective: getDnsTcpResponseTimeoutMs(e), env: raw('DNS_TIMEOUT_MS') },
 		DNS_TOTAL_TIMEOUT_MS: { effective: getDnsTotalTimeoutMs(e), env: raw('DNS_TOTAL_TIMEOUT_MS') },
 		DOH_SUBREQUEST_BUDGET: { effective: getDohSubrequestBudget(e) || '(unlimited)', env: raw('DOH_SUBREQUEST_BUDGET') },
+		// Settings added during the teardown investigation. They were reachable from the environment but
+		// invisible here, so the panel could not show what the worker was actually running with — which is
+		// exactly what you need when correlating a capture against a deployment.
+		INITIAL_WRITE_TIMEOUT_MS: { effective: getInitialWriteTimeoutMs(e) || '(disabled)', env: raw('INITIAL_WRITE_TIMEOUT_MS') },
+		WS_REMOTE_SETTLE_OBSERVE_MS: { effective: getWsRemoteSettleObserveMs(e) || '(off)', env: raw('WS_REMOTE_SETTLE_OBSERVE_MS') },
+		WS_HALF_OPEN_TEARDOWN: { effective: isEnabledEnvFlag(e?.WS_HALF_OPEN_TEARDOWN) ? 'on (manual close)' : 'off (runtime auto-close)', env: raw('WS_HALF_OPEN_TEARDOWN') },
+		OFF_LOG: { effective: isEnabledEnvFlag(e?.OFF_LOG) ? 'on (logging suppressed)' : 'off', env: raw('OFF_LOG') },
+		DEBUG_STAT_INTERVAL_MS: { effective: Math.max(5000, Math.min(300000, Number(e?.DEBUG_STAT_INTERVAL_MS) || 15000)), env: raw('DEBUG_STAT_INTERVAL_MS') },
 		DOWNLINK_GRAIN_PACKET_BYTES: { effective: getDownlinkGrainBytes(e), env: raw('DOWNLINK_GRAIN_PACKET_BYTES') },
 		DOWNLINK_BACKPRESSURE_HWM_BYTES: { effective: getDownlinkBackpressureHwm(e), env: raw('DOWNLINK_BACKPRESSURE_HWM_BYTES') },
 		WS_BUFFERED_AMOUNT_LIMIT_BYTES: { effective: getWsBufferedAmountLimitBytes(e), env: raw('WS_BUFFERED_AMOUNT_LIMIT_BYTES') },
