@@ -1737,9 +1737,9 @@ async function 处理WS请求(request, yourUUID, url) {
 	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
-	// Short bound on OBSERVING the remote socket/pipe settle after close. Not a new teardown stage — it only
-	// keeps that work inside the tracked promise long enough to see whether it finishes.
-	const 远端结算上限毫秒 = 1000;
+	// Diagnostic-only bound on OBSERVING remote handles settle after close. 0 disables it entirely, and it
+	// is additionally gated on a tracer existing, so production (DEBUG=0) never waits here at all.
+	const 观察结算上限毫秒 = getWsRemoteSettleObserveMs(getWorkerRequestContext(request)?.env);
 	let WS拆卸截止 = 0;
 	// Set once the coordinated finalizer has closed the remote side and requested the client Close reply.
 	// This is the ONLY reliable "graceful teardown finished" signal — see the watchdog for why.
@@ -2184,24 +2184,34 @@ async function 处理WS请求(request, yourUUID, url) {
 			// downlink pipe, none of which anything ever awaited.
 			const 远端Socket = remoteConnWrapper.socket;
 			const 下行管道 = remoteConnWrapper.pipePromise;
+			// The winning candidate lives in 待处理Socket while its FIRST packet is still being written —
+			// during that window .socket is null and pipePromise does not exist yet, so capturing only those
+			// two would report "skipped" for exactly the unbounded initial write this is hunting. Same for a
+			// client that leaves while the dial/handshake is still running (connectingPromise).
+			const 待处理Socket = remoteConnWrapper.待处理Socket;
+			const 建立中 = remoteConnWrapper.connectingPromise;
 			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
 			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
-			// Bounded observation of the remote side. This is deliberately SHORT: the point is to let normal
-			// cleanup finish inside the tracked promise, and to record which handle failed to settle when it
-			// does not — not to add another multi-second teardown stage.
-			let 远端结算 = 'skipped';
-			if (关闭远端 && (远端Socket || 下行管道)) {
-				const 待结算 = [];
-				try { if (远端Socket?.closed) 待结算.push(远端Socket.closed); } catch (e) { }
-				if (下行管道) 待结算.push(下行管道);
-				if (待结算.length) {
-					远端结算 = await Promise.race([
-						Promise.allSettled(待结算).then(() => 'settled'),
-						new Promise(r => setTimeout(() => r('timeout'), 远端结算上限毫秒)),
-					]).catch(() => 'error');
+			// DIAGNOSTIC ONLY — runs only when a tracer exists, i.e. under DEBUG. An earlier revision ran this
+			// on every teardown regardless, which (a) put a purely diagnostic wait in the production data path
+			// and (b) raced a raw setTimeout whose LOSING timer was never cleared. Leaving a 1s event
+			// scheduled on every teardown is self-defeating when the failure under investigation is the
+			// runtime deciding no events remain — the instrument would have altered the measurement.
+			// Each handle is observed SEPARATELY: one aggregate allSettled() reported a rejected handle as
+			// "settled" and could never distinguish which one was stuck.
+			let 远端结算 = null;
+			if (remoteConnWrapper.追踪 && 观察结算上限毫秒 > 0) {
+				远端结算 = {};
+				for (const [名称, 句柄] of [
+					['remote_closed', (() => { try { return 远端Socket?.closed } catch (e) { return null } })()],
+					['pending_closed', (() => { try { return 待处理Socket?.closed } catch (e) { return null } })()],
+					['connecting', 建立中],
+					['pipe', 下行管道],
+				]) {
+					远端结算[名称] = await 观察句柄结算(句柄, 观察结算上限毫秒);
 				}
 			}
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
@@ -2224,9 +2234,10 @@ async function 处理WS请求(request, yourUUID, url) {
 				close_requested: 已回送关闭,
 				ws_auto_reply: !WS半开拆卸,
 				ws_state_now: (() => { try { return serverSock.readyState } catch (e) { return null } })(),
-				remote_settled: 远端结算,
+				...(远端结算 ? { remote_settled: 远端结算 } : {}),
 				...(拆卸错误 ? { err: 拆卸错误 } : {}),
-				closed_remote: Boolean(关闭远端),
+				// Renamed: this only ever meant "we asked". remote_settled below reports what was observed.
+				remote_close_requested: Boolean(关闭远端),
 				...队列瞬时状态(上行写入队列),
 			});
 		});
@@ -4129,6 +4140,38 @@ function 是可回送WS关闭码(code) {
 function 已完成WS关闭(socket) {
 	if (!socket) return true;
 	try { return socket.readyState === WebSocket.CLOSED; } catch (error) { return false; }
+}
+
+// DOH_SUBREQUEST_BUDGET env override. 0 disables the cap entirely — correct on a Paid plan, where the
+// allowance is 10,000 rather than 50 and capping tunneled DoH at 40 would downgrade it to plaintext TCP
+// for no reason. The plan cannot be detected at runtime, so this is deployment configuration.
+// WS_REMOTE_SETTLE_OBSERVE_MS: how long teardown may WATCH remote handles settle, for diagnosis only.
+// Default 1000 under DEBUG (where a tracer exists) and 0 otherwise, so it can never add teardown latency
+// to a production connection. Clamped to [0, 5000].
+function getWsRemoteSettleObserveMs(env = {}) {
+	const raw = String(env?.WS_REMOTE_SETTLE_OBSERVE_MS ?? '').trim();
+	if (raw) {
+		const v = Number(raw);
+		if (Number.isFinite(v) && v >= 0) return Math.min(5000, Math.round(v));
+	}
+	return 调试日志打印 ? 1000 : 0;
+}
+
+// Observe ONE lifecycle handle and report what actually happened to it. Uses withOperationTimeout, which
+// clears its timer in a finally — a raw Promise.race against a bare setTimeout leaves the losing timer
+// scheduled, which is unacceptable here because the failure being investigated is the runtime concluding
+// that no events remain. Distinguishes fulfilled from rejected: collapsing both into "settled" hides a
+// handle that blew up, and elapsed_ms shows whether something merely took a while.
+async function 观察句柄结算(句柄, 上限毫秒) {
+	if (!句柄 || typeof 句柄.then !== 'function') return { state: 'absent' };
+	const 开始 = Date.now();
+	try {
+		await withOperationTimeout(句柄, 上限毫秒, 'settlement timed out');
+		return { state: 'fulfilled', ms: Date.now() - 开始 };
+	} catch (error) {
+		const 消息 = error?.message || String(error);
+		return { state: /settlement timed out/.test(消息) ? 'timeout' : 'rejected', ms: Date.now() - 开始, err: 追踪错误名(error) };
+	}
 }
 
 function closeSocketQuietly(socket, code) {
