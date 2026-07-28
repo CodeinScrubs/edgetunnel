@@ -295,7 +295,13 @@ export default {
 		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
-			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+			// Version is now a build stamp ("<time> (<sha>[-dirty])"), not a bare date. Stripping every
+			// non-digit merged the timestamp with the digits inside the hex SHA and produced a 19-digit value
+			// past Number.MAX_SAFE_INTEGER, which silently lost precision and did not even round-trip. Take
+			// only the LEADING timestamp digits (14 -> ~2e13, safely inside the integer range) for the numeric
+			// field callers may compare, and return the full stamp separately so a log can be tied to a build.
+			const 版本数字 = Number((String(Version).match(/\d/g) || []).slice(0, 14).join('')) || 0;
+			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
@@ -928,7 +934,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
-				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1371,7 +1377,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				关闭连接,
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
-				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1603,6 +1609,9 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false, WS拆卸已强制 = false;
 	let WS传输错误文本 = null; // preserved cause for teardown_done, which otherwise reports result=error with no reason
+	// Env-overridable so a Free deployment can lower per-connection retention without a code change.
+	const WS显式队列上限字节 = getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env);
+	const WS显式队列上限条目 = getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env);
 	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
@@ -1651,7 +1660,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
-		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+		最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
 	if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -2015,7 +2024,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		const chunkSize = Math.max(0, 有效数据长度(data));
 		const nextBytes = WS显式队列字节 + chunkSize;
 		const nextItems = WS显式队列条目 + 1;
-		if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		if (nextBytes > WS显式队列上限字节 || nextItems > WS显式队列上限条目) {
 			处理WS显式传输错误(new Error(`[WS explicit transport] Queue overflow: ${nextBytes}B/${nextItems}`));
 			return;
 		}
@@ -3946,6 +3955,23 @@ function getWsRemoteSettleObserveMs(env = {}) {
 // INITIAL_WRITE_TIMEOUT_MS: deadline for the FIRST packet write only — deliberately separate from
 // UPLINK_WRITE_TIMEOUT_MS (which stays off, because a steady-state upload may legitimately block for a
 // long time under backpressure). Default 15000, clamped to [1000, 60000]; 0 disables it.
+// UPLINK_QUEUE_MAX_BYTES / UPLINK_QUEUE_MAX_ITEMS. These bound TWO independent counters that share the
+// same limit: the WS explicit message chain and the uplink writer queue. A single connection can
+// therefore retain up to 2x this value, against an isolate that shares 128 MB across all concurrent
+// requests. Captures have never shown more than 8 KiB in use, so the headroom is enormous — but the
+// defaults are left alone here and only made configurable, because lowering them is a memory-safety
+// trade that needs a large-upload test rather than a guess.
+function getUplinkQueueMaxBytes(env = {}) {
+	const v = Number(String(env?.UPLINK_QUEUE_MAX_BYTES ?? '').trim());
+	if (!Number.isFinite(v) || v <= 0) return 上行队列最大字节;
+	return Math.max(64 * 1024, Math.min(64 * 1024 * 1024, Math.round(v)));
+}
+function getUplinkQueueMaxItems(env = {}) {
+	const v = Number(String(env?.UPLINK_QUEUE_MAX_ITEMS ?? '').trim());
+	if (!Number.isFinite(v) || v <= 0) return 上行队列最大条目;
+	return Math.max(16, Math.min(65536, Math.round(v)));
+}
+
 function getInitialWriteTimeoutMs(env = {}) {
 	const raw = String(env?.INITIAL_WRITE_TIMEOUT_MS ?? '').trim();
 	if (!raw) return 15000;
@@ -4190,7 +4216,8 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+// 最大字节/最大条目 default to the module constants, so an omitted option is exactly the old behaviour.
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -4368,7 +4395,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 		const nextBytes = queuedBytes + chunk.byteLength;
 		const nextItems = chunks.length - head + 1;
 		const retainedBytes = nextBytes + inFlightBytes;
-		if (retainedBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		if (retainedBytes > 最大字节 || nextItems > 最大条目) {
 			closed = true;
 			if (统计) 统计.overflowCount++;
 			const err = Object.assign(new Error(`${名称}: upload queue overflow (${retainedBytes}B/${nextItems})`), { isQueueOverflow: true });

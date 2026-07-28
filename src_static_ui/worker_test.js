@@ -104,7 +104,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-07-28 19:52:25 (1d9b592-dirty, panel)';
+const Version = '2026-07-28 20:02:22 (55d0b5c-dirty, panel)';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1735,6 +1735,9 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false, WS拆卸已强制 = false;
 	let WS传输错误文本 = null; // preserved cause for teardown_done, which otherwise reports result=error with no reason
+	// Env-overridable so a Free deployment can lower per-connection retention without a code change.
+	const WS显式队列上限字节 = getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env);
+	const WS显式队列上限条目 = getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env);
 	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
@@ -1783,7 +1786,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
-		写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+		最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
 	if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -2147,7 +2150,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		const chunkSize = Math.max(0, 有效数据长度(data));
 		const nextBytes = WS显式队列字节 + chunkSize;
 		const nextItems = WS显式队列条目 + 1;
-		if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		if (nextBytes > WS显式队列上限字节 || nextItems > WS显式队列上限条目) {
 			处理WS显式传输错误(new Error(`[WS explicit transport] Queue overflow: ${nextBytes}B/${nextItems}`));
 			return;
 		}
@@ -3023,6 +3026,27 @@ function getInitialWriteTimeoutMs(env = {}) {
 	if (!Number.isFinite(v) || v < 0) return 15000;
 	if (v === 0) return 0;
 	return Math.max(1000, Math.min(60000, Math.round(v)));
+}
+
+// INITIAL_WRITE_TIMEOUT_MS: deadline for the FIRST packet write only — deliberately separate from
+// UPLINK_WRITE_TIMEOUT_MS (which stays off, because a steady-state upload may legitimately block for a
+// long time under backpressure). Default 15000, clamped to [1000, 60000]; 0 disables it.
+// UPLINK_QUEUE_MAX_BYTES / UPLINK_QUEUE_MAX_ITEMS. These bound TWO independent counters that share the
+// same limit: the WS explicit message chain and the uplink writer queue. A single connection can
+// therefore retain up to 2x this value, against an isolate that shares 128 MB across all concurrent
+// requests. Captures have never shown more than 8 KiB in use, so the headroom is enormous — but the
+// defaults are left alone here and only made configurable, because lowering them is a memory-safety
+// trade that needs a large-upload test rather than a guess.
+function getUplinkQueueMaxBytes(env = {}) {
+	const v = Number(String(env?.UPLINK_QUEUE_MAX_BYTES ?? '').trim());
+	if (!Number.isFinite(v) || v <= 0) return 上行队列最大字节;
+	return Math.max(64 * 1024, Math.min(64 * 1024 * 1024, Math.round(v)));
+}
+
+function getUplinkQueueMaxItems(env = {}) {
+	const v = Number(String(env?.UPLINK_QUEUE_MAX_ITEMS ?? '').trim());
+	if (!Number.isFinite(v) || v <= 0) return 上行队列最大条目;
+	return Math.max(16, Math.min(65536, Math.round(v)));
 }
 
 function closeRemoteSocketQuietly(socket) {
