@@ -908,17 +908,31 @@ async function 处理XHTTP请求(request, yourUUID) {
 	// parsed) and may report real statuses.
 	if (!request.body) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	const reader = request.body.getReader();
-	const 首包 = await 读取XHTTP首包(reader, yourUUID);
-	if (!首包) {
+	// Every pre-auth rejection must CANCEL the body, not just drop the lock. Releasing the lock leaves the
+	// request body unread and still attached to the invocation, so a rejected peer could keep sending into a
+	// stream nobody is draining. Also catches the new pre-auth deadline so it becomes the camouflage page
+	// rather than escaping as an unhandled error.
+	const 放弃XHTTP请求 = (原因) => {
+		cancelReaderQuietly(reader, 原因);
 		try { reader.releaseLock() } catch (e) { }
+	};
+	let 首包 = null;
+	try {
+		首包 = await 读取XHTTP首包(reader, yourUUID);
+	} catch (error) {
+		放弃XHTTP请求('XHTTP pre-auth failed');
+		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+	}
+	if (!首包) {
+		放弃XHTTP请求('XHTTP first packet invalid');
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	}
 	if (isSpeedTestSite(首包.hostname)) {
-		try { reader.releaseLock() } catch (e) { }
+		放弃XHTTP请求('speed-test destination blocked');
 		return new Response('Forbidden', { status: 403 });
 	}
 	if (首包.isUDP && 首包.协议 !== 'trojan' && 首包.port !== 53) {
-		try { reader.releaseLock() } catch (e) { }
+		放弃XHTTP请求('unsupported UDP destination');
 		return new Response('UDP is not supported', { status: 400 });
 	}
 
@@ -2106,6 +2120,9 @@ async function 处理WS请求(request, yourUUID, url) {
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
+			// The graceful path finished. If a capture shows teardown_start with no teardown_done and no
+			// teardown_force, the stall is inside this chain rather than after it.
+			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', { closed_remote: Boolean(关闭远端), ...队列瞬时状态(上行写入队列) });
 		});
 	};
 
@@ -2125,16 +2142,32 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		入队WS显式传输(event.data);
 	});
-	serverSock.addEventListener('close', () => {
+	serverSock.addEventListener('close', (event) => {
 		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
 		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
 		remoteConnWrapper.客户端已关闭 = true;
+		// Record the WS-level close facts and the LIVE queue/socket state. Every hung invocation in a capture
+		// ended right here with reason=client_close and nothing after it, and the existing close event only
+		// carries historical maxima (q_max_*), so it cannot show whether a write was still outstanding at this
+		// instant. Without these fields a post-close stall is indistinguishable from a clean exit.
+		remoteConnWrapper.关闭现场 = {
+			ws_code: event?.code ?? null,
+			ws_clean: event?.wasClean ?? null,
+			ws_state: serverSock.readyState,
+			has_remote: Boolean(remoteConnWrapper.socket),
+			has_pending: Boolean(remoteConnWrapper.待处理Socket),
+		};
 		// Do NOT overwrite a hint an earlier stage already set. Unconditionally stamping 'client_close' here
 		// relabelled remote_eof / first_byte_timeout / idle_timeout closes as client-initiated, which is why a
 		// debug capture showed 515 of 515 closes as 'client_close' across hundreds of unrelated destinations —
 		// telemetry that cannot distinguish who hung up is worse than useless when diagnosing a stall.
 		if (!remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'client_close';
+		const 拆卸追踪 = remoteConnWrapper.追踪;
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
+		// 追踪关闭 marks the tracer closed, so ordinary trace calls stop emitting from here on. Teardown runs
+		// AFTER that point, which is precisely the window a hang lives in — 追踪拆卸 deliberately bypasses the
+		// closed flag so the next capture can show whether teardown started, finished, or had to be forced.
+		追踪拆卸(拆卸追踪, 'teardown_start', 队列瞬时状态(上行写入队列));
 		closeSocketQuietly(serverSock);
 		// Arm the force-close deadline HERE, in the event handler, so it runs even when the serialized chain is
 		// parked in a write that never settles. Clearing the queue rejects the parked waiter and closing the
@@ -2144,6 +2177,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			WS强制关闭定时器 = setTimeout(() => {
 				WS强制关闭定时器 = null;
 				log('[WS forwarding] teardown deadline reached; forcing close');
+				追踪拆卸(拆卸追踪, 'teardown_force', 队列瞬时状态(上行写入队列));
 				try { 上行写入队列.清空() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
 			}, 5000);
@@ -3136,6 +3170,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	}
 
 	async function connecttoPry(允许发送首包 = true) {
+		// The client can leave at any point before or during fallback — including in the window between the
+		// caller's own check and this call. ProxyIP resolution costs a DoH subrequest and each candidate costs
+		// one of the six simultaneously-establishing outbound connections, so none of it is worth spending on
+		// a peer that has already gone.
+		if (remoteConnWrapper.客户端已关闭) return;
 		if (remoteConnWrapper.connectingPromise) {
 			await remoteConnWrapper.connectingPromise;
 			return;
@@ -6485,6 +6524,22 @@ function 分类关闭原因(wrapper, err) {
 	if (err) return { reason: 'error', expected: false };
 	return { reason: 'eof', expected: true };
 }
+// Teardown events must survive 追踪关闭. Everything else stops emitting once the tracer is closed, but the
+// close event is exactly where a hung invocation stops — so without a post-close channel there is no way to
+// tell "teardown completed" from "teardown never finished".
+function 追踪拆卸(s, phase, fields) {
+	if (!s) return;
+	追踪发射(s, phase, { since_close_ms: s.closedAt ? Date.now() - s.closedAt : null, ...(fields || {}) });
+}
+// LIVE queue state (vs the historical maxima the close event carries), so a capture can show whether bytes
+// were still outstanding at teardown time.
+function 队列瞬时状态(队列) {
+	try {
+		const q = 队列?.获取统计?.() || null;
+		if (!q) return {};
+		return { q_now_bytes: q.queuedBytes ?? null, q_now_inflight: q.inFlightBytes ?? null, q_writes: q.maxItems ?? null };
+	} catch (e) { return {}; }
+}
 function 追踪发射(s, ev, fields) {
 	// One structured object per line = machine-parseable. Gated on 调试日志打印 (a tracer only exists under
 	// DEBUG anyway; this belt-and-suspenders keeps it silent if DEBUG is off or in unit tests).
@@ -6608,6 +6663,7 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 	// capture) is actually diagnosable — otherwise, with legacy text off, the cause is lost.
 	const errText = (!expected && err) ? 追踪错误名(err) : null;
 	s.closed = true;
+	s.closedAt = Date.now(); // baseline for the post-close teardown events, which outlive this tracer
 	if (s.hb) { try { clearInterval(s.hb) } catch (e) { } s.hb = null; }
 	更新追踪速率峰值(s); // fold in the final partial interval so a sub-heartbeat connection reports a real peak
 	const dur = Math.round(Date.now() - s.t0);
@@ -6624,6 +6680,13 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 		dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
 		...(errText ? { err: errText } : {}),
 		...(q ? { q_max_bytes: q.maxQueuedBytes, q_max_inflight: q.maxInFlightBytes, q_max_items: q.maxItems, q_max_write_ms: q.maxWriteMs, q_overflow: q.overflowCount } : {}),
+		// LIVE state at the instant of close. The q_max_* fields above are historical maxima and cannot show
+		// whether bytes were still outstanding right now — which is the difference between a clean exit and a
+		// teardown that is about to stall.
+		...(q ? { q_now_bytes: q.queuedBytes ?? null, q_now_inflight: q.inFlightBytes ?? null } : {}),
+		// WS-level close facts (code / clean / socket state / which sockets still exist), set by the close
+		// listener. Without these, every stalled invocation looks identical to a normal client disconnect.
+		...(typeof reasonOrWrapper === 'object' && reasonOrWrapper?.关闭现场 ? reasonOrWrapper.关闭现场 : {}),
 	});
 }
 
