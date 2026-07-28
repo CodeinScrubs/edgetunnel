@@ -1717,6 +1717,10 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS上行写入队列 = null;
 	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false, WS拆卸已强制 = false;
+	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
+	// and the drain timeout, so the two can no longer race with independent start points.
+	const 拆卸截止毫秒 = 5000;
+	let WS拆卸截止 = 0;
 	// Force-close deadline for teardown. It must be armed from the close EVENT, not from inside the serialized
 	// message chain: if the task currently on that chain is parked in a remote writer.write() that never settles,
 	// anything appended after it never starts, so a drain timeout queued there could never fire.
@@ -2142,7 +2146,11 @@ async function 处理WS请求(request, yourUUID, url) {
 			// default, so a wedged remote writer would otherwise keep this teardown pending forever — holding
 			// the remote socket open against the platform's small simultaneous-connection budget and making
 			// later dials queue behind a connection that is already dead.
-			try { await withOperationTimeout(上行写入队列.等待空(), 5000, 'WS teardown drain timed out'); }
+			// Share the SINGLE deadline armed by the close listener instead of starting a second independent
+			// 5s timer. Two timers with different start points raced each other, so the effective bound was
+			// whichever happened to fire first rather than one predictable window.
+			const 剩余拆卸毫秒 = WS拆卸截止 ? Math.max(1, WS拆卸截止 - Date.now()) : 拆卸截止毫秒;
+			try { await withOperationTimeout(上行写入队列.等待空(), 剩余拆卸毫秒, 'WS teardown drain timed out'); }
 			catch (e) { 拆卸结果 = 'drain_timeout'; 拆卸错误 = e?.message || String(e); log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
 		}).finally(() => {
@@ -2153,6 +2161,10 @@ async function 处理WS请求(request, yourUUID, url) {
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
+			// Coordination is finished — NOW answer the client's Close frame, which is the half of
+			// allowHalfOpen the close listener deliberately leaves undone. Echo the peer's close code when we
+			// have one. Safe to call unconditionally: closeSocketQuietly ignores an already-closed socket.
+			closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
 			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', {
 				result: WS拆卸已强制 ? 'forced' : 拆卸结果,
 				forced: Boolean(WS拆卸已强制),
@@ -2209,8 +2221,14 @@ async function 处理WS请求(request, yourUUID, url) {
 		// 追踪关闭 marks the tracer closed, so ordinary trace calls stop emitting from here on. Teardown runs
 		// AFTER that point, which is precisely the window a hang lives in — 追踪拆卸 deliberately bypasses the
 		// closed flag so the next capture can show whether teardown started, finished, or had to be forced.
-		追踪拆卸(拆卸追踪, 'teardown_start', 队列瞬时状态(上行写入队列));
-		closeSocketQuietly(serverSock);
+		追踪拆卸(拆卸追踪, 'teardown_start', { ws_code: event?.code ?? null, ...队列瞬时状态(上行写入队列) });
+		// Do NOT close serverSock here. accept({allowHalfOpen:true}) exists precisely so the socket stays in
+		// CLOSING while we coordinate the other side; completing the client close handshake immediately and
+		// only THEN draining upstream gave neither model's guarantee — it opted out of the runtime's automatic
+		// close reply and still didn't hold the half-open state it asked for. The reply is now sent from the
+		// teardown finalizer once the drain has actually finished, and the force deadline below closes both
+		// sides if that never happens, so this can never outlive 拆卸截止毫秒.
+		WS拆卸截止 = Date.now() + 拆卸截止毫秒;
 		// Arm the force-close deadline HERE, in the event handler, so it runs even when the serialized chain is
 		// parked in a write that never settles. Clearing the queue rejects the parked waiter and closing the
 		// remote makes its write reject, which unwedges the chain. The finalizer cancels this timer on the
@@ -2226,7 +2244,8 @@ async function 处理WS请求(request, yourUUID, url) {
 				追踪拆卸(拆卸追踪, 'teardown_force', 队列瞬时状态(上行写入队列));
 				try { 上行写入队列.清空() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
-			}, 5000);
+				closeSocketQuietly(serverSock); // the drain never finished; answer the Close frame anyway
+			}, 拆卸截止毫秒);
 		}
 		// The outbound remote socket is closed by 收尾WS显式传输's finalizer — AFTER the message chain drains
 		// and the upload queue empties — so a client disconnect still can't leak the socket + a blocked reader
@@ -2383,7 +2402,10 @@ function 解析魏烈思请求(chunk, token) {
 
 	const cmd = data[cmdIndex];
 	let isUDP = false;
-	if (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: 'Invalid command' } }
+	// Report the actual command byte. A capture showed seven connections rejected as a bare "Invalid command"
+	// with no way to tell WHICH mode the client asked for — command 3 (Mux) looks identical to a corrupt
+	// header in the logs, and the two need completely different responses (turn Mux off vs investigate).
+	if (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: `Invalid command: ${cmd}` } }
 
 	const portIdx = cmdIndex + 1;
 	const port = (data[portIdx] << 8) | data[portIdx + 1];
@@ -4025,10 +4047,13 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	}
 }
 
-function closeSocketQuietly(socket) {
+function closeSocketQuietly(socket, code) {
 	try {
 		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-			socket.close();
+			// Echo the peer's close code when the caller has one (half-open teardown replies to the client's
+			// Close frame). A code outside the valid application range is dropped rather than risking a throw.
+			if (Number.isInteger(code) && code >= 1000 && code <= 4999 && code !== 1005 && code !== 1006) socket.close(code);
+			else socket.close();
 		}
 	} catch (error) { }
 }
