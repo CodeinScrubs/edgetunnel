@@ -2132,9 +2132,12 @@ async function 处理WS请求(request, yourUUID, url) {
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
 			// allowHalfOpen the close listener deliberately leaves undone.
 			const 已回送关闭 = closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
-			// Cancel the force deadline ONLY once the reply actually went out. Clearing it first meant a close
-			// that threw left the socket in CLOSING with no timer to rescue it.
-			if (已回送关闭 && WS强制关闭定时器) { try { clearTimeout(WS强制关闭定时器) } catch (e) { } WS强制关闭定时器 = null; }
+			// Cancel the force deadline ONLY when the socket has genuinely reached CLOSED. A successful
+			// close() call just means the handshake was REQUESTED — the socket is normally still CLOSING at
+			// this instant — so cancelling on that alone threw away the last watchdog while the close was
+			// still in flight. If it is not CLOSED yet the timer stays armed; the watchdog itself exits
+			// quietly once the socket finishes, so the normal path costs nothing.
+			if (已完成WS关闭(serverSock) && WS强制关闭定时器) { try { clearTimeout(WS强制关闭定时器) } catch (e) { } WS强制关闭定时器 = null; }
 			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', {
 				result: WS拆卸已强制 ? 'forced' : 拆卸结果,
 				forced: Boolean(WS拆卸已强制),
@@ -2207,6 +2210,9 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (!WS强制关闭定时器) {
 			WS强制关闭定时器 = setTimeout(() => {
 				WS强制关闭定时器 = null;
+				// The graceful path may have completed while this timer was still armed (it deliberately
+				// leaves the timer running until the socket actually reaches CLOSED). Nothing to force.
+				if (已完成WS关闭(serverSock) && !remoteConnWrapper.socket && !remoteConnWrapper.待处理Socket) return;
 				WS拆卸已强制 = true;
 				log('[WS forwarding] teardown deadline reached; forcing close');
 				// NOTE: this only proves the 5s timer fired. The chain could be stuck on a remote write, an
@@ -4044,9 +4050,9 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 }
 
 // RFC 6455: 1004, 1005 and 1006 are reserved and must never be SENT in a Close frame, and 1015 (TLS
-// handshake) is reserved the same way. Everything else in 1000-1014 that is registered, plus the private
-// 3000-4999 range, is sendable. An earlier revision accepted the whole 1000-4999 span, so echoing a peer's
-// 1004/1015 could make close() throw.
+// handshake) is reserved the same way. Everything else in 1000-1014 that is registered is sendable, as is
+// 3000-3999 (registered for libraries/frameworks) and 4000-4999 (private use). An earlier revision accepted
+// the whole 1000-4999 span, so echoing a peer's 1004/1015 could make close() throw.
 function 是可回送WS关闭码(code) {
 	if (!Number.isInteger(code)) return false;
 	if (code >= 3000 && code <= 4999) return true;
@@ -4058,18 +4064,31 @@ function 是可回送WS关闭码(code) {
 // stuck in CLOSING — the exact lifecycle failure the half-open teardown exists to prevent.
 function closeSocketQuietly(socket, code) {
 	if (!socket) return true;
-	try {
-		if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CLOSING) return true;
-	} catch (error) { return true; }
-	// Echo the peer's code when it is sendable, then fall back to 1000, then to a bare close().
-	const 尝试 = 是可回送WS关闭码(code) ? [code, 1000, null] : [1000, null];
+	let 状态;
+	// A readyState that throws means we know nothing about this socket — reporting success there would let a
+	// caller cancel its watchdog on no evidence at all.
+	try { 状态 = socket.readyState; } catch (error) { return false; }
+	if (状态 === WebSocket.CLOSED) return true;
+	// CONNECTING is not closeable and is not closed; say so rather than claiming success.
+	if (状态 !== WebSocket.OPEN && 状态 !== WebSocket.CLOSING) return false;
+	// Echo the peer's code when it is sendable, then fall back to 1000, then to a bare close(). 1000 is not
+	// retried twice when it was already the peer's code.
+	const 尝试 = (是可回送WS关闭码(code) && code !== 1000) ? [code, 1000, null] : [1000, null];
 	for (const 候选 of 尝试) {
 		try {
 			if (候选 === null) socket.close(); else socket.close(候选);
-			return true;
+			return true; // the close was REQUESTED; see 已完成WS关闭 for whether it finished
 		} catch (error) { }
 	}
 	return false;
+}
+
+// close() only STARTS the handshake — the socket moves to CLOSING and reaches CLOSED asynchronously. A
+// caller holding a force-close watchdog must distinguish "we asked" from "it finished", or it cancels its
+// last safety net while the socket is still CLOSING.
+function 已完成WS关闭(socket) {
+	if (!socket) return true;
+	try { return socket.readyState === WebSocket.CLOSED; } catch (error) { return false; }
 }
 
 function formatIdentifier(arr, offset = 0) {
