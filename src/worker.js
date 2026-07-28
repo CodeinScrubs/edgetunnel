@@ -997,7 +997,9 @@ async function 处理XHTTP请求(request, yourUUID) {
 			XHTTP上行写入队列?.清空();
 			关闭连接全部Socket(remoteConnWrapper);
 			释放远端写入器();
-			try { await reader.cancel() } catch (e) { }
+			// Bounded: an unbounded cancel() can leave this cleanup (and the pipe promise the WS teardown now
+		// observes) pending forever if the underlying socket shutdown never settles.
+		try { await withOperationTimeout(reader.cancel(), 500, 'reader cancel timed out') } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
 	}, new ByteLengthQueuingStrategy({ highWaterMark: getDownlinkBackpressureHwm(getWorkerRequestContext(request).env) })), { status: 200, headers: responseHeaders });
@@ -1512,7 +1514,9 @@ async function 处理gRPC请求(request, yourUUID) {
 			}
 			当前写入Socket = null;
 			关闭连接全部Socket(remoteConnWrapper);
-			try { await reader.cancel() } catch (e) { }
+			// Bounded: an unbounded cancel() can leave this cleanup (and the pipe promise the WS teardown now
+		// observes) pending forever if the underlying socket shutdown never settles.
+		try { await withOperationTimeout(reader.cancel(), 500, 'reader cancel timed out') } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
 	}, new ByteLengthQueuingStrategy({ highWaterMark: getDownlinkBackpressureHwm(getWorkerRequestContext(request).env) })), { status: 200, headers: grpcHeaders });
@@ -1601,6 +1605,9 @@ async function 处理WS请求(request, yourUUID, url) {
 	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
+	// Short bound on OBSERVING the remote socket/pipe settle after close. Not a new teardown stage — it only
+	// keeps that work inside the tracked promise long enough to see whether it finishes.
+	const 远端结算上限毫秒 = 1000;
 	let WS拆卸截止 = 0;
 	// Set once the coordinated finalizer has closed the remote side and requested the client Close reply.
 	// This is the ONLY reliable "graceful teardown finished" signal — see the watchdog for why.
@@ -2037,12 +2044,34 @@ async function 处理WS请求(request, yourUUID, url) {
 			try { await withOperationTimeout(上行写入队列.等待空(), 剩余拆卸毫秒, 'WS teardown drain timed out'); }
 			catch (e) { 拆卸结果 = 'drain_timeout'; 拆卸错误 = e?.message || String(e); log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
-		}).finally(() => {
+		}).finally(async () => {
+			// Capture the remote lifecycle handles BEFORE closing, so we can actually observe them settle.
+			// A capture of 371 WS tunnels showed every hang with the WebSocket already CLOSED, the queue
+			// empty, and teardown_done emitted 0-1ms earlier — so the unresolved work is not the WS and not
+			// the queue. The remaining candidates are the remote socket's close()/closed promises and the
+			// downlink pipe, none of which anything ever awaited.
+			const 远端Socket = remoteConnWrapper.socket;
+			const 下行管道 = remoteConnWrapper.pipePromise;
 			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
 			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
+			// Bounded observation of the remote side. This is deliberately SHORT: the point is to let normal
+			// cleanup finish inside the tracked promise, and to record which handle failed to settle when it
+			// does not — not to add another multi-second teardown stage.
+			let 远端结算 = 'skipped';
+			if (关闭远端 && (远端Socket || 下行管道)) {
+				const 待结算 = [];
+				try { if (远端Socket?.closed) 待结算.push(远端Socket.closed); } catch (e) { }
+				if (下行管道) 待结算.push(下行管道);
+				if (待结算.length) {
+					远端结算 = await Promise.race([
+						Promise.allSettled(待结算).then(() => 'settled'),
+						new Promise(r => setTimeout(() => r('timeout'), 远端结算上限毫秒)),
+					]).catch(() => 'error');
+				}
+			}
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
 			// allowHalfOpen the close listener deliberately leaves undone.
 			// Only answer the Close frame ourselves in half-open mode. With plain accept() the runtime has
@@ -2058,7 +2087,12 @@ async function 处理WS请求(request, yourUUID, url) {
 			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', {
 				result: WS拆卸已强制 ? 'forced' : 拆卸结果,
 				forced: Boolean(WS拆卸已强制),
-				close_replied: 已回送关闭,
+				// Renamed for honesty: these record what was REQUESTED. remote_settled is the one field that
+				// reports an observed outcome (settled | timeout | skipped | error).
+				close_requested: 已回送关闭,
+				ws_auto_reply: !WS半开拆卸,
+				ws_state_now: (() => { try { return serverSock.readyState } catch (e) { return null } })(),
+				remote_settled: 远端结算,
 				...(拆卸错误 ? { err: 拆卸错误 } : {}),
 				closed_remote: Boolean(关闭远端),
 				...队列瞬时状态(上行写入队列),
@@ -4565,7 +4599,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		if (pipeMeta?.wrapper && pipeMeta.wrapper.记录上行活动 === 记录上行活动) pipeMeta.wrapper.记录上行活动 = null;
 		if (首字节计时器) { try { clearTimeout(首字节计时器) } catch (e) { } }
 		if (空闲计时器) { try { clearTimeout(空闲计时器) } catch (e) { } }
-		try { await reader.cancel() } catch (e) { }
+		// Bounded: an unbounded cancel() can leave this cleanup (and the pipe promise the WS teardown now
+		// observes) pending forever if the underlying socket shutdown never settles.
+		try { await withOperationTimeout(reader.cancel(), 500, 'reader cancel timed out') } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
 	}
 	// A stale pipe (a reconnect installed a different socket) must not touch the shared client transport or
