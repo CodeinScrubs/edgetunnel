@@ -1602,6 +1602,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS上行写入队列 = null;
 	let WS显式传输链 = Promise.resolve();
 	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false, WS拆卸已强制 = false;
+	let WS传输错误文本 = null; // preserved cause for teardown_done, which otherwise reports result=error with no reason
 	// ONE absolute teardown deadline, set when the client's Close frame arrives and shared by the force timer
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
@@ -1988,6 +1989,11 @@ async function 处理WS请求(request, yourUUID, url) {
 		WS显式队列字节 = 0;
 		WS显式队列条目 = 0;
 		const msg = err?.message || `${err}`;
+		// Keep the ORIGINAL cause. teardown_done emitted result=error 13 times in one capture, every one with
+		// no err text, because the failure flag was set here while the error itself was dropped — and the WS
+		// close listener then labelled the connection a plain client_close. An error you cannot name is not
+		// diagnosable.
+		if (!WS传输错误文本) WS传输错误文本 = msg;
 		if (msg.includes('Network connection lost') || msg.includes('ReadableStream is closed')) {
 			log(`[WS forwarding] Connection ended: ${msg}`);
 		} else {
@@ -2032,7 +2038,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		// alone only ever meant "the promise settled", not "teardown succeeded".
 		let 拆卸结果 = 'graceful', 拆卸错误 = null;
 		const 拆卸承诺 = 追加WS显式传输任务(async () => {
-			if (WS显式传输失败) { 拆卸结果 = 'error'; return; }
+			if (WS显式传输失败) { 拆卸结果 = 'error'; 拆卸错误 = WS传输错误文本 || '(cause not recorded)'; return; }
 			// Bounded: 等待空() waits for the uplink queue to drain, and the per-write watchdog is off by
 			// default, so a wedged remote writer would otherwise keep this teardown pending forever — holding
 			// the remote socket open against the platform's small simultaneous-connection budget and making
@@ -2072,15 +2078,18 @@ async function 处理WS请求(request, yourUUID, url) {
 			// "settled" and could never distinguish which one was stuck.
 			let 远端结算 = null;
 			if (remoteConnWrapper.追踪 && 观察结算上限毫秒 > 0) {
-				远端结算 = {};
-				for (const [名称, 句柄] of [
+				// CONCURRENT, sharing ONE deadline. Observing them in sequence made the configured limit a
+				// PER-HANDLE budget: 4 handles x 1000ms was a 4s worst case, and at the 5000ms maximum a 20s
+				// teardown. That is not what the setting says, and a diagnostic must not dominate the thing
+				// it measures.
+				const 条目 = [
 					['remote_closed', (() => { try { return 远端Socket?.closed } catch (e) { return null } })()],
 					['pending_closed', (() => { try { return 待处理Socket?.closed } catch (e) { return null } })()],
 					['connecting', 建立中],
 					['pipe', 下行管道],
-				]) {
-					远端结算[名称] = await 观察句柄结算(句柄, 观察结算上限毫秒);
-				}
+				];
+				const 结果 = await Promise.all(条目.map(async ([名称, 句柄]) => [名称, await 观察句柄结算(句柄, 观察结算上限毫秒)]));
+				远端结算 = Object.fromEntries(结果);
 			}
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
 			// allowHalfOpen the close listener deliberately leaves undone.
