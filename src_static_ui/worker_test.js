@@ -1716,7 +1716,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
 	let WS上行写入队列 = null;
 	let WS显式传输链 = Promise.resolve();
-	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
+	let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false, WS拆卸已强制 = false;
 	// Force-close deadline for teardown. It must be armed from the close EVENT, not from inside the serialized
 	// message chain: if the task currently on that chain is parked in a remote writer.write() that never settles,
 	// anything appended after it never starts, so a drain timeout queued there could never fire.
@@ -2132,14 +2132,18 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (WS显式传输收尾已入队) return;
 		WS显式传输收尾已入队 = true;
 		WS显式传输停止接收 = true;
-		追加WS显式传输任务(async () => {
-			if (WS显式传输失败) return;
+		// 结果 distinguishes the ways this chain can settle. .finally() runs after a clean drain, a drain
+		// timeout, an earlier task error, AND after a force-close unwedged the chain — so "teardown_done"
+		// alone only ever meant "the promise settled", not "teardown succeeded".
+		let 拆卸结果 = 'graceful', 拆卸错误 = null;
+		const 拆卸承诺 = 追加WS显式传输任务(async () => {
+			if (WS显式传输失败) { 拆卸结果 = 'error'; return; }
 			// Bounded: 等待空() waits for the uplink queue to drain, and the per-write watchdog is off by
 			// default, so a wedged remote writer would otherwise keep this teardown pending forever — holding
 			// the remote socket open against the platform's small simultaneous-connection budget and making
 			// later dials queue behind a connection that is already dead.
 			try { await withOperationTimeout(上行写入队列.等待空(), 5000, 'WS teardown drain timed out'); }
-			catch (e) { log(`[WS forwarding] ${e?.message || e}`); }
+			catch (e) { 拆卸结果 = 'drain_timeout'; 拆卸错误 = e?.message || String(e); log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
 		}).finally(() => {
 			// Graceful path completed: cancel the force-close deadline armed by the close handler.
@@ -2149,10 +2153,19 @@ async function 处理WS请求(request, yourUUID, url) {
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
-			// The graceful path finished. If a capture shows teardown_start with no teardown_done and no
-			// teardown_force, the stall is inside this chain rather than after it.
-			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', { closed_remote: Boolean(关闭远端), ...队列瞬时状态(上行写入队列) });
+			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', {
+				result: WS拆卸已强制 ? 'forced' : 拆卸结果,
+				forced: Boolean(WS拆卸已强制),
+				...(拆卸错误 ? { err: 拆卸错误 } : {}),
+				closed_remote: Boolean(关闭远端),
+				...队列瞬时状态(上行写入队列),
+			});
 		});
+		// Hand the bounded teardown to the runtime instead of leaving it floating. Cloudflare may cancel a
+		// promise that is never awaited, returned, or passed to waitUntil — and this chain is exactly the
+		// post-close work a capture showed no completion event for.
+		try { getWorkerRequestContext(request)?.ctx?.waitUntil?.(拆卸承诺); } catch (e) { }
+		return 拆卸承诺;
 	};
 
 	serverSock.addEventListener('message', (event) => {
@@ -2205,7 +2218,11 @@ async function 处理WS请求(request, yourUUID, url) {
 		if (!WS强制关闭定时器) {
 			WS强制关闭定时器 = setTimeout(() => {
 				WS强制关闭定时器 = null;
+				WS拆卸已强制 = true;
 				log('[WS forwarding] teardown deadline reached; forcing close');
+				// NOTE: this only proves the 5s timer fired. The chain could be stuck on a remote write, an
+				// earlier queued task, or simply have been descheduled — teardown_force narrows the window,
+				// it does not by itself identify a stuck write.
 				追踪拆卸(拆卸追踪, 'teardown_force', 队列瞬时状态(上行写入队列));
 				try { 上行写入队列.清空() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
@@ -6540,7 +6557,10 @@ function 队列瞬时状态(队列) {
 	try {
 		const q = 队列?.获取统计?.() || null;
 		if (!q) return {};
-		return { q_now_bytes: q.queuedBytes ?? null, q_now_inflight: q.inFlightBytes ?? null, q_writes: q.maxItems ?? null };
+		// q_now_* are LIVE; q_max_items is the historical peak and is named as such. An earlier revision
+		// exposed that peak as "q_writes", which read as "this many writes are outstanding right now" — a
+		// clean teardown whose queue had once held 99 items looked like 99 stuck writes.
+		return { q_now_bytes: q.queuedBytes ?? null, q_now_inflight: q.inFlightBytes ?? null, q_max_items: q.maxItems ?? null };
 	} catch (e) { return {}; }
 }
 
