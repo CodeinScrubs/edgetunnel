@@ -2018,20 +2018,21 @@ async function 处理WS请求(request, yourUUID, url) {
 			catch (e) { 拆卸结果 = 'drain_timeout'; 拆卸错误 = e?.message || String(e); log(`[WS forwarding] ${e?.message || e}`); }
 			释放远端写入器();
 		}).finally(() => {
-			// Graceful path completed: cancel the force-close deadline armed by the close handler.
-			if (WS强制关闭定时器) { try { clearTimeout(WS强制关闭定时器) } catch (e) { } WS强制关闭定时器 = null; }
 			// Close the remote only AFTER the serialized message chain drained and the upload queue emptied.
 			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
-			// allowHalfOpen the close listener deliberately leaves undone. Echo the peer's close code when we
-			// have one. Safe to call unconditionally: closeSocketQuietly ignores an already-closed socket.
-			closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
+			// allowHalfOpen the close listener deliberately leaves undone.
+			const 已回送关闭 = closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
+			// Cancel the force deadline ONLY once the reply actually went out. Clearing it first meant a close
+			// that threw left the socket in CLOSING with no timer to rescue it.
+			if (已回送关闭 && WS强制关闭定时器) { try { clearTimeout(WS强制关闭定时器) } catch (e) { } WS强制关闭定时器 = null; }
 			追踪拆卸(remoteConnWrapper.追踪, 'teardown_done', {
 				result: WS拆卸已强制 ? 'forced' : 拆卸结果,
 				forced: Boolean(WS拆卸已强制),
+				close_replied: 已回送关闭,
 				...(拆卸错误 ? { err: 拆卸错误 } : {}),
 				closed_remote: Boolean(关闭远端),
 				...队列瞬时状态(上行写入队列),
@@ -3936,15 +3937,33 @@ async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封
 	}
 }
 
+// RFC 6455: 1004, 1005 and 1006 are reserved and must never be SENT in a Close frame, and 1015 (TLS
+// handshake) is reserved the same way. Everything else in 1000-1014 that is registered, plus the private
+// 3000-4999 range, is sendable. An earlier revision accepted the whole 1000-4999 span, so echoing a peer's
+// 1004/1015 could make close() throw.
+function 是可回送WS关闭码(code) {
+	if (!Number.isInteger(code)) return false;
+	if (code >= 3000 && code <= 4999) return true;
+	return code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006;
+}
+
+// Returns TRUE when the socket is closed or already was. The caller must not cancel a force-close deadline
+// on a false return: a rejected close code used to be swallowed with no fallback, which left the socket
+// stuck in CLOSING — the exact lifecycle failure the half-open teardown exists to prevent.
 function closeSocketQuietly(socket, code) {
+	if (!socket) return true;
 	try {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-			// Echo the peer's close code when the caller has one (half-open teardown replies to the client's
-			// Close frame). A code outside the valid application range is dropped rather than risking a throw.
-			if (Number.isInteger(code) && code >= 1000 && code <= 4999 && code !== 1005 && code !== 1006) socket.close(code);
-			else socket.close();
-		}
-	} catch (error) { }
+		if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CLOSING) return true;
+	} catch (error) { return true; }
+	// Echo the peer's code when it is sendable, then fall back to 1000, then to a bare close().
+	const 尝试 = 是可回送WS关闭码(code) ? [code, 1000, null] : [1000, null];
+	for (const 候选 of 尝试) {
+		try {
+			if (候选 === null) socket.close(); else socket.close(候选);
+			return true;
+		} catch (error) { }
+	}
+	return false;
 }
 
 function formatIdentifier(arr, offset = 0) {
