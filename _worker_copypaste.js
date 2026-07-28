@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-28 19:34:44 (e6ec002-dirty)
+// Build: 2026-07-28 19:52:29 (1d9b592-dirty)
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -107,7 +107,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-28 19:34:44 (e6ec002-dirty)';
+const Version = '2026-07-28 19:52:29 (1d9b592-dirty)';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();

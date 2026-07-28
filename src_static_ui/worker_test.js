@@ -104,7 +104,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-06-01 15:49:39';
+const Version = '2026-07-28 19:52:25 (1d9b592-dirty, panel)';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -10372,6 +10372,11 @@ var ENV_SETTINGS=[
  {k:'DNS_TIMEOUT_MS',d:'1200',h:'Per-stage timeout (ms) for tunneled DNS — applies to each DoH request, each DoH body read, and each DNS-over-TCP connect/write/read. Clamped 400-5000. No longer inherited from CONNECT_TIMEOUT_MS.'},
  {k:'DNS_TOTAL_TIMEOUT_MS',d:'4000',h:'ONE total budget (ms) for a whole tunneled DNS lookup, shared across every DoH attempt AND the DNS-over-TCP fallback. When it runs out the worker answers SERVFAIL immediately instead of stacking per-stage timeouts. Clamped 1000-10000. Lower (2000-3000) hands back to your client resolver sooner; raise only if your resolvers are genuinely slow rather than broken.'},
  {k:'DOH_SUBREQUEST_BUDGET',d:'40',h:'How many DNS-over-HTTPS lookups one connection may make before tunneled DNS switches to plaintext DNS-over-TCP. The free plan allows 50 external subrequests PER INVOCATION and a WebSocket tunnel is ONE invocation, so an unbounded session would spend them all on DNS and leave none for anything else. Cached answers are always free and never count. Set 0 to remove the cap (correct on a paid plan, which allows 10000).'},
+ {k:'INITIAL_WRITE_TIMEOUT_MS',d:'15000',h:'Deadline (ms) for the FIRST packet written to the remote server. Publishing the socket only rescues the case where the CLIENT disconnects; if the client stays connected and that write never completes, the dial and its ProxyIP fallback park forever with nothing to unwedge them. A first packet is a small protocol header or TLS hello, so 15s can only fire on a genuinely stuck writer, never on a slow-but-healthy link. Clamped 1000-60000. Set 0 to restore the old unbounded wait. Deliberately separate from UPLINK_WRITE_TIMEOUT_MS, which stays off because a steady-state upload may legitimately block for a long time under backpressure.'},
+ {k:'WS_HALF_OPEN_TEARDOWN',d:'0',h:'Make the worker complete the WebSocket close handshake itself instead of letting the runtime answer the peer Close frame. LEAVE OFF. A capture of 158 WS tunnels showed every failed invocation ending with the close already requested and the socket still CLOSING, while not one of 123 closes had queued bytes for half-open to protect. Final-upload safety comes from closing the REMOTE socket after the drain, which happens either way. Only set 1 to A/B the old behaviour.'},
+ {k:'WS_REMOTE_SETTLE_OBSERVE_MS',d:'0',h:'DEBUG-only. How long teardown may WATCH the remote socket and downlink pipe finish settling, purely to record which handle is stuck. Has no effect unless DEBUG=1 and adds no production latency. Set 1000 only while taking a diagnostic capture. Clamped 0-5000.'},
+ {k:'OFF_LOG',d:'0',h:'Suppress persistent request logging entirely. Recommended ON (1) on the free plan: request logging spends KV writes against a 1000/day quota and CPU against a 10ms budget, for data you rarely read.'},
+ {k:'DEBUG_STAT_INTERVAL_MS',d:'15000',h:'How often a live connection emits a periodic stat event while DEBUG=1. No effect when DEBUG=0. Raise to 60000 for diagnostic captures so long sessions do not flood the tail and inflate CPU. Clamped 5000-300000.'},
  {g:'Throughput'},
  {k:'DOWNLINK_GRAIN_PACKET_BYTES',d:'32768',h:'Download coalescing size. Smaller (8-16k) feels snappier for browsing; larger (64k) is better for big downloads.'},
  {k:'DOWNLINK_BACKPRESSURE_HWM_BYTES',d:'262144',h:'How much undelivered data may buffer before the remote read is paused. Raise on fast links with memory headroom; too high risks isolate memory pressure. Clamped 64k-8M.'},
