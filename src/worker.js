@@ -1585,6 +1585,9 @@ async function 处理WS请求(request, yourUUID, url) {
 	// and the drain timeout, so the two can no longer race with independent start points.
 	const 拆卸截止毫秒 = 5000;
 	let WS拆卸截止 = 0;
+	// Set once the coordinated finalizer has closed the remote side and requested the client Close reply.
+	// This is the ONLY reliable "graceful teardown finished" signal — see the watchdog for why.
+	let WS协调收尾完成 = false;
 	// Force-close deadline for teardown. It must be armed from the close EVENT, not from inside the serialized
 	// message chain: if the task currently on that chain is parked in a remote writer.write() that never settles,
 	// anything appended after it never starts, so a drain timeout queued there could never fire.
@@ -2026,6 +2029,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
 			// allowHalfOpen the close listener deliberately leaves undone.
 			const 已回送关闭 = closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
+			WS协调收尾完成 = true; // drain done, remote closed, client Close requested
 			// Cancel the force deadline ONLY when the socket has genuinely reached CLOSED. A successful
 			// close() call just means the handshake was REQUESTED — the socket is normally still CLOSING at
 			// this instant — so cancelling on that alone threw away the last watchdog while the close was
@@ -2106,7 +2110,11 @@ async function 处理WS请求(request, yourUUID, url) {
 				WS强制关闭定时器 = null;
 				// The graceful path may have completed while this timer was still armed (it deliberately
 				// leaves the timer running until the socket actually reaches CLOSED). Nothing to force.
-				if (已完成WS关闭(serverSock) && !remoteConnWrapper.socket && !remoteConnWrapper.待处理Socket) return;
+				// Use the EXPLICIT completion flag, not socket truthiness: 关闭连接全部Socket closes the
+				// sockets but deliberately leaves the properties set, because connectStreams identifies a
+				// superseded pipe by socket identity. Testing truthiness here meant the guard never held and
+				// every healthy teardown was logged as forced — corrupting the very telemetry this exists for.
+				if (WS协调收尾完成 && 已完成WS关闭(serverSock)) return;
 				WS拆卸已强制 = true;
 				log('[WS forwarding] teardown deadline reached; forcing close');
 				// NOTE: this only proves the 5s timer fired. The chain could be stuck on a remote write, an
@@ -3843,9 +3851,10 @@ function getDohSubrequestBudget(env = {}) {
 	const configured = Number(raw);
 	if (!Number.isFinite(configured) || configured < 0) return DOH_SUBREQUEST_BUDGET;
 	if (configured === 0) return 0;
-	// Paid Workers allow far more than 10000 subrequests per invocation, so don't cap the knob below what
-	// the platform can actually grant.
-	return Math.max(1, Math.min(10_000_000, Math.round(configured)));
+	// Paid Workers allow 10,000 external subrequests per request (Free allows 50), so the knob is clamped to
+	// the platform ceiling. An earlier revision allowed up to 10,000,000 on the mistaken belief that paid
+	// plans went into the millions — a budget above the real limit is not a budget at all.
+	return Math.max(1, Math.min(10000, Math.round(configured)));
 }
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
