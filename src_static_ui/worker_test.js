@@ -3013,6 +3013,18 @@ function 关闭连接全部Socket(wrapper) {
 	closeRemoteSocketQuietly(wrapper.socket);
 }
 
+// INITIAL_WRITE_TIMEOUT_MS: deadline for the FIRST packet write only — deliberately separate from
+// UPLINK_WRITE_TIMEOUT_MS (which stays off, because a steady-state upload may legitimately block for a
+// long time under backpressure). Default 15000, clamped to [1000, 60000]; 0 disables it.
+function getInitialWriteTimeoutMs(env = {}) {
+	const raw = String(env?.INITIAL_WRITE_TIMEOUT_MS ?? '').trim();
+	if (!raw) return 15000;
+	const v = Number(raw);
+	if (!Number.isFinite(v) || v < 0) return 15000;
+	if (v === 0) return 0;
+	return Math.max(1000, Math.min(60000, Math.round(v)));
+}
+
 function closeRemoteSocketQuietly(socket) {
 	// A Cloudflare TCP socket's close() is asynchronous and returns a promise that can reject (e.g. the peer
 	// already RST'd). Swallow both the synchronous throw AND the async rejection so a routine cleanup during
@@ -3203,7 +3215,20 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// The client can leave while candidates are still being dialled; don't start a write for a peer
 			// that is already gone.
 			if (remoteConnWrapper?.客户端已关闭) throw new Error('client disconnected before the initial write');
-			await writer.write(bytes);
+			// Deadline on the FIRST write. Publishing 待处理Socket only helps when the client disconnects; if
+			// the client stays connected and this write never settles, the dial and its fallback stay parked
+			// forever. This was declined for several rounds for lack of evidence, but that argument was
+			// circular: 待处理Socket is cleared in the finally below, so a capture could only ever report the
+			// handle as "absent" — the instrumentation could not observe the failure it was meant to rule out.
+			// Generous by design (15s): a first packet is a small header or ClientHello, so this can only fire
+			// on a genuinely stuck writer, never on a slow-but-healthy link. 0 restores the old unbounded wait.
+			const 首包写入超时 = getInitialWriteTimeoutMs(env);
+			if (首包写入超时 > 0) {
+				await withOperationTimeout(writer.write(bytes), 首包写入超时, 'Initial TCP write timed out',
+					() => closeRemoteSocketQuietly(remoteSock));
+			} else {
+				await writer.write(bytes);
+			}
 			追踪初始写入(remoteConnWrapper?.追踪, bytes.byteLength);
 		}
 		finally {
