@@ -50,3 +50,4 @@ reason_new/
 
 # wrangler tail captures (large, local debugging artifacts)
 worker-debug-*.jsonl
+src_static_ui/capture*.json

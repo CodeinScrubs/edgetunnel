@@ -48,6 +48,9 @@ const 下行背压高水位字节 = ENGINE_DEFAULTS.DOWNLINK_BACKPRESSURE_HWM_BY
 const WS缓冲上限字节 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_LIMIT_BYTES, WS缓冲最大等待毫秒 = ENGINE_DEFAULTS.WS_BUFFERED_AMOUNT_MAX_WAIT_MS;
 const GRPC_MAX_FRAME_PAYLOAD_BYTES = ENGINE_DEFAULTS.GRPC_MAX_FRAME_PAYLOAD_BYTES;
 const XHTTP_FIRST_PACKET_MAX_BYTES = ENGINE_DEFAULTS.XHTTP_FIRST_PACKET_MAX_BYTES;
+// Whole-phase deadline for reading an XHTTP first packet, before any Response exists. Generous: a real
+// client sends its header immediately, so this only ever fires on a stalled or hostile peer.
+const XHTTP_PREAUTH_TIMEOUT_MS = 10000;
 const PROXY_RESOLUTION_CACHE_VERSION = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_VERSION;
 const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES;
 const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS;
@@ -718,7 +721,7 @@ export default {
 							订阅内容 = finalizeSubscriptionContent(订阅内容, config_JSON);
 						}
 
-						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || shouldBase64Subscription)) 订阅内容 = btoa(订阅内容);
+						if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || shouldBase64Subscription)) 订阅内容 = UTF8转Base64(订阅内容);
 
 						if (订阅类型 === 'singbox') {
 							订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
@@ -906,7 +909,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 					await remoteConnWrapper.retryConnect();
 				},
 				关闭连接: () => {
-					closeRemoteSocketQuietly(remoteConnWrapper.socket);
+					关闭连接全部Socket(remoteConnWrapper);
 					closeSocketQuietly(xhttpBridge);
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
@@ -948,21 +951,21 @@ async function 处理XHTTP请求(request, yourUUID) {
 					// writer is wedged, and close() queues behind that same write — waiting a second full
 					// deadline on it just doubles teardown time before the inevitable force-close.
 					const 已排空 = await 有限排空上行队列(上行写入队列);
-					if (!已排空) closeRemoteSocketQuietly(remoteConnWrapper.socket);
+					if (!已排空) 关闭连接全部Socket(remoteConnWrapper);
 					const writer = 已排空 ? 获取远端写入器() : null;
 					if (writer) {
 						// close() queues BEHIND any outstanding write, so a wedged write would leave this pending
 						// forever. Bound it and force the socket shut when the deadline passes.
 						try {
 							await withOperationTimeout(writer.close(), 5000, 'XHTTP upstream close timed out',
-								() => closeRemoteSocketQuietly(remoteConnWrapper.socket));
-						} catch (e) { closeRemoteSocketQuietly(remoteConnWrapper.socket); }
+								() => 关闭连接全部Socket(remoteConnWrapper));
+						} catch (e) { 关闭连接全部Socket(remoteConnWrapper); }
 					}
 				}
 			} catch (err) {
 				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
-				closeRemoteSocketQuietly(remoteConnWrapper.socket); // close the upstream too (WS/gRPC already do)
+				关闭连接全部Socket(remoteConnWrapper); // close the upstream too (WS/gRPC already do)
 				closeSocketQuietly(xhttpBridge);
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
@@ -978,7 +981,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 			追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 			释放下行背压();
 			XHTTP上行写入队列?.清空();
-			closeRemoteSocketQuietly(remoteConnWrapper.socket);
+			关闭连接全部Socket(remoteConnWrapper);
 			释放远端写入器();
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
@@ -1117,8 +1120,16 @@ async function 读取XHTTP首包(reader, token) {
 	let buffer = new Uint8Array(1024);
 	let offset = 0;
 
+	// XHTTP is the one transport that parses its first packet BEFORE returning a Response — WS answers 101
+	// immediately and gRPC streams its reply. So an unauthenticated peer that opens a POST, sends a partial
+	// header and then just waits could hold this invocation open with no Response ever produced. The 64 KiB
+	// cap bounds bytes but not time; this bounds the whole pre-auth phase.
+	const 预认证截止 = Date.now() + XHTTP_PREAUTH_TIMEOUT_MS;
+
 	while (true) {
-		const { value, done } = await reader.read();
+		const 剩余毫秒 = 预认证截止 - Date.now();
+		if (剩余毫秒 <= 0) throw new Error('XHTTP pre-auth timed out');
+		const { value, done } = await readWithOperationTimeout(reader, 剩余毫秒, 'XHTTP pre-auth timed out');
 		if (done) {
 			if (offset === 0) return null;
 			break;
@@ -1313,7 +1324,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				}
 				当前写入Socket = null;
 				try { reader.releaseLock() } catch (e) { }
-				closeRemoteSocketQuietly(remoteConnWrapper.socket);
+				关闭连接全部Socket(remoteConnWrapper);
 				try { controller.close() } catch (e) { }
 			};
 
@@ -1441,7 +1452,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				// socket shut instead of queuing a half-close behind that same stuck write and burning a
 				// second deadline on it.
 				const 已排空 = await 有限排空上行队列(上行写入队列);
-				if (!已排空) closeRemoteSocketQuietly(remoteConnWrapper.socket);
+				if (!已排空) 关闭连接全部Socket(remoteConnWrapper);
 				// Opt-in gRPC duplex half-close (GRPC_HALF_CLOSE_ON_EOF, default off): on a NORMAL request-body
 				// EOF, half-close only the upstream writable (FIN) and let the downstream response finish, rather
 				// than aborting the whole duplex in the finally. Off by default preserves the proven full-close.
@@ -1486,7 +1497,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				远端写入器 = null;
 			}
 			当前写入Socket = null;
-			closeRemoteSocketQuietly(remoteConnWrapper.socket);
+			关闭连接全部Socket(remoteConnWrapper);
 			try { await reader.cancel() } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
@@ -1589,7 +1600,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			await remoteConnWrapper.retryConnect();
 		},
 		关闭连接: () => {
-			closeRemoteSocketQuietly(remoteConnWrapper.socket);
+			关闭连接全部Socket(remoteConnWrapper);
 			closeSocketQuietly(serverSock);
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
@@ -1939,7 +1950,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		上行写入队列.清空();
 		释放远端写入器();
-		closeRemoteSocketQuietly(remoteConnWrapper.socket); // close the upstream directly, not only via the serverSock close cascade
+		关闭连接全部Socket(remoteConnWrapper); // close the upstream directly, not only via the serverSock close cascade
 		closeSocketQuietly(serverSock);
 	};
 
@@ -1987,7 +1998,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			// Closing it synchronously in the WS 'close' handler raced the chain: a final message queued just
 			// before the close frame was still being written when the socket died, so its bytes were lost
 			// (truncated uploads / a Telegram send failing right at teardown). Error paths still close at once.
-			if (关闭远端) { closeRemoteSocketQuietly(remoteConnWrapper.socket); }
+			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
 		});
 	};
 
@@ -2027,7 +2038,7 @@ async function 处理WS请求(request, yourUUID, url) {
 				WS强制关闭定时器 = null;
 				log('[WS forwarding] teardown deadline reached; forcing close');
 				try { 上行写入队列.清空() } catch (e) { }
-				closeRemoteSocketQuietly(remoteConnWrapper.socket);
+				关闭连接全部Socket(remoteConnWrapper);
 			}, 5000);
 		}
 		// The outbound remote socket is closed by 收尾WS显式传输's finalizer — AFTER the message chain drains
@@ -2039,9 +2050,11 @@ async function 处理WS请求(request, yourUUID, url) {
 		// A WS transport error is a client-side termination too (like 'close'): mark it so the downlink pipe
 		// doesn't score the route as failed or spend a ProxyIP fallback dial on an already-dead client.
 		remoteConnWrapper.客户端已关闭 = true;
-		remoteConnWrapper.closeHint = 'client_ws_error';
+		// Same rule as the 'close' listener: don't clobber a hint an earlier stage set. An error event often
+		// FOLLOWS the real cause (remote_eof, first_byte_timeout, idle_timeout), so overwriting here loses it.
+		if (!remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'client_ws_error';
 		追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err?.error || err);
-		closeRemoteSocketQuietly(remoteConnWrapper.socket);
+		关闭连接全部Socket(remoteConnWrapper);
 		处理WS显式传输错误(err);
 	});
 
@@ -2675,6 +2688,36 @@ async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
 	return new Uint8Array(pt);
 }
 
+// btoa() throws on any code point above U+00FF, so a subscription carrying a non-Latin-1 node remark
+// (Persian, Chinese, an emoji) made the whole /sub response fail instead of encoding. Encode to UTF-8
+// bytes first, in chunks so a large subscription can't blow the argument limit of String.fromCharCode.
+function UTF8转Base64(text) {
+	const bytes = new TextEncoder().encode(String(text ?? ''));
+	let binary = '';
+	const 块 = 0x8000;
+	for (let i = 0; i < bytes.length; i += 块) {
+		binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 块));
+	}
+	return btoa(binary);
+}
+
+// ReadableStream.cancel() returns a promise that can reject (e.g. the peer already reset). A bare
+// try/catch only catches a synchronous throw, so the rejection surfaced as an unhandled rejection.
+function cancelBodyQuietly(response, reason) {
+	try {
+		const result = response?.body?.cancel?.(reason);
+		if (result && typeof result.catch === 'function') result.catch(() => { });
+	} catch (e) { }
+}
+
+// Close BOTH the established socket and any socket still mid-initial-write. During 写入首包 the winning
+// candidate is not yet in .socket, so closing only .socket leaves a pending write with nothing to reject it.
+function 关闭连接全部Socket(wrapper) {
+	if (!wrapper) return;
+	closeRemoteSocketQuietly(wrapper.待处理Socket);
+	closeRemoteSocketQuietly(wrapper.socket);
+}
+
 function closeRemoteSocketQuietly(socket) {
 	// A Cloudflare TCP socket's close() is asynchronous and returns a promise that can reject (e.g. the peer
 	// already RST'd). Swallow both the synchronous throw AND the async rejection so a routine cleanup during
@@ -2854,9 +2897,24 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	async function 写入首包(remoteSock, data) {
 		if (有效数据长度(data) <= 0) return;
 		const bytes = 数据转Uint8Array(data);
+		// Publish the socket BEFORE awaiting the write. remoteConnWrapper.socket is only assigned once the
+		// connection is fully established, so during this write the socket was unreachable: if the write never
+		// settled and the client then disconnected, 绑定请求中止 closed remoteConnWrapper.socket (still null)
+		// and nothing could reject the pending write — the invocation stayed parked until the runtime killed it
+		// with "your Worker's code had hung". Closing 待处理Socket rejects the write and unparks it.
+		if (remoteConnWrapper) remoteConnWrapper.待处理Socket = remoteSock;
 		const writer = remoteSock.writable.getWriter();
-		try { await writer.write(bytes); 追踪初始写入(remoteConnWrapper?.追踪, bytes.byteLength); }
-		finally { try { writer.releaseLock() } catch (e) { } }
+		try {
+			// The client can leave while candidates are still being dialled; don't start a write for a peer
+			// that is already gone.
+			if (remoteConnWrapper?.客户端已关闭) throw new Error('client disconnected before the initial write');
+			await writer.write(bytes);
+			追踪初始写入(remoteConnWrapper?.追踪, bytes.byteLength);
+		}
+		finally {
+			try { writer.releaseLock() } catch (e) { }
+			if (remoteConnWrapper && remoteConnWrapper.待处理Socket === remoteSock) remoteConnWrapper.待处理Socket = null;
+		}
 	}
 
 	async function 并发打开候选连接(候选列表) {
@@ -3129,6 +3187,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				closeSocketQuietly(ws);
 				throw err;
 			}
+			// The client left while we were dialling. Don't score the route (a dial we abandoned says nothing
+			// about the destination's health, and a false failure pins the host to ProxyIP for the 10-minute
+			// TTL) and don't spend a resolver lookup plus new connections on a peer that is already gone — the
+			// free plan allows only six simultaneously-establishing outbound connections.
+			if (remoteConnWrapper.客户端已关闭) { 关闭连接全部Socket(remoteConnWrapper); return; }
 			recordDirectRouteFailure(直连路由键);
 			// connectDirect() writes the first packet internally, so this failure may be a WRITE failure that
 			// already (partially) delivered rawData. Replaying a non-replay-safe first packet to ProxyIP could
@@ -3310,12 +3373,17 @@ function 解析DNS应答最小TTL毫秒(msg) {
 	const qd = (q[4] << 8) | q[5];
 	const an = (q[6] << 8) | q[7];
 	if (qd !== 1 || an < 1) return null;
+	// Measure ALL non-OPT records, not just the answer section. 老化DNS_TTL replays authority and additional
+	// records too, so sizing the entry off answers alone could keep serving an additional record long after
+	// its own TTL expired — it would go out with TTL 0, but the stale address is still in the message and
+	// usable for that transaction.
+	const 记录总数 = an + ((q[8] << 8) | q[9]) + ((q[10] << 8) | q[11]);
 	let p = 12;
 	let 最小TTL秒 = Infinity;
 	try {
 		p = 跳过DNS名称(q, p);
 		p += 4; // QTYPE + QCLASS
-		for (let i = 0; i < an; i++) {
+		for (let i = 0; i < 记录总数; i++) {
 			p = 跳过DNS名称(q, p);
 			if (p + 10 > q.byteLength) return null; // TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2)
 			const 类型 = (q[p] << 8) | q[p + 1];
@@ -3567,10 +3635,10 @@ async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null, �
 			headers: { 'content-type': 'application/dns-message', 'accept': 'application/dns-message' },
 			body: query,
 		}, 剩余DNS时间(总截止, timeoutMs));
-		if (!resp.ok) { try { resp.body?.cancel() } catch (e) { } throw new Error(`DoH HTTP ${resp.status}`); }
+		if (!resp.ok) { cancelBodyQuietly(resp); throw new Error(`DoH HTTP ${resp.status}`); }
 		// Reject a declared-oversized body before buffering it (a DNS message can't exceed 64KB; a
 		// misbehaving/hostile DoH endpoint shouldn't get to spike isolate memory via arrayBuffer()).
-		if (Number(resp.headers?.get?.('content-length') || 0) > 65535) { try { resp.body?.cancel() } catch (e) { } throw new Error('DoH response too large'); }
+		if (Number(resp.headers?.get?.('content-length') || 0) > 65535) { cancelBodyQuietly(resp); throw new Error('DoH response too large'); }
 		// Read the body with its OWN deadline. fetchWithTimeout's timer is cleared the moment response headers
 		// arrive, so an endpoint that answers with headers and then stalls its body used to hang here forever —
 		// and because this never returned, the fallback DoH URL and the DNS-over-TCP fallback never ran either,
@@ -3582,7 +3650,7 @@ async function DNS经DoH转发(requestData, env, timeoutMs, 总截止 = null, �
 		// while hard-failing on an absent header would break an otherwise working resolver that omits it.
 		const 内容类型 = String(resp.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
 		if (内容类型 && 内容类型 !== 'application/dns-message') {
-			try { resp.body?.cancel() } catch (e) { }
+			cancelBodyQuietly(resp);
 			throw new Error(`unexpected DoH content-type: ${内容类型}`);
 		}
 		const msg = await 读取有限响应体(resp, 65535, 剩余DNS时间(总截止, timeoutMs), 'DoH');
@@ -6462,8 +6530,9 @@ function 绑定请求中止(request, wrapper) {
 		wrapper.客户端已关闭 = true;
 		if (!wrapper.closeHint) wrapper.closeHint = 'client_abort';
 		追踪关闭(wrapper.追踪, wrapper); // synchronous close emit before the invocation is torn down
-		// close() returns a Promise; a bare try/catch leaves its rejection unhandled.
-		closeRemoteSocketQuietly(wrapper.socket);
+		// close() returns a Promise; a bare try/catch leaves its rejection unhandled. Closes the pending
+		// initial-write socket too — that is the whole point of this handler when a client vanishes mid-dial.
+		关闭连接全部Socket(wrapper);
 	};
 	if (signal.aborted) { onAbort(); return; }
 	try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) { }
@@ -7533,18 +7602,18 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 			body: query,
 		}, DOH_LOOKUP_TIMEOUT_MS);
 		if (!response.ok) {
-			try { response.body?.cancel() } catch (e) { }
+			cancelBodyQuietly(response);
 			debugWarn(`[DoH lookup] Request failed for ${域名} ${记录类型} via ${DoH解析服务}; response code: ${response.status}`);
 			return [];
 		}
 
 
-		if (Number(response.headers?.get?.('content-length') || 0) > 65535) { try { response.body?.cancel() } catch (e) { } log(`[DoH lookup] Declared response too large for ${域名} via ${DoH解析服务}`); return []; }
+		if (Number(response.headers?.get?.('content-length') || 0) > 65535) { cancelBodyQuietly(response); log(`[DoH lookup] Declared response too large for ${域名} via ${DoH解析服务}`); return []; }
 		// Same media-type and body-deadline rules as the tunneled-DNS path. This function resolves ProxyIP
 		// (and preload-race) targets, so an endpoint that returns headers and then stalls its body used to
 		// hang name resolution here with no timer running — freezing relay setup before any dial began.
 		const 应答类型 = String(response.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-		if (应答类型 && 应答类型 !== 'application/dns-message') { try { response.body?.cancel() } catch (e) { } log(`[DoH lookup] Unexpected content-type (${应答类型}) for ${域名} via ${DoH解析服务}`); return []; }
+		if (应答类型 && 应答类型 !== 'application/dns-message') { cancelBodyQuietly(response); log(`[DoH lookup] Unexpected content-type (${应答类型}) for ${域名} via ${DoH解析服务}`); return []; }
 		const buf = await 读取有限响应体(response, 65535, DOH_LOOKUP_TIMEOUT_MS, 'DoH lookup');
 		if (buf.byteLength > 65535) { log(`[DoH lookup] Response too large (${buf.byteLength}B) for ${域名} via ${DoH解析服务}`); return []; }
 		验证DNS响应(query, buf);
@@ -8851,7 +8920,7 @@ async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
 		// response can't spike isolate memory; the timeout above bounds a slow/hung upstream.
 		const 声明长度 = Number(response.headers.get('content-length') || 0);
 		if (Number.isFinite(声明长度) && 声明长度 > 512 * 1024) {
-			try { response.body?.cancel() } catch (e) { }
+			cancelBodyQuietly(response);
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: response too large`);
 			return [优选IP, 其他节点LINK];
 		}
