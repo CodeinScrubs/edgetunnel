@@ -53,3 +53,4 @@ worker-debug-*.jsonl
 src_static_ui/capture*.json
 src_static_ui/capture2*.json
 src_static_ui/capture3*.json
+src_static_ui/capture4*.json

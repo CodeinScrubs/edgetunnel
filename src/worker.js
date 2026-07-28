@@ -1567,8 +1567,25 @@ async function 处理WS请求(request, yourUUID, url) {
 	// docs: with newer compatibility dates binary frames default to Blob, and binaryType only affects
 	// messages dispatched after it is set).
 	serverSock.binaryType = 'arraybuffer';
-	try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
-	catch (_) { serverSock.accept() }
+	// Half-open teardown is now OPT-IN (WS_HALF_OPEN_TEARDOWN=1) and OFF by default.
+	//
+	// allowHalfOpen makes the Worker solely responsible for completing the client Close handshake. A DEBUG
+	// capture of 158 WebSocket tunnels showed why that is a bad trade here: teardown_force fired 0 times,
+	// every one of 123 closes reported an EMPTY upload queue (q_now_bytes=0, q_now_inflight=0), and all 8
+	// exception invocations — including all 5 runtime hangs — ended with result=graceful, the close already
+	// requested, and readyState still CLOSING. Not one close in that capture had queued bytes for half-open
+	// to protect, while every exception correlated with a Close handshake we owned and never completed.
+	//
+	// With plain accept() the runtime answers the peer's Close frame itself. The final-upload protection that
+	// motivated half-open is preserved by what actually provides it: the serialized message chain still runs
+	// admitted messages, and the REMOTE socket is still closed only after the drain completes.
+	const WS半开拆卸 = isEnabledEnvFlag(getWorkerRequestContext(request)?.env?.WS_HALF_OPEN_TEARDOWN);
+	if (WS半开拆卸) {
+		try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
+		catch (_) { serverSock.accept() }
+	} else {
+		serverSock.accept();
+	}
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	remoteConnWrapper.追踪 = 创建连接追踪器('ws', request, getWorkerRequestContext(request)?.env);
 	绑定请求中止(request, remoteConnWrapper);
@@ -2028,7 +2045,9 @@ async function 处理WS请求(request, yourUUID, url) {
 			if (关闭远端) { 关闭连接全部Socket(remoteConnWrapper); }
 			// Coordination is finished — NOW answer the client's Close frame, which is the half of
 			// allowHalfOpen the close listener deliberately leaves undone.
-			const 已回送关闭 = closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code);
+			// Only answer the Close frame ourselves in half-open mode. With plain accept() the runtime has
+			// already replied, and calling close() again here is at best redundant.
+			const 已回送关闭 = WS半开拆卸 ? closeSocketQuietly(serverSock, remoteConnWrapper.关闭现场?.ws_code) : true;
 			WS协调收尾完成 = true; // drain done, remote closed, client Close requested
 			// Cancel the force deadline ONLY when the socket has genuinely reached CLOSED. A successful
 			// close() call just means the handshake was REQUESTED — the socket is normally still CLOSING at
@@ -2123,7 +2142,9 @@ async function 处理WS请求(request, yourUUID, url) {
 				追踪拆卸(拆卸追踪, 'teardown_force', 队列瞬时状态(上行写入队列));
 				try { 上行写入队列.清空() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
-				closeSocketQuietly(serverSock); // the drain never finished; answer the Close frame anyway
+				// Only in half-open mode is answering the Close frame ours to do; otherwise the runtime
+				// already did it and the socket may legitimately still be settling.
+				if (WS半开拆卸) closeSocketQuietly(serverSock);
 			}, 拆卸截止毫秒);
 		}
 		// The outbound remote socket is closed by 收尾WS显式传输's finalizer — AFTER the message chain drains
@@ -3851,10 +3872,10 @@ function getDohSubrequestBudget(env = {}) {
 	const configured = Number(raw);
 	if (!Number.isFinite(configured) || configured < 0) return DOH_SUBREQUEST_BUDGET;
 	if (configured === 0) return 0;
-	// Paid Workers allow 10,000 external subrequests per request (Free allows 50), so the knob is clamped to
-	// the platform ceiling. An earlier revision allowed up to 10,000,000 on the mistaken belief that paid
-	// plans went into the millions — a budget above the real limit is not a budget at all.
-	return Math.max(1, Math.min(10000, Math.round(configured)));
+	// Free allows 50 external subrequests per invocation; paid DEFAULTS to 10,000 but is configurable up to
+	// 10,000,000, so the knob is clamped to that configurable ceiling rather than to the default. Clamping
+	// at 10,000 would have capped the setting below what the platform can actually grant.
+	return Math.max(1, Math.min(10_000_000, Math.round(configured)));
 }
 async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, udpContext = null, 追踪 = null) {
 	// Reassemble length-prefixed DNS query frames across calls. Without this each call parsed only its
