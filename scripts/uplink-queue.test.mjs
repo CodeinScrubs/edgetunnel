@@ -127,9 +127,12 @@ await 检查('write-succeeds', { 获取写入器: () => ({ write: async () => { 
 
 // 写入开始/写入结束 drive remoteConnWrapper.活跃写入数; an unbalanced pair makes teardown mis-read how
 // many writes are outstanding. They must stay balanced even when no writer was ever obtained.
+// 统计上行 feeds the uplink byte total in a capture. It must count only bytes whose write RESOLVED --
+// counting on attempt meant a connection that uploaded nothing still reported bytes sent.
 for (const [标签, 获取写入器, 期望计数] of [
 	['balanced-on-success', () => ({ write: async () => { } }), 4],
 	['balanced-without-writer', () => null, 0],
+	['not-counted-when-write-rejects', () => ({ write: async () => { throw new Error('nope'); } }), 0],
 ]) {
 	let 开始 = 0, 结束 = 0, 已计上行 = 0;
 	const q = 建队列({

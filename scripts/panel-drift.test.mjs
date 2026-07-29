@@ -220,10 +220,18 @@ for (const decl of ['const USER_CONFIG = {', 'const ENGINE_DEFAULTS = {']) {
 	const view = viewStart < 0 || viewEnd < 0 ? '' : panelText.slice(viewStart, viewEnd);
 	const helpKeys = new Set([...panelText.matchAll(/\{\s*k\s*:\s*'([A-Z][A-Z0-9_]+)'/g)].map((m) => m[1]));
 	if (!view) configProblems.push('could not read 构建生效设置视图() from the panel build');
-	else for (const key of userKeys) {
-		if (NOT_RUNTIME_SETTINGS.has(key)) continue;
-		if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`${key} is missing from the panel's effective-settings view`);
-		if (!helpKeys.has(key)) configProblems.push(`${key} is missing from the panel's settings help list`);
+	else {
+		for (const key of userKeys) {
+			if (NOT_RUNTIME_SETTINGS.has(key)) continue;
+			if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`${key} is missing from the panel's effective-settings view`);
+			if (!helpKeys.has(key)) configProblems.push(`${key} is missing from the panel's settings help list`);
+		}
+		// And the mirror direction. The panel renders ONLY from ENV_SETTINGS, so a key in the view with no
+		// ENV_SETTINGS entry is invisible in the UI (that is how UUID_SOURCE reached /admin/env.json and
+		// nowhere else), and a row whose key the view does not answer renders a permanently blank value.
+		for (const key of helpKeys) {
+			if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`the panel renders a row for ${key} but the effective-settings view never returns it, so it shows blank`);
+		}
 	}
 }
 

@@ -109,7 +109,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-07-29 src:c699bd86a1d9 panel';
+const Version = '2026-07-29 src:656bff20bda5 panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -375,10 +375,14 @@ export default {
 		// and every tunnel attempt fails authentication with nothing anywhere explaining why. Shape is still
 		// enforced (8-4-4-4-12 hex); only the version/variant constraint is dropped.
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+		// The nil UUID is shape-valid but is a publicly known constant, so as a tunnel credential it is
+		// equivalent to having none at all. Reject it rather than let it look configured.
+		const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 		const envUUID = env.UUID || env.uuid;
-		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(String(envUUID).trim());
-		if (envUUID && !envUUID可用) log('[Identity] The configured UUID is not a canonical 8-4-4-4-12 UUID and was IGNORED; falling back to the derived identity. Clients using that UUID will fail to authenticate.');
-		const userID = envUUID可用 ? String(envUUID).trim().toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+		const envUUID规范 = String(envUUID ?? '').trim().toLowerCase();
+		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(envUUID规范) && envUUID规范 !== NIL_UUID;
+		if (envUUID && !envUUID可用) log('[Identity] The configured UUID was IGNORED (not a canonical 8-4-4-4-12 UUID, or the nil UUID); falling back to the derived identity. Clients using that UUID will fail to authenticate. The panel shows this as UUID_SOURCE.');
+		const userID = envUUID可用 ? envUUID规范 : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
 		let hosts;
 		if (env.HOST) {
 			const hostConfigKey = String(env.HOST);
@@ -4513,9 +4517,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				try {
 					const writer = 获取写入器();
 					if (!writer) throw new Error(`${名称}: remote writer unavailable`);
-					// Count only once a writer actually exists. Counting at bundle() time reported uplink traffic for
-					// chunks that were never handed to a socket at all.
-					if (统计上行) 统计上行(item.chunk.byteLength);
 					// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
 					// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
 					// first packet while later bytes may already be on the wire.
@@ -4534,6 +4535,11 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						throw err;
 					}
 					已交付远端字节 = true;
+					// Count AFTER the write resolves. Counting before it meant a rejected write still incremented
+					// the uplink byte total, so a connection that uploaded nothing could report bytes sent — the
+					// opposite of what you want when reading a capture to answer "did the upload work". Bytes
+					// still in flight are visible separately as inFlightBytes.
+					if (统计上行) { try { 统计上行(item.chunk.byteLength); } catch (e) { } }
 					try { 上行活动?.(); } catch (e) { }
 					settleCompletions(completions);
 				} catch (err) {
@@ -10017,6 +10023,7 @@ th{color:var(--muted);font-weight:500}
 .envcur{font-size:.72rem;color:var(--muted);margin:.1rem 0 .05rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
 .envcur .envval{color:var(--ink)}
 .envbadge{font-size:.62rem;padding:.03rem .4rem;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+.envro{font-size:.68rem;color:var(--muted);font-style:italic;padding:.1rem 0}
 .envbadge.set{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 .envbadge.def{color:var(--muted)}
 .tip{display:inline-flex;align-items:center;justify-content:center;min-width:1.15em;height:1.15em;border-radius:50%;background:var(--muted);color:var(--panel);font-size:.7rem;font-weight:700;font-style:normal;cursor:help;position:relative;outline:none;flex:none;user-select:none}
@@ -10466,6 +10473,8 @@ $('lg-run').addEventListener('click',loadLogs);
 function loadLogs(){say($('m-lg'),'Loading...',true);fetch('/admin/log.json?limit='+encodeURIComponent($('lg-limit').value)).then(function(r){return r.json()}).then(function(j){var rows=Array.isArray(j)?j:(j&&Array.isArray(j.logs)?j.logs:null);if(!rows){$('lg-out').innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>';return clr($('m-lg'))}if(!rows.length){$('lg-out').innerHTML='<small class="note">No entries.</small>';return clr($('m-lg'))}var cols=Object.keys(rows[0]);var h='<table><thead><tr>';cols.forEach(function(c){h+='<th>'+esc(c)+'</th>'});h+='</tr></thead><tbody>';rows.forEach(function(r){h+='<tr>';cols.forEach(function(c){var v=r[c];h+='<td>'+esc(typeof v==='object'?JSON.stringify(v):v)+'</td>'});h+='</tr>'});$('lg-out').innerHTML=h+'</tbody></table>';say($('m-lg'),rows.length+' entries.',true)}).catch(function(e){say($('m-lg'),'Load failed: '+e.message,false)})}
 
 var ENV_SETTINGS=[
+ {g:'Identity'},
+ {k:'UUID_SOURCE',ro:1,d:'read-only',h:'Whether the tunnel identity came from an explicit UUID you set, was derived from ADMIN/KEY because no UUID is set, or whether a UUID you DID set was rejected for not being a canonical 8-4-4-4-12 value. A rejected UUID is not an error you can see anywhere else: the worker keeps serving on the derived identity, so clients configured with your UUID simply fail to authenticate. The credential itself is never shown here.'},
  {g:'Performance & stability'},
  {k:'DIRECT_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Drop a direct connection that opens but never sends a byte (a silent blackhole) after this many ms, so the client re-dials. OFF by default: a fixed deadline can cut a server that legitimately takes several seconds for its first byte (AI inference, a slow API), so enable it only if your workload has no slow-first-byte servers. Setting 0 also = off; a positive value is honored (clamped 1-15s).'},
  {k:'PROXY_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Same idea for the relay path. OFF by default for the same reason. Setting 0 = off; a positive value is honored (clamped 1-15s).'},
@@ -10516,7 +10525,9 @@ var ENV_SETTINGS=[
  var host=$('envrows'); if(!host)return; var h='';
  ENV_SETTINGS.forEach(function(s){
   if(s.g){h+='<div class="envgroup">'+esc(s.g)+'</div>';return}
-  h+='<div class="envrow"><div class="envlabel">'+esc(s.k)+'<span class="tip" tabindex="0" data-tip="'+esc(s.h)+'">i</span></div><div class="envcur" id="envcur_'+s.k+'">&nbsp;</div><input id="env_'+s.k+'" placeholder="override (default '+esc(s.d)+')" autocomplete="off"></div>';
+  // s.ro marks a read-only DIAGNOSTIC: it reports state the worker computed, not an environment
+  // variable you can set, so it gets no override input and never appears in generated env text.
+  h+='<div class="envrow"><div class="envlabel">'+esc(s.k)+'<span class="tip" tabindex="0" data-tip="'+esc(s.h)+'">i</span></div><div class="envcur" id="envcur_'+s.k+'">&nbsp;</div>'+(s.ro?'<div class="envro">read-only</div>':'<input id="env_'+s.k+'" placeholder="override (default '+esc(s.d)+')" autocomplete="off">')+'</div>';
  });
  host.innerHTML=h;
 })();
@@ -10532,13 +10543,13 @@ function loadEnv(){
  }).catch(function(){});
 }
 $('env-gen').addEventListener('click',function(){
- var lines=[]; ENV_SETTINGS.forEach(function(s){if(s.g)return;var el=$('env_'+s.k);var v=el?el.value.trim():'';if(v)lines.push(s.k+'='+v)});
+ var lines=[]; ENV_SETTINGS.forEach(function(s){if(s.g||s.ro)return;var el=$('env_'+s.k);var v=el?el.value.trim():'';if(v)lines.push(s.k+'='+v)});
  var out=$('env-out'),m=$('m-env');
  if(!lines.length){out.hidden=true;return say(m,'Nothing to generate - every field is blank, so all defaults apply.',false)}
  out.hidden=false; out.textContent=lines.join('\\n');
  say(m,lines.length+(lines.length>1?' variables':' variable')+' ready - paste into Cloudflare, your Worker, Settings, Variables, then redeploy.',true);
 });
-$('env-clear').addEventListener('click',function(){ENV_SETTINGS.forEach(function(s){if(s.g)return;var el=$('env_'+s.k);if(el)el.value=''});$('env-out').hidden=true;clr($('m-env'))});
+$('env-clear').addEventListener('click',function(){ENV_SETTINGS.forEach(function(s){if(s.g||s.ro)return;var el=$('env_'+s.k);if(el)el.value=''});$('env-out').hidden=true;clr($('m-env'))});
 
 function qrEncode(text) {
 	var EXP = new Array(256), LOG = new Array(256);

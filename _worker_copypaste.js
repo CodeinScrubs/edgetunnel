@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:bee3fce7443c
+// Build: 2026-07-29 src:93833e48b5ab
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:bee3fce7443c';
+const Version = '2026-07-29 src:93833e48b5ab';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -381,10 +381,14 @@ export default {
 		// and every tunnel attempt fails authentication with nothing anywhere explaining why. Shape is still
 		// enforced (8-4-4-4-12 hex); only the version/variant constraint is dropped.
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+		// The nil UUID is shape-valid but is a publicly known constant, so as a tunnel credential it is
+		// equivalent to having none at all. Reject it rather than let it look configured.
+		const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 		const envUUID = env.UUID || env.uuid;
-		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(String(envUUID).trim());
-		if (envUUID && !envUUID可用) log('[Identity] The configured UUID is not a canonical 8-4-4-4-12 UUID and was IGNORED; falling back to the derived identity. Clients using that UUID will fail to authenticate.');
-		const userID = envUUID可用 ? String(envUUID).trim().toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+		const envUUID规范 = String(envUUID ?? '').trim().toLowerCase();
+		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(envUUID规范) && envUUID规范 !== NIL_UUID;
+		if (envUUID && !envUUID可用) log('[Identity] The configured UUID was IGNORED (not a canonical 8-4-4-4-12 UUID, or the nil UUID); falling back to the derived identity. Clients using that UUID will fail to authenticate. The panel shows this as UUID_SOURCE.');
+		const userID = envUUID可用 ? envUUID规范 : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
 		let hosts;
 		if (env.HOST) {
 			const hostConfigKey = String(env.HOST);
@@ -4508,9 +4512,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				try {
 					const writer = 获取写入器();
 					if (!writer) throw new Error(`${名称}: remote writer unavailable`);
-					// Count only once a writer actually exists. Counting at bundle() time reported uplink traffic for
-					// chunks that were never handed to a socket at all.
-					if (统计上行) 统计上行(item.chunk.byteLength);
 					// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
 					// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
 					// first packet while later bytes may already be on the wire.
@@ -4529,6 +4530,11 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						throw err;
 					}
 					已交付远端字节 = true;
+					// Count AFTER the write resolves. Counting before it meant a rejected write still incremented
+					// the uplink byte total, so a connection that uploaded nothing could report bytes sent — the
+					// opposite of what you want when reading a capture to answer "did the upload work". Bytes
+					// still in flight are visible separately as inFlightBytes.
+					if (统计上行) { try { 统计上行(item.chunk.byteLength); } catch (e) { } }
 					try { 上行活动?.(); } catch (e) { }
 					settleCompletions(completions);
 				} catch (err) {
