@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:b8ae2a129399
+// Build: 2026-07-29 src:7cfabb6176da
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:b8ae2a129399';
+const Version = '2026-07-29 src:7cfabb6176da';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -614,7 +614,8 @@ export default {
 									if (!ip || !loc) throw new Error('Proxy check response is invalid');
 									检测代理响应 = { success: true, proxy: 代理协议 + "://" + 完整代理参数, ip, loc, responseTime: Date.now() - startTime };
 								} finally {
-									try { tlsSocket ? tlsSocket.close() : await tcpSocket?.close?.() } catch (e) { }
+									// The TLS branch was never awaited, so its async rejection bypassed this try/catch entirely.
+									if (tlsSocket) closeRemoteSocketQuietly(tlsSocket); else closeRemoteSocketQuietly(tcpSocket);
 								}
 							} catch (error) {
 								检测代理响应 = { success: false, error: error.message, proxy: 代理协议 + "://" + 完整代理参数, responseTime: Date.now() - startTime };
@@ -1646,7 +1647,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					let 半关闭写入器 = null;
 					try {
 						半关闭写入器 = 半关闭Socket.writable.getWriter();
-						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => { try { 半关闭Socket.close() } catch (e) { } });
+						await withOperationTimeout(半关闭写入器.close(), 10000, 'gRPC upstream half-close timed out', () => closeRemoteSocketQuietly(半关闭Socket));
 					} catch (e) {
 						// On ANY half-close failure (immediate reject or timeout), close THIS socket so the downstream
 						// read side ends and the awaited pipe below can't hang on a peer that never EOFs.
@@ -6026,7 +6027,11 @@ class TlsClient {
 			}
 		}
 	}
-	close() { this.socket.close() }
+	// Guard the UNDERLYING socket here, not just at the call sites. Socket.close() returns Promise<void>;
+	// this method used to call it and discard the result, so `closeRemoteSocketQuietly(tlsSocket)` received
+	// undefined and protected nothing — the rejection still escaped. Converting call sites to a helper is
+	// useless when the wrapper itself loses the promise.
+	close() { closeRemoteSocketQuietly(this.socket) }
 }
 
 function stripIPv6Brackets(hostname = '') {
@@ -6302,7 +6307,7 @@ async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
 				});
 			},
 			cancel() {
-				try { dataReader?.cancel?.() } catch (e) { }
+				cancelReaderQuietly(dataReader);
 				releaseDataReader();
 				close();
 			}
