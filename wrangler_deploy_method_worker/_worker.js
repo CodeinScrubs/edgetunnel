@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:c77290c464d9
+// Build: 2026-07-29 src:ca1690698782
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:c77290c464d9';
+const Version = '2026-07-29 src:ca1690698782';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -726,7 +726,11 @@ export default {
 
 					ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
 					return fetchEnglishStaticPage('/admin' + url.search);
-				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {
+				// UUID规范格式 is the shared shape check. This used to reference a local `uuidRegex` that was
+				// removed when identity resolution moved into 解析显式UUID -- leaving a ReferenceError here that
+				// the top-level catch swallowed into the camouflage page, silently making /locations and
+				// /robots.txt unreachable for any path that was not literally "logout".
+				} else if (访问路径 === 'logout' || UUID规范格式.test(访问路径)) {
 					const 响应 = new Response('Redirecting...', { status: 302, headers: { 'Location': '/login' } });
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;

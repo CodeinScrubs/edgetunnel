@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-29 src:80adc132e2bb panel';
+const Version = '2026-07-29 src:07fa92178a54 panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -423,11 +423,6 @@ export default {
 		}
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
-		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
-		// DEBUG_LEGACY_TEXT=0 silences the verbose human-readable `log()` lines while keeping the structured
-		// tracer events. The two together doubled tail volume and pushed wrangler tail into sampling mode (which
-		// drops messages) — structured-only mode roughly halves output and CPU. Warnings/errors still print.
-		抑制旧文本日志 = 调试日志打印 && ['0', 'false', 'off'].includes(String(env.DEBUG_LEGACY_TEXT ?? '').toLowerCase());
 		workerRequestContext.tunnel = await createTunnelContext(request, env);
 		const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || 'unknown-ip';
 		// Tunnel path gate: when a non-root PATH is set, only requests under that path may enter the
@@ -749,7 +744,11 @@ export default {
 
 					ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
 					return 渲染管理页();
-				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {
+				// UUID规范格式 is the shared shape check. This used to reference a local `uuidRegex` that was
+				// removed when identity resolution moved into 解析显式UUID -- leaving a ReferenceError here that
+				// the top-level catch swallowed into the camouflage page, silently making /locations and
+				// /robots.txt unreachable for any path that was not literally "logout".
+				} else if (访问路径 === 'logout' || UUID规范格式.test(访问路径)) {
 					const 响应 = new Response('Redirecting...', { status: 302, headers: { 'Location': '/login' } });
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;

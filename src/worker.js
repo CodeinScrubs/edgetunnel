@@ -612,7 +612,11 @@ export default {
 
 					ctx?.waitUntil?.(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
 					return fetchEnglishStaticPage('/admin' + url.search);
-				} else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {
+				// UUID规范格式 is the shared shape check. This used to reference a local `uuidRegex` that was
+				// removed when identity resolution moved into 解析显式UUID -- leaving a ReferenceError here that
+				// the top-level catch swallowed into the camouflage page, silently making /locations and
+				// /robots.txt unreachable for any path that was not literally "logout".
+				} else if (访问路径 === 'logout' || UUID规范格式.test(访问路径)) {
 					const 响应 = new Response('Redirecting...', { status: 302, headers: { 'Location': '/login' } });
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;

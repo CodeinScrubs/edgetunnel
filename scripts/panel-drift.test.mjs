@@ -204,6 +204,58 @@ const NOT_RUNTIME_SETTINGS = new Set([
 	'FIRST_BYTE_TIMEOUT_MS',
 ]);
 
+// ---------------------------------------------------------------------------------------------------
+// The entry handler. `export default { async fetch(...) }` is not a NAMED top-level function, so the
+// function scan above never looked at it -- and a stale copy of the debug-flag initialisation survived
+// there in the panel build, assigning the same module state twice. The handlers cannot be compared
+// wholesale (the panel serves its admin UI inline and the canonical build fetches an external page), so
+// pin the invariants that a diverging copy actually violates: statements that must appear exactly once,
+// and anchor counts that must agree across builds.
+// ---------------------------------------------------------------------------------------------------
+function entryHandler(text) {
+	const start = text.indexOf('export default {');
+	if (start < 0) return null;
+	const open = text.indexOf('{', start);
+	const end = scanEndOfBlock(text, open);
+	return end < 0 ? null : text.slice(start, end);
+}
+
+// Assigning module-level mutable state twice in one request is always either dead code or a bug.
+const ASSIGN_EXACTLY_ONCE = [
+	['调试日志打印', /^\s*调试日志打印 = \[/gm],
+	['抑制旧文本日志', /^\s*抑制旧文本日志 = 调试日志打印/gm],
+];
+// Statements whose count must be IDENTICAL in every build, even though the handlers differ overall.
+const ENTRY_ANCHORS = [
+	['env merge', /env = applyUserConfigDefaults\(env\);/g],
+	['identity resolution', /解析显式UUID\(env\.UUID \|\| env\.uuid\)/g],
+	['derived-identity fallback', /await MD5MD5\(身份种子 \+ 加密秘钥\)/g],
+	['/version handler', /const 版本日期 = String\(Version\)\.match/g],
+	['tunnel context creation', /workerRequestContext\.tunnel = await createTunnelContext/g],
+	['WS dispatch', /return await 处理WS请求\(/g],
+	['gRPC dispatch', /return await 处理gRPC请求\(/g],
+	['XHTTP dispatch', /return await 处理XHTTP请求\(/g],
+];
+
+const entryProblems = [];
+{
+	const entries = { [CANONICAL]: entryHandler(canonicalText), [PANEL]: entryHandler(panelText) };
+	for (const [file, body] of Object.entries(entries)) {
+		if (!body) { entryProblems.push(`could not locate the default fetch handler in ${file}`); continue; }
+		for (const [label, re] of ASSIGN_EXACTLY_ONCE) {
+			const n = (body.match(re) || []).length;
+			if (n !== 1) entryProblems.push(`${file}: ${label} is assigned ${n} time(s) in the entry handler, expected exactly 1`);
+		}
+	}
+	if (entries[CANONICAL] && entries[PANEL]) {
+		for (const [label, re] of ENTRY_ANCHORS) {
+			const a = (entries[CANONICAL].match(re) || []).length;
+			const b = (entries[PANEL].match(re) || []).length;
+			if (a !== b) entryProblems.push(`entry handler: ${label} appears ${a}x in the canonical build but ${b}x in the deployed panel build`);
+		}
+	}
+}
+
 const configProblems = [];
 for (const decl of ['const USER_CONFIG = {', 'const ENGINE_DEFAULTS = {']) {
 	const a = objectKeys(canonicalText, decl), b = objectKeys(panelText, decl);
@@ -257,6 +309,13 @@ if (unbounded.length) {
 	console.error(`[panel-drift] FAIL: could not determine the extent of ${unbounded.length} function(s): ${unbounded.join(', ')}`);
 	process.exit(1);
 }
+if (entryProblems.length) {
+	console.error(`[panel-drift] FAIL: entry-handler drift (${entryProblems.length}):`);
+	for (const p of entryProblems) console.error(`  - ${p}`);
+	process.exit(1);
+}
+console.log('[panel-drift] OK: the entry fetch handler agrees across builds');
+
 if (configProblems.length) {
 	console.error(`[panel-drift] FAIL: configuration drift (${configProblems.length}):`);
 	for (const p of configProblems) console.error(`  - ${p}`);
