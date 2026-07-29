@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:90376304e68a
+// Build: 2026-07-29 src:07a2fce62fa2
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -12,6 +12,7 @@ const USER_CONFIG = {
 	GO2SOCKS5: undefined,
 	URL: undefined,
 	DEBUG: undefined,
+	DEBUG_LEGACY_TEXT: undefined,
 	ENABLE_KV_LOG: undefined,
 	OFF_LOG: undefined,
 	ENABLE_KV_PROXY_CACHE: undefined,
@@ -19,6 +20,7 @@ const USER_CONFIG = {
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
 	DNS_TOTAL_TIMEOUT_MS: undefined,
+	DOH_SUBREQUEST_BUDGET: undefined,
 	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
@@ -32,6 +34,10 @@ const USER_CONFIG = {
 	SUB_UPDATE_TIME: undefined,
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
 	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
+	// Uplink queue backstops. Env-readable since the queue factory took its caps as parameters, but absent
+	// from every declared surface until now, so nothing documented that they were tunable at all.
+	UPLINK_QUEUE_MAX_BYTES: undefined,
+	UPLINK_QUEUE_MAX_ITEMS: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	IDLE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
@@ -107,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:90376304e68a';
+const Version = '2026-07-29 src:07a2fce62fa2';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -402,13 +408,21 @@ export default {
 		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
-			// Version is now a build stamp ("<time> (<sha>[-dirty])"), not a bare date. Stripping every
-			// non-digit merged the timestamp with the digits inside the hex SHA and produced a 19-digit value
-			// past Number.MAX_SAFE_INTEGER, which silently lost precision and did not even round-trip. Take
-			// only the LEADING timestamp digits (14 -> ~2e13, safely inside the integer range) for the numeric
-			// field callers may compare, and return the full stamp separately so a log can be tied to a build.
-			const 版本数字 = Number((String(Version).match(/\d/g) || []).slice(0, 14).join('')) || 0;
-			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+			// Version is a build stamp ("YYYY-MM-DD src:<hash>"), not a bare date, so the numeric field has to
+			// be parsed structurally rather than by scraping digits.
+			//
+			// Two earlier attempts were both wrong. Stripping every non-digit merged the date with the digits
+			// inside the hex hash into a 19-digit value past Number.MAX_SAFE_INTEGER, which lost precision and
+			// did not round-trip. Taking the first 14 digits then looked safe but silently kept 6 hash digits,
+			// because the date only supplies 8 -- so the value moved unpredictably between builds of the same
+			// day, and its MAGNITUDE changed with the hash: an all-hex-letter hash contributes no digits at all
+			// and collapses the result to 20260729, which sorts below builds from years earlier.
+			//
+			// Only the date is genuinely numeric and ordered, so parse exactly that and let the full stamp --
+			// which already identifies the artifact precisely via its source hash -- travel as a string.
+			const 版本日期 = String(Version).match(/^(\d{4})-(\d{2})-(\d{2})\b/);
+			const 版本数字 = 版本日期 ? Number(版本日期[1] + 版本日期[2] + 版本日期[3]) : 0;
+			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
 		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);

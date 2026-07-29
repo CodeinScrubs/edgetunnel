@@ -11,6 +11,7 @@ const USER_CONFIG = {
 	GO2SOCKS5: undefined,
 	URL: undefined,
 	DEBUG: undefined,
+	DEBUG_LEGACY_TEXT: undefined,
 	ENABLE_KV_LOG: undefined,
 	OFF_LOG: undefined,
 	ENABLE_KV_PROXY_CACHE: undefined,
@@ -32,6 +33,10 @@ const USER_CONFIG = {
 	SUB_UPDATE_TIME: undefined,
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
 	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
+	// Uplink queue backstops. Env-readable since the queue factory took its caps as parameters, but absent
+	// from every declared surface until now, so nothing documented that they were tunable at all.
+	UPLINK_QUEUE_MAX_BYTES: undefined,
+	UPLINK_QUEUE_MAX_ITEMS: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	IDLE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
@@ -104,7 +109,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-07-29 src:cced647125ed panel';
+const Version = '2026-07-29 src:51db025c98ff panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -397,13 +402,21 @@ export default {
 		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
-			// Version is now a build stamp ("<time> (<sha>[-dirty])"), not a bare date. Stripping every
-			// non-digit merged the timestamp with the digits inside the hex SHA and produced a 19-digit value
-			// past Number.MAX_SAFE_INTEGER, which silently lost precision and did not even round-trip. Take
-			// only the LEADING timestamp digits (14 -> ~2e13, safely inside the integer range) for the numeric
-			// field callers may compare, and return the full stamp separately so a log can be tied to a build.
-			const 版本数字 = Number((String(Version).match(/\d/g) || []).slice(0, 14).join('')) || 0;
-			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+			// Version is a build stamp ("YYYY-MM-DD src:<hash>"), not a bare date, so the numeric field has to
+			// be parsed structurally rather than by scraping digits.
+			//
+			// Two earlier attempts were both wrong. Stripping every non-digit merged the date with the digits
+			// inside the hex hash into a 19-digit value past Number.MAX_SAFE_INTEGER, which lost precision and
+			// did not round-trip. Taking the first 14 digits then looked safe but silently kept 6 hash digits,
+			// because the date only supplies 8 -- so the value moved unpredictably between builds of the same
+			// day, and its MAGNITUDE changed with the hash: an all-hex-letter hash contributes no digits at all
+			// and collapses the result to 20260729, which sorts below builds from years earlier.
+			//
+			// Only the date is genuinely numeric and ordered, so parse exactly that and let the full stamp --
+			// which already identifies the artifact precisely via its source hash -- travel as a string.
+			const 版本日期 = String(Version).match(/^(\d{4})-(\d{2})-(\d{2})\b/);
+			const 版本数字 = 版本日期 ? Number(版本日期[1] + 版本日期[2] + 版本日期[3]) : 0;
+			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
 		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
@@ -10018,6 +10031,10 @@ function 构建生效设置视图(env) {
 		PROXY_FIRST_BYTE_TIMEOUT_MS: { effective: offZero(getProxyFirstByteTimeoutMs(e)), env: raw('PROXY_FIRST_BYTE_TIMEOUT_MS', 'FIRST_BYTE_TIMEOUT_MS') },
 		IDLE_TIMEOUT_MS: { effective: offZero(getIdleTimeoutMs(e)), env: raw('IDLE_TIMEOUT_MS') },
 		UPLINK_WRITE_TIMEOUT_MS: { effective: offZero(getUplinkWriteTimeoutMs(e)), env: raw('UPLINK_WRITE_TIMEOUT_MS') },
+		// The queue caps were env-readable for several releases while being invisible here, so there was no
+		// way to confirm from the panel whether a lowered limit had actually taken effect.
+		UPLINK_QUEUE_MAX_BYTES: { effective: getUplinkQueueMaxBytes(e), env: raw('UPLINK_QUEUE_MAX_BYTES') },
+		UPLINK_QUEUE_MAX_ITEMS: { effective: getUplinkQueueMaxItems(e), env: raw('UPLINK_QUEUE_MAX_ITEMS') },
 		CONNECT_TIMEOUT_MS: { effective: getProxyConnectTimeoutMs(e), env: raw('CONNECT_TIMEOUT_MS') },
 		DIAL_STAGGER_MS: { effective: getDialStaggerMs(e), env: raw('DIAL_STAGGER_MS') },
 		TCP_CONCURRENT_DIAL: { effective: 拨号并发取值(e.TCP_CONCURRENT_DIAL, 2), env: raw('TCP_CONCURRENT_DIAL') },
@@ -10044,6 +10061,8 @@ function 构建生效设置视图(env) {
 		WS_BUFFERED_AMOUNT_MAX_WAIT_MS: { effective: getWsBufferedAmountMaxWaitMs(e), env: raw('WS_BUFFERED_AMOUNT_MAX_WAIT_MS') },
 		GRPC_HALF_CLOSE_ON_EOF: { effective: isGrpcHalfCloseOnEof(e) ? 'on' : 'off', env: raw('GRPC_HALF_CLOSE_ON_EOF') },
 		DEBUG: { effective: flagVal('DEBUG'), env: raw('DEBUG') },
+		DEBUG_LEGACY_TEXT: { effective: !调试日志打印 ? 'n/a (DEBUG off)' : (抑制旧文本日志 ? 'off (structured only)' : 'on'), env: raw('DEBUG_LEGACY_TEXT') },
+		ENABLE_KV_PROXY_CACHE: { effective: isProxyResolutionKvCacheEnabled(e) ? 'on' : 'off', env: raw('ENABLE_KV_PROXY_CACHE', 'KV_PROXY_CACHE') },
 		ENABLE_KV_LOG: { effective: isEnabledEnvFlag(raw('OFF_LOG')) ? 'off (OFF_LOG set)' : flagVal('ENABLE_KV_LOG', 'KV_LOG'), env: raw('ENABLE_KV_LOG', 'KV_LOG') }
 	};
 }
@@ -10420,6 +10439,8 @@ var ENV_SETTINGS=[
  {k:'DIRECT_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Drop a direct connection that opens but never sends a byte (a silent blackhole) after this many ms, so the client re-dials. OFF by default: a fixed deadline can cut a server that legitimately takes several seconds for its first byte (AI inference, a slow API), so enable it only if your workload has no slow-first-byte servers. Setting 0 also = off; a positive value is honored (clamped 1-15s).'},
  {k:'PROXY_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Same idea for the relay path. OFF by default for the same reason. Setting 0 = off; a positive value is honored (clamped 1-15s).'},
  {k:'UPLINK_WRITE_TIMEOUT_MS',d:'0 (off)',h:'Abort an upload write that never completes (a wedged outbound socket). Off by default because a slow-but-alive upload also legitimately blocks writes; enable only if you observe upload freezes.'},
+ {k:'UPLINK_QUEUE_MAX_BYTES',d:'16777216',h:'How many upload bytes one connection may hold in memory when the outbound socket is slower than your client. Past this the connection is dropped rather than letting the queue grow — on the free plan the whole isolate has 128 MB shared across every concurrent request, so an unbounded queue kills OTHER connections too. Lower it (4194304) if large uploads coincide with unrelated connections dying. Clamped 65536-67108864.'},
+ {k:'UPLINK_QUEUE_MAX_ITEMS',d:'4096',h:'The same backstop counted in queued chunks rather than bytes, which catches a flood of tiny writes that would never trip the byte cap. Both limits are checked; whichever is hit first closes the connection. Clamped 16-65536.'},
  {k:'IDLE_TIMEOUT_MS',d:'0 (off)',h:'Close a connection with no traffic for this long. Leave off unless you see stuck sessions; too low kills quiet-but-alive streams like video buffering.'},
  {k:'CONNECT_TIMEOUT_MS',d:'850',h:'Max ms to establish a TCP connection before trying the next candidate. Clamped to 400-5000.'},
  {k:'DIAL_STAGGER_MS',d:'90',h:'Delay before racing the second dial candidate. Lower it on reliable networks for faster failover.'},
@@ -10456,6 +10477,8 @@ var ENV_SETTINGS=[
  {k:'URL',d:'nginx',h:'What non-tunnel visitors see. "nginx" is the built-in decoy page, or set a URL to reverse-proxy a real-looking site.'},
  {g:'Logging'},
  {k:'DEBUG',d:'0',h:'Verbose logging visible in wrangler tail. Keep 0 in production.'},
+ {k:'DEBUG_LEGACY_TEXT',d:'1',h:'Only meaningful while DEBUG=1. Set 0 to emit the structured JSON telemetry without the human-readable text lines, which is what you want when capturing a tail for analysis rather than reading it live. No effect when DEBUG=0.'},
+ {k:'ENABLE_KV_PROXY_CACHE',d:'on',h:'Persist resolved ProxyIP endpoint health to KV so it survives an isolate restart. Set 0 on the free plan if you would rather spend the 1000/day KV write quota on nothing at all — the in-memory cache still works per isolate, it just restarts cold.'},
  {k:'ENABLE_KV_LOG',d:'off',h:'Record request logs to KV (shown on the Logs tab). Consumes free-plan KV write quota.'}
 ];
 (function(){

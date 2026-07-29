@@ -791,4 +791,42 @@ import { join } from 'node:path';
 	assert.match(source, /name = "edgetunnel-benchmark-target"/);
 }
 
+// The /version numeric field has been got wrong twice, both times by scraping digits out of the build
+// stamp. Guard the property that actually matters: the number depends ONLY on the date, so it cannot be
+// perturbed by whatever hex the source hash happens to contain.
+{
+	for (const file of ['_worker_copypaste.js', 'wrangler_deploy_method_worker/_worker.js', 'src_static_ui/worker_test.js']) {
+		const source = readFileSync(file, 'utf8');
+		assert.doesNotMatch(source, /\.match\(\/\\d\/g\)[\s\S]{0,80}?\.slice\(0, 14\)/,
+			`${file}: /version must not scrape leading digits -- 6 hash digits leak in, because the date supplies only 8`);
+		assert.doesNotMatch(source, /Number\(String\(Version\)\.replace\(\/\\D\+\/g, ''\)\)/,
+			`${file}: /version must not strip all non-digits -- that overflows Number.MAX_SAFE_INTEGER`);
+		assert.match(source, /const 版本日期 = String\(Version\)\.match\(\/\^\(\\d\{4\}\)-\(\\d\{2\}\)-\(\\d\{2\}\)\\b\//,
+			`${file}: /version should parse the leading YYYY-MM-DD structurally`);
+		assert.match(source, /Build: String\(Version\)/, `${file}: /version should return the full stamp as Build`);
+	}
+
+	// Behavioural check on the real stamps: same date + different hash must give the same number. The
+	// all-letter hash is the case that exposed the old bug hardest -- it contributes no digits at all.
+	const 取版本数字 = (v) => {
+		const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})\b/);
+		return m ? Number(m[1] + m[2] + m[3]) : 0;
+	};
+	const stamps = ['2026-07-29 src:cced647125ed', '2026-07-29 src:0aa1b2c3d4e5', '2026-07-29 src:ffffffffffff panel'];
+	const values = stamps.map(取版本数字);
+	assert.equal(new Set(values).size, 1, `same-day builds must yield one version number, got ${values.join(', ')}`);
+	assert.equal(values[0], 20260729);
+	assert.ok(Number.isSafeInteger(values[0]), 'version number must be a safe integer');
+	assert.ok(取版本数字('2026-08-01 src:000000000000') > 取版本数字('2026-07-29 src:ffffffffffff'),
+		'a later build must sort above an earlier one regardless of hash content');
+	assert.equal(取版本数字(''), 0, 'an unparseable stamp must yield 0, never NaN');
+
+	// Every shipped build must actually carry a parseable stamp.
+	for (const file of ['_worker_copypaste.js', 'wrangler_deploy_method_worker/_worker.js', 'src_static_ui/worker_test.js']) {
+		const stamp = readFileSync(file, 'utf8').match(/^const Version = '([^']*)';/m);
+		assert.ok(stamp, `${file}: missing Version literal`);
+		assert.ok(取版本数字(stamp[1]) > 20200101, `${file}: Version stamp "${stamp[1]}" does not start with a parseable date`);
+	}
+}
+
 console.log('tooling tests passed');

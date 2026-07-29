@@ -153,8 +153,79 @@ const stripComments = (s) => s
 	.filter(Boolean)
 	.join('\n');
 
-const canonical = extractAll(readFileSync(CANONICAL, 'utf8'));
-const panel = extractAll(readFileSync(PANEL, 'utf8'));
+const canonicalText = readFileSync(CANONICAL, 'utf8');
+const panelText = readFileSync(PANEL, 'utf8');
+const canonical = extractAll(canonicalText);
+const panel = extractAll(panelText);
+
+// ---------------------------------------------------------------------------------------------------
+// Configuration parity. Function parity does NOT imply this: USER_CONFIG and ENGINE_DEFAULTS are object
+// literals, and the panel's settings surfaces are an object literal plus an array of help entries, so a
+// function-level comparison is blind to all of them. That blindness is not theoretical -- the panel's
+// USER_CONFIG had gained DOH_SUBREQUEST_BUDGET that src/core/config.js never got, and the uplink queue
+// caps were env-readable while appearing in no declared surface at all.
+// ---------------------------------------------------------------------------------------------------
+function objectKeys(text, declaration) {
+	const start = text.indexOf(declaration);
+	if (start < 0) return null;
+	const open = text.indexOf('{', start);
+	const end = scanEndOfBlock(text, open);
+	if (end < 0) return null;
+	// Top-level keys only, so nested object values cannot contribute phantom names.
+	const body = text.slice(open + 1, end - 1);
+	const keys = [];
+	let depth = 0;
+	for (const line of body.split('\n')) {
+		const trimmed = line.trim();
+		if (depth === 0) {
+			const m = trimmed.match(/^([A-Za-z_$][\w$]*)\s*:/);
+			if (m) keys.push(m[1]);
+		}
+		for (const c of trimmed) {
+			if (c === '{' || c === '[') depth++;
+			else if (c === '}' || c === ']') depth--;
+		}
+	}
+	return keys;
+}
+
+// Keys that legitimately do not appear in the panel's runtime settings view.
+//   credentials/identity -- echoing these into /admin/env.json would leak them
+//   subscription generation -- they shape emitted client configs, not the running data plane
+//   FIRST_BYTE_TIMEOUT_MS -- superseded by the DIRECT_/PROXY_ pair, which already show it as their
+//                            fallback env source, so listing it again would imply it still acts alone
+const NOT_RUNTIME_SETTINGS = new Set([
+	'ADMIN', 'KEY', 'UUID', 'HOST',
+	'TRANSPORT', 'FP', 'FINGERPRINT', 'GRPC_MODE', 'GRPC_USER_AGENT', 'SUBNAME', 'SUB_UPDATE_TIME',
+	'FIRST_BYTE_TIMEOUT_MS',
+]);
+
+const configProblems = [];
+for (const decl of ['const USER_CONFIG = {', 'const ENGINE_DEFAULTS = {']) {
+	const a = objectKeys(canonicalText, decl), b = objectKeys(panelText, decl);
+	if (!a || !b) { configProblems.push(`could not read ${decl.slice(6, -4).trim()} from both builds`); continue; }
+	const onlyCanonical = a.filter((k) => !b.includes(k));
+	const onlyPanel = b.filter((k) => !a.includes(k));
+	const name = decl.slice(6, -4).trim();
+	if (onlyCanonical.length) configProblems.push(`${name}: missing from the panel build: ${onlyCanonical.join(', ')}`);
+	if (onlyPanel.length) configProblems.push(`${name}: present only in the panel build: ${onlyPanel.join(', ')}`);
+}
+
+// Every operator-tunable USER_CONFIG key must be observable and documented in the panel, otherwise a
+// setting can be honoured by the code while the operator has no way to confirm it took effect.
+{
+	const userKeys = objectKeys(panelText, 'const USER_CONFIG = {') || [];
+	const viewStart = panelText.indexOf('function 构建生效设置视图(');
+	const viewEnd = viewStart < 0 ? -1 : scanEndOfBlock(panelText, panelText.indexOf('{', viewStart));
+	const view = viewStart < 0 || viewEnd < 0 ? '' : panelText.slice(viewStart, viewEnd);
+	const helpKeys = new Set([...panelText.matchAll(/\{\s*k\s*:\s*'([A-Z][A-Z0-9_]+)'/g)].map((m) => m[1]));
+	if (!view) configProblems.push('could not read 构建生效设置视图() from the panel build');
+	else for (const key of userKeys) {
+		if (NOT_RUNTIME_SETTINGS.has(key)) continue;
+		if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`${key} is missing from the panel's effective-settings view`);
+		if (!helpKeys.has(key)) configProblems.push(`${key} is missing from the panel's settings help list`);
+	}
+}
 
 const missing = [], differs = [], allowedVariants = [];
 for (const [name, body] of canonical.fns) {
@@ -174,6 +245,13 @@ if (unbounded.length) {
 	console.error(`[panel-drift] FAIL: could not determine the extent of ${unbounded.length} function(s): ${unbounded.join(', ')}`);
 	process.exit(1);
 }
+if (configProblems.length) {
+	console.error(`[panel-drift] FAIL: configuration drift (${configProblems.length}):`);
+	for (const p of configProblems) console.error(`  - ${p}`);
+	process.exit(1);
+}
+console.log('[panel-drift] OK: USER_CONFIG / ENGINE_DEFAULTS keys match and every tunable is shown in the panel');
+
 if (missing.length) console.error(`[panel-drift] FAIL: missing from the deployed panel build: ${missing.join(', ')}`);
 if (differs.length) console.error(`[panel-drift] FAIL: the deployed panel build has drifted in: ${differs.join(', ')}`);
 if (missing.length || differs.length) {

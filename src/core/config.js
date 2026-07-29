@@ -9,6 +9,7 @@ export const USER_CONFIG = {
 	GO2SOCKS5: undefined,
 	URL: undefined,
 	DEBUG: undefined,
+	DEBUG_LEGACY_TEXT: undefined,
 	ENABLE_KV_LOG: undefined,
 	OFF_LOG: undefined,
 	ENABLE_KV_PROXY_CACHE: undefined,
@@ -16,6 +17,7 @@ export const USER_CONFIG = {
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
 	DNS_TOTAL_TIMEOUT_MS: undefined,
+	DOH_SUBREQUEST_BUDGET: undefined,
 	DIAL_STAGGER_MS: undefined,
 	DNS_SERVER: undefined,
 	DOH_URL: undefined,
@@ -29,6 +31,10 @@ export const USER_CONFIG = {
 	SUB_UPDATE_TIME: undefined,
 	DOWNLINK_BACKPRESSURE_HWM_BYTES: undefined,
 	DOWNLINK_GRAIN_PACKET_BYTES: undefined,
+	// Uplink queue backstops. Env-readable since the queue factory took its caps as parameters, but absent
+	// from every declared surface until now, so nothing documented that they were tunable at all.
+	UPLINK_QUEUE_MAX_BYTES: undefined,
+	UPLINK_QUEUE_MAX_ITEMS: undefined,
 	FIRST_BYTE_TIMEOUT_MS: undefined,
 	IDLE_TIMEOUT_MS: undefined,
 	PROXYIP_FALLBACK: undefined,
