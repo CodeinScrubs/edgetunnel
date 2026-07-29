@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:07a2fce62fa2
+// Build: 2026-07-29 src:b11744877b1e
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:07a2fce62fa2';
+const Version = '2026-07-29 src:b11744877b1e';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -4485,19 +4485,29 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 				if (closed) break;
 				const item = bundle();
 				if (!item) break;
-				inFlightBytes += item.chunk.byteLength;
-				if (统计上行) 统计上行(item.chunk.byteLength);
-				if (统计 && inFlightBytes > 统计.maxInFlightBytes) 统计.maxInFlightBytes = inFlightBytes;
-				let writer = 获取写入器();
-				if (!writer) throw new Error(`${名称}: remote writer unavailable`);
+				// bundle() has ALREADY removed this item from `chunks`, so from here until it settles the queue can
+				// reach its completions ONLY through activeCompletions. Claim that ownership before anything that
+				// can throw. Acquiring the writer used to come first, and when it returned null — exactly what the
+				// WS and gRPC getters do once remoteConnWrapper.socket is gone — the item existed in neither place:
+				// rejectQueued() iterates `chunks` and could not see it, clear() settles activeCompletions and could
+				// not see it, so the awaiting 写入并等待() promise stayed pending forever and parked that transport's
+				// upload loop. Every transport uses 写入并等待(), so this was the normal path, not an edge case.
 				const completions = item.completions || null;
 				activeCompletions = completions;
-				// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
-				// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
-				// first packet while later bytes may already be on the wire.
-				try { 写入开始?.(); } catch (e) { }
-				const 写入开始时刻 = 统计 ? Date.now() : 0;
+				inFlightBytes += item.chunk.byteLength;
+				if (统计 && inFlightBytes > 统计.maxInFlightBytes) 统计.maxInFlightBytes = inFlightBytes;
+				let 写入已开始 = false;
 				try {
+					const writer = 获取写入器();
+					if (!writer) throw new Error(`${名称}: remote writer unavailable`);
+					// Count only once a writer actually exists. Counting at bundle() time reported uplink traffic for
+					// chunks that were never handed to a socket at all.
+					if (统计上行) 统计上行(item.chunk.byteLength);
+					// Mark uplink delivery ambiguous the moment the write STARTS (not when it resolves): a write still
+					// pending when the remote EOFs has uncertain delivery, so the no-data fallback must not replay the
+					// first packet while later bytes may already be on the wire.
+					try { 写入开始?.(); 写入已开始 = true; } catch (e) { }
+					const 写入开始时刻 = 统计 ? Date.now() : 0;
 					try {
 						await 执行远端写入(writer, item.chunk);
 						if (统计) { const wms = Date.now() - 写入开始时刻; if (wms > 统计.maxWriteMs) 统计.maxWriteMs = wms; }
@@ -4517,7 +4527,9 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 					settleCompletions(completions, err);
 					throw err;
 				} finally {
-					try { 写入结束?.(); } catch (e) { }
+					// 写入结束 fires only if 写入开始 did, otherwise remoteConnWrapper.活跃写入数 drifts and the
+					// teardown path mis-reads how many writes are still outstanding.
+					if (写入已开始) { try { 写入结束?.(); } catch (e) { } }
 					inFlightBytes -= item.chunk.byteLength;
 					if (inFlightBytes < 0) inFlightBytes = 0;
 					if (activeCompletions === completions) activeCompletions = null;
