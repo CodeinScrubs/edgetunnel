@@ -3539,8 +3539,14 @@ function 读取DNS线缓存(key, query) {
 	const cached = DNS_WIRE_CACHE.get(key);
 	if (!cached) return null;
 	const now = Date.now();
-	if (cached.expiresAt <= now) { DNS_WIRE_CACHE.delete(key); return null; }
-	DNS_WIRE_CACHE.delete(key); DNS_WIRE_CACHE.set(key, cached); // LRU touch
+	// Expiry must decrement the byte counter too, or it drifts upward until eviction runs constantly.
+	if (cached.expiresAt <= now) {
+		DNS_WIRE_CACHE.delete(key);
+		DNS_WIRE_CACHE线缓存字节 -= (cached.msg?.byteLength || 0);
+		if (DNS_WIRE_CACHE线缓存字节 < 0) DNS_WIRE_CACHE线缓存字节 = 0;
+		return null;
+	}
+	DNS_WIRE_CACHE.delete(key); DNS_WIRE_CACHE.set(key, cached); // LRU touch (byte total unchanged)
 	const q = 数据转Uint8Array(query);
 	const out = new Uint8Array(cached.msg);
 	out[0] = q[0]; out[1] = q[1]; // restore the caller's transaction ID into the cached response
@@ -3608,8 +3614,23 @@ function 写入DNS线缓存(key, msg) {
 	stored[0] = 0; stored[1] = 0;
 	const now = Date.now();
 	// cachedAt lets 读取DNS线缓存 age each record's TTL by the time already spent here.
+	// Refuse to cache an unusually large answer at all: one outlier should not be allowed to consume a
+	// large share of the cache budget for the sake of a single question.
+	if (stored.byteLength > DNS_CACHE_MAX_ENTRY_BYTES) return;
+	const 旧 = DNS_WIRE_CACHE.get(key);
+	if (旧) DNS_WIRE_CACHE线缓存字节 -= (旧.msg?.byteLength || 0);
 	DNS_WIRE_CACHE.set(key, { msg: stored, cachedAt: now, expiresAt: now + ttlMs });
-	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES) DNS_WIRE_CACHE.delete(DNS_WIRE_CACHE.keys().next().value);
+	DNS_WIRE_CACHE线缓存字节 += stored.byteLength;
+	// Evict on BOTH entry count and total bytes. A count-only bound let 256 entries of up to 64 KiB each
+	// retain ~16 MiB — a large slice of an isolate that shares 128 MB across every concurrent request.
+	while (DNS_WIRE_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES || DNS_WIRE_CACHE线缓存字节 > DNS_WIRE_CACHE_MAX_BYTES) {
+		const 首键 = DNS_WIRE_CACHE.keys().next().value;
+		if (首键 === undefined) break;
+		const 逐出 = DNS_WIRE_CACHE.get(首键);
+		DNS_WIRE_CACHE线缓存字节 -= (逐出?.msg?.byteLength || 0);
+		DNS_WIRE_CACHE.delete(首键);
+	}
+	if (DNS_WIRE_CACHE线缓存字节 < 0) DNS_WIRE_CACHE线缓存字节 = 0; // defensive: never let drift wedge eviction
 }
 
 // Walk one DNS name, returning the offset just past its ENCODED form (a compression pointer ends the
@@ -3929,6 +3950,12 @@ async function DNS经TCP转发(requestData, request, timeoutMs, 总截止 = null
 const DNS_QUERY_MAX_BYTES = 4096;
 const DNS_REASSEMBLY_MAX_BYTES = 128 * 1024;
 const DNS_TOTAL_TIMEOUT_DEFAULT_MS = 4000;
+// The wire cache was bounded by ENTRY COUNT only. A DNS message may approach 64 KiB, so 256 entries could
+// retain ~16 MiB on an isolate that shares 128 MB across all concurrent requests. Bound the total bytes as
+// well, and refuse to admit a single outsized answer.
+const DNS_WIRE_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const DNS_CACHE_MAX_ENTRY_BYTES = 16 * 1024;
+let DNS_WIRE_CACHE线缓存字节 = 0;
 // Free plan allows 50 external subrequests PER INVOCATION, and a WebSocket tunnel is ONE long-lived
 // invocation — so every DoH lookup spends from a budget shared by the whole session. A client that routes
 // its DNS through the tunnel exhausts that in a normal browsing session, after which every further fetch()

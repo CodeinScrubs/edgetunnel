@@ -50,15 +50,16 @@ if (/^import\s+/m.test(bundled)) {
 // Stamp the build so a deployed worker can say WHICH build it is. The hardcoded Version string never
 // changed across many deploys, which made a tail capture impossible to correlate with a specific artifact
 // — the exact problem when handing internal-error references to Cloudflare support.
-let 构建标识 = '';
-try {
-	const { execSync } = await import('node:child_process');
-	const sha = execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-	const dirty = execSync('git status --porcelain', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() ? '-dirty' : '';
-	构建标识 = sha + dirty;
-} catch (e) { 构建标识 = 'nogit'; }
-const 构建时间 = new Date().toISOString().replace('T', ' ').slice(0, 19);
-const 版本串 = `${构建时间} (${构建标识})`;
+// Identify the build by a hash of the SOURCE it was generated from, not by the git commit.
+//
+// Stamping the commit SHA is self-referential: the generated files are committed alongside the source,
+// so a build can only ever carry the PREVIOUS commit's SHA, and building from the working tree (which is
+// always the case just before committing) marks every committed artifact '-dirty' forever. A source hash
+// has none of that: identical source always yields the same stamp, it is stable across the commit that
+// contains it, and it makes the generated files reproducible.
+const { createHash } = await import('node:crypto');
+const 源哈希 = createHash('sha256').update(bundled).digest('hex').slice(0, 12);
+const 版本串 = `${new Date().toISOString().slice(0, 10)} src:${源哈希}`;
 
 const banner = [
 	'// Generated from src/worker.js by scripts/build-worker.mjs.',
