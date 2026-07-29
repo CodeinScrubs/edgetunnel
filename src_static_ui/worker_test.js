@@ -109,7 +109,26 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-07-29 src:656bff20bda5 panel';
+// ONE authority on whether an explicitly configured UUID is usable. The runtime check and the panel's
+// UUID_SOURCE readout were written twice, and they drifted the moment the nil UUID was rejected in only
+// one of them: the worker fell back to the derived identity while the panel reported "explicit UUID
+// accepted" — worse than no diagnostic at all. Key-presence parity between builds could never catch
+// that, because two independently written expressions can both exist and still disagree, so the
+// duplication itself had to go rather than be patched.
+const UUID规范格式 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Shape-valid but a publicly known constant, so as a tunnel credential it is equivalent to having none.
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+function 解析显式UUID(value) {
+	if (value === undefined || value === null || String(value).trim() === '') {
+		return { status: 'absent', value: null, reason: null };
+	}
+	const 规范 = String(value).trim().toLowerCase();
+	if (!UUID规范格式.test(规范)) return { status: 'invalid', value: null, reason: 'not a canonical 8-4-4-4-12 UUID' };
+	if (规范 === NIL_UUID) return { status: 'invalid', value: null, reason: 'the nil UUID is not usable as a credential' };
+	return { status: 'valid', value: 规范, reason: null };
+}
+
+const Version = '2026-07-29 src:80adc132e2bb panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -342,6 +361,15 @@ export default {
 		// exception"). On any unexpected error we serve the nginx camouflage page instead of throwing.
 		try {
 		env = applyUserConfigDefaults(env);
+		// Arm logging IMMEDIATELY after the env merge. These flags used to be set ~55 lines further down,
+		// so every log() before that point was evaluated against the module-init default (false) and was
+		// silently dropped on a cold isolate even with DEBUG=1 — including the identity warning below,
+		// which is the one message you most need when a configured UUID is not taking effect.
+		调试日志打印 = ['1', 'true'].includes(String(env.DEBUG || '').toLowerCase());
+		// DEBUG_LEGACY_TEXT=0 silences the verbose human-readable `log()` lines while keeping the structured
+		// tracer events. The two together doubled tail volume and pushed wrangler tail into sampling mode (which
+		// drops messages) — structured-only mode roughly halves output and CPU. Warnings/errors still print.
+		抑制旧文本日志 = 调试日志打印 && ['0', 'false', 'off'].includes(String(env.DEBUG_LEGACY_TEXT ?? '').toLowerCase());
 		const workerRequestContext = { env, ctx, tunnel: null };
 		WORKER_REQUEST_CONTEXT.set(request, workerRequestContext);
 		let config_JSON;
@@ -367,22 +395,20 @@ export default {
 		// /login + /admin only. A worker with NO credential at all falls through to the decoy (fails closed).
 		const 隧道凭据可用 = Boolean(身份种子);
 		const 加密秘钥 = env.KEY || 'default-key-change-with-KEY-env-if-needed';
-		const userIDMD5 = await MD5MD5(身份种子 + 加密秘钥);
-		// Accept ANY canonical UUID, not only v4. The old pattern pinned the version nibble to 4 and the
-		// variant to [89ab], which rejects a v5 (what Xray produces when it maps a custom string ID), a v1,
-		// a v7 from a modern generator, and the nil UUID. Rejection is SILENT — the value simply falls
-		// through to the derived UUID below — so the worker and the client end up disagreeing about identity
-		// and every tunnel attempt fails authentication with nothing anywhere explaining why. Shape is still
-		// enforced (8-4-4-4-12 hex); only the version/variant constraint is dropped.
-		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-		// The nil UUID is shape-valid but is a publicly known constant, so as a tunnel credential it is
-		// equivalent to having none at all. Reject it rather than let it look configured.
-		const NIL_UUID = '00000000-0000-0000-0000-000000000000';
-		const envUUID = env.UUID || env.uuid;
-		const envUUID规范 = String(envUUID ?? '').trim().toLowerCase();
-		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(envUUID规范) && envUUID规范 !== NIL_UUID;
-		if (envUUID && !envUUID可用) log('[Identity] The configured UUID was IGNORED (not a canonical 8-4-4-4-12 UUID, or the nil UUID); falling back to the derived identity. Clients using that UUID will fail to authenticate. The panel shows this as UUID_SOURCE.');
-		const userID = envUUID可用 ? envUUID规范 : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+		// 解析显式UUID is the single authority (see its definition); the panel's UUID_SOURCE row calls the
+		// same function, so the two can no longer disagree about what counts as usable.
+		const 显式UUID = 解析显式UUID(env.UUID || env.uuid);
+		if (显式UUID.status === 'invalid') log(`[Identity] The configured UUID was IGNORED (${显式UUID.reason}); serving on the derived identity instead, so clients using that UUID will fail to authenticate. The panel reports this as UUID_SOURCE.`);
+		// Compute the derived identity ONLY when it is actually going to be used. The double-MD5 is pure-JS
+		// hashing that ran on every request against a 10 ms CPU budget, including when an explicit UUID had
+		// already decided identity and the digest was thrown away.
+		let userID;
+		if (显式UUID.status === 'valid') {
+			userID = 显式UUID.value;
+		} else {
+			const 摘要 = await MD5MD5(身份种子 + 加密秘钥);
+			userID = [摘要.slice(0, 8), 摘要.slice(8, 12), '4' + 摘要.slice(13, 16), '8' + 摘要.slice(17, 20), 摘要.slice(20)].join('-');
+		}
 		let hosts;
 		if (env.HOST) {
 			const hostConfigKey = String(env.HOST);
@@ -4526,7 +4552,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 						await 执行远端写入(writer, item.chunk);
 						if (统计) { const wms = Date.now() - 写入开始时刻; if (wms > 统计.maxWriteMs) 统计.maxWriteMs = wms; }
 					} catch (err) {
-						释放写入器?.();
+						// Guarded: an exception from the release helper would otherwise REPLACE the real write
+						// failure, so the connection close reason and the rejected completion would both report a
+						// cleanup error instead of the socket error that actually ended the upload.
+						try { 释放写入器?.(); } catch (e) { }
 						// Delivery is UNCERTAIN once writer.write() was invoked — a rejected write does not prove
 						// zero bytes reached the remote. Never resend this chunk on a fresh socket (that could
 						// duplicate or corrupt a non-idempotent stream); close and let the client re-dial. The only
@@ -10052,14 +10081,17 @@ function 构建生效设置视图(env) {
 		// The UUID itself is a credential and must never be echoed here, but WHETHER an explicitly configured
 		// one was accepted is exactly what you need when clients suddenly cannot authenticate: a malformed
 		// value is ignored silently and the worker quietly uses the derived identity instead.
-		UUID_SOURCE: {
-			effective: !(e?.UUID || e?.uuid)
-				? 'derived from ADMIN/KEY'
-				: (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(e.UUID || e.uuid).trim())
-					? 'explicit UUID accepted'
-					: 'explicit UUID REJECTED (not a canonical 8-4-4-4-12 UUID) - clients using it will fail to authenticate'),
-			env: (e?.UUID || e?.uuid) ? '(set)' : null
-		},
+		// Calls the SAME resolver the tunnel authenticates with. Re-implementing the check here is how this
+		// row once reported "accepted" for a nil UUID that the runtime was rejecting.
+		UUID_SOURCE: (() => {
+			const 结果 = 解析显式UUID(e?.UUID || e?.uuid);
+			return {
+				effective: 结果.status === 'valid' ? 'explicit UUID accepted'
+					: 结果.status === 'absent' ? 'derived from ADMIN/KEY'
+						: `explicit UUID REJECTED (${结果.reason}) - clients using it will fail to authenticate`,
+				env: (e?.UUID || e?.uuid) ? '(set)' : null
+			};
+		})(),
 		URL: { effective: raw('URL') || 'nginx (built-in decoy)', env: raw('URL') },
 		PROXYIP: { effective: raw('PROXYIP') || 'auto (community relay)', env: raw('PROXYIP') },
 		PROXYIP_FALLBACK: { effective: flagVal('PROXYIP_FALLBACK'), env: raw('PROXYIP_FALLBACK') },

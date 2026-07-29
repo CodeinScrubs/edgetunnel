@@ -171,6 +171,10 @@ function objectKeys(text, declaration) {
 	const open = text.indexOf('{', start);
 	const end = scanEndOfBlock(text, open);
 	if (end < 0) return null;
+	// Match `KEY:` regardless of what the value expression is -- an object literal, a call, or an IIFE.
+	// Requiring `KEY: {` reported a false positive the moment a row computed its value instead of
+	// declaring one. Nested keys inside those values are lowercase (effective/env), so a SCREAMING_SNAKE
+	// setting name cannot collide with them.
 	// Top-level keys only, so nested object values cannot contribute phantom names.
 	const body = text.slice(open + 1, end - 1);
 	const keys = [];
@@ -223,14 +227,14 @@ for (const decl of ['const USER_CONFIG = {', 'const ENGINE_DEFAULTS = {']) {
 	else {
 		for (const key of userKeys) {
 			if (NOT_RUNTIME_SETTINGS.has(key)) continue;
-			if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`${key} is missing from the panel's effective-settings view`);
+			if (!new RegExp(`^\\s*${key}\\s*:`, 'm').test(view)) configProblems.push(`${key} is missing from the panel's effective-settings view`);
 			if (!helpKeys.has(key)) configProblems.push(`${key} is missing from the panel's settings help list`);
 		}
 		// And the mirror direction. The panel renders ONLY from ENV_SETTINGS, so a key in the view with no
 		// ENV_SETTINGS entry is invisible in the UI (that is how UUID_SOURCE reached /admin/env.json and
 		// nowhere else), and a row whose key the view does not answer renders a permanently blank value.
 		for (const key of helpKeys) {
-			if (!new RegExp(`^\\s*${key}\\s*:\\s*\\{`, 'm').test(view)) configProblems.push(`the panel renders a row for ${key} but the effective-settings view never returns it, so it shows blank`);
+			if (!new RegExp(`^\\s*${key}\\s*:`, 'm').test(view)) configProblems.push(`the panel renders a row for ${key} but the effective-settings view never returns it, so it shows blank`);
 		}
 	}
 }
