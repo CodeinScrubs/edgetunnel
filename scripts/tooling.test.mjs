@@ -829,4 +829,25 @@ import { join } from 'node:path';
 	}
 }
 
+// The two builds differ in exactly one place: the outbound connect factory. The Dashboard editor
+// mishandles a `cloudflare:sockets` module import and answers 1101, which is the failure this project
+// was reorganised around -- so a stray import leaking into the copy-paste build is not cosmetic. The
+// build throws if it cannot find the factory to swap, but nothing asserted the resulting artifacts.
+{
+	const copypaste = readFileSync('_worker_copypaste.js', 'utf8');
+	const wrangler = readFileSync('wrangler_deploy_method_worker/_worker.js', 'utf8');
+	const panel = readFileSync('src_static_ui/worker_test.js', 'utf8');
+
+	for (const [name, source] of [['_worker_copypaste.js', copypaste], ['src_static_ui/worker_test.js', panel]]) {
+		assert.doesNotMatch(source, /cloudflare:sockets/,
+			`${name} is a Dashboard copy-paste artifact and must not import cloudflare:sockets (the editor answers 1101)`);
+		assert.doesNotMatch(source, /^\s*import\s/m, `${name} must have no module imports at all`);
+		assert.match(source, /fetcher\.connect/, `${name} must dial through request.fetcher.connect`);
+	}
+
+	assert.match(wrangler, /^import \{ connect as cloudflareConnect \} from 'cloudflare:sockets';/,
+		'the wrangler build must import the documented cloudflare:sockets connect()');
+	assert.match(wrangler, /cloudflareConnect\(/, 'the wrangler build must actually call cloudflareConnect');
+}
+
 console.log('tooling tests passed');
