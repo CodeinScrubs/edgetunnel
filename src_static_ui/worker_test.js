@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-29 src:1d6f2f40181b panel';
+const Version = '2026-07-29 src:f0adc475766f panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -8029,10 +8029,58 @@ function cloneDohAnswer(answer) {
 	};
 }
 
+// The parsed-answer cache was bounded by ENTRY COUNT only, exactly the gap the wire cache already closed.
+// A DNS answer can approach 64 KiB of rdata, so 256 entries could retain ~15 MiB before object, string and
+// Map overhead — a large slice of an isolate that shares 128 MB across every concurrent request, and enough
+// to reduce how many tunnels it can carry. Bound the total bytes too, and refuse a single outsized entry.
+const DNS_RESULT_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const DNS_RESULT_CACHE_MAX_ENTRY_BYTES = 16 * 1024;
+let DNS_RESULT_CACHE字节 = 0;
+
+// Approximate retained size of one parsed answer: the rdata bytes dominate, but the decoded name/data
+// strings are retained too (2 bytes per UTF-16 unit), plus a flat allowance for the object itself.
+function 估算应答字节(answer) {
+	return 64
+		+ (answer?.rdata?.byteLength || 0)
+		+ String(answer?.name || '').length * 2
+		+ String(answer?.data || '').length * 2;
+}
+function 估算条目字节(entry) {
+	let total = 32;
+	for (const answer of entry?.answers || []) total += 估算应答字节(answer);
+	return total;
+}
+// Every mutation path must adjust the counter, or it drifts and either wedges eviction (too high) or
+// disables it (too low). Insert, replacement, expiry, LRU eviction and the negative cache all route here.
+function DNS结果缓存写入(cacheKey, entry) {
+	const 大小 = 估算条目字节(entry);
+	if (大小 > DNS_RESULT_CACHE_MAX_ENTRY_BYTES) return; // one outlier must not own the budget
+	const 旧 = DNS_RESULT_CACHE.get(cacheKey);
+	if (旧) DNS_RESULT_CACHE字节 -= (旧.字节 || 0);
+	entry.字节 = 大小;
+	DNS_RESULT_CACHE.delete(cacheKey);
+	DNS_RESULT_CACHE.set(cacheKey, entry);
+	DNS_RESULT_CACHE字节 += 大小;
+	while (DNS_RESULT_CACHE.size > DNS_RESULT_CACHE_MAX_ENTRIES || DNS_RESULT_CACHE字节 > DNS_RESULT_CACHE_MAX_BYTES) {
+		const 首键 = DNS_RESULT_CACHE.keys().next().value;
+		if (首键 === undefined) break;
+		DNS_RESULT_CACHE字节 -= (DNS_RESULT_CACHE.get(首键)?.字节 || 0);
+		DNS_RESULT_CACHE.delete(首键);
+	}
+	if (DNS_RESULT_CACHE字节 < 0) DNS_RESULT_CACHE字节 = 0;
+}
+function DNS结果缓存删除(cacheKey) {
+	const 旧 = DNS_RESULT_CACHE.get(cacheKey);
+	if (!旧) return;
+	DNS_RESULT_CACHE字节 -= (旧.字节 || 0);
+	if (DNS_RESULT_CACHE字节 < 0) DNS_RESULT_CACHE字节 = 0;
+	DNS_RESULT_CACHE.delete(cacheKey);
+}
+
 function readDohCache(cacheKey, now = Date.now()) {
 	const cached = getLruCacheValue(DNS_RESULT_CACHE, cacheKey);
 	if (!cached || cached.expiresAt <= now) {
-		if (cached) DNS_RESULT_CACHE.delete(cacheKey);
+		if (cached) DNS结果缓存删除(cacheKey); // expiry must decrement, or the counter drifts upward
 		return null;
 	}
 	return cached.answers.map(cloneDohAnswer);
@@ -8049,19 +8097,19 @@ function writeDohCache(cacheKey, answers, now = Date.now()) {
 	// floor still applies only when the response carried no readable TTL at all.
 	const dnsTtlMs = ttlValues.length ? Math.min(...ttlValues) : DNS_RESULT_CACHE_MIN_TTL_MS;
 	const ttlMs = Math.min(DNS_RESULT_CACHE_MAX_TTL_MS, dnsTtlMs);
-	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
+	DNS结果缓存写入(cacheKey, {
 		expiresAt: now + ttlMs,
 		answers: (answers || []).map(cloneDohAnswer),
-	}, DNS_RESULT_CACHE_MAX_ENTRIES);
+	});
 }
 
 function writeDohNegativeCache(cacheKey, now = Date.now()) {
 	const ttlMs = Math.max(1000, Number(DNS_RESULT_NEGATIVE_TTL_MS) || 30 * 1000);
-	setLruCacheValue(DNS_RESULT_CACHE, cacheKey, {
+	DNS结果缓存写入(cacheKey, {
 		expiresAt: now + ttlMs,
 		answers: [],
 		negative: true,
-	}, DNS_RESULT_CACHE_MAX_ENTRIES);
+	});
 }
 
 function getDnsRcode(buf) {
@@ -8882,19 +8930,38 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 	const atIndex = address.lastIndexOf("@");
 	const hostPart = (atIndex === -1 ? address : address.slice(atIndex + 1)).split('/')[0];
 	const authPart = atIndex === -1 ? "" : address.slice(0, atIndex);
-	const [username, password] = authPart ? authPart.split(":") : [];
-	if (authPart && !password) throw new Error('Invalid proxy address format: the authentication part must be "username:password"');
+	// Split on the FIRST colon only. `split(":")` destructured to two names silently DISCARDED everything
+	// after the second colon, so a password containing a colon ("u:p:q@host") authenticated as just "p" and
+	// the proxy rejected the connection with no indication why.
+	let username, password;
+	if (authPart) {
+		const 分隔 = authPart.indexOf(':');
+		if (分隔 < 0) throw new Error('Invalid proxy address format: the authentication part must be "username:password"');
+		username = authPart.slice(0, 分隔);
+		password = authPart.slice(分隔 + 1);
+		if (!password) throw new Error('Invalid proxy address format: the authentication part must be "username:password"');
+	}
 
+	// Reject a malformed port instead of stripping non-digits out of it. `"80abc".replace(/[^\d]/g,'')`
+	// silently became 80, so a typo produced a connection to a port the operator never wrote — a wrong
+	// destination is worse than a clear error.
+	const 解析端口 = (原始) => {
+		const 文本 = String(原始 ?? '').trim();
+		if (!/^\d+$/.test(文本)) throw new Error(`Invalid proxy address format: the port must be a number, got "${原始}"`);
+		const 值 = Number(文本);
+		if (!Number.isInteger(值) || 值 < 1 || 值 > 65535) throw new Error(`Invalid proxy address format: port out of range: ${文本}`);
+		return 值;
+	};
 	let hostname = hostPart, port = 默认端口;
 	if (hostPart.includes("]:")) {
 		const [ipv6Host, ipv6Port = ""] = hostPart.split("]:");
 		hostname = ipv6Host + "]";
-		port = Number(ipv6Port.replace(/[^\d]/g, ""));
+		port = 解析端口(ipv6Port);
 	} else if (!hostPart.startsWith("[")) {
 		const parts = hostPart.split(":");
 		if (parts.length === 2) {
 			hostname = parts[0];
-			port = Number(parts[1].replace(/[^\d]/g, ""));
+			port = 解析端口(parts[1]);
 		}
 	}
 
