@@ -261,9 +261,17 @@ export default {
 		const 隧道凭据可用 = Boolean(身份种子);
 		const 加密秘钥 = env.KEY || 'default-key-change-with-KEY-env-if-needed';
 		const userIDMD5 = await MD5MD5(身份种子 + 加密秘钥);
-		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+		// Accept ANY canonical UUID, not only v4. The old pattern pinned the version nibble to 4 and the
+		// variant to [89ab], which rejects a v5 (what Xray produces when it maps a custom string ID), a v1,
+		// a v7 from a modern generator, and the nil UUID. Rejection is SILENT — the value simply falls
+		// through to the derived UUID below — so the worker and the client end up disagreeing about identity
+		// and every tunnel attempt fails authentication with nothing anywhere explaining why. Shape is still
+		// enforced (8-4-4-4-12 hex); only the version/variant constraint is dropped.
+		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
-		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+		const envUUID可用 = Boolean(envUUID) && uuidRegex.test(String(envUUID).trim());
+		if (envUUID && !envUUID可用) log('[Identity] The configured UUID is not a canonical 8-4-4-4-12 UUID and was IGNORED; falling back to the derived identity. Clients using that UUID will fail to authenticate.');
+		const userID = envUUID可用 ? String(envUUID).trim().toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
 		let hosts;
 		if (env.HOST) {
 			const hostConfigKey = String(env.HOST);
