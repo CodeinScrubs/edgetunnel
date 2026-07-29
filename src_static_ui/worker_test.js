@@ -104,7 +104,7 @@ function applyUserConfigDefaults(env = {}) {
 }
 
 
-const Version = '2026-07-29 src:344e9a513c1e panel';
+const Version = '2026-07-29 src:cced647125ed panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -397,7 +397,13 @@ export default {
 		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
 		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
-			return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+			// Version is now a build stamp ("<time> (<sha>[-dirty])"), not a bare date. Stripping every
+			// non-digit merged the timestamp with the digits inside the hex SHA and produced a 19-digit value
+			// past Number.MAX_SAFE_INTEGER, which silently lost precision and did not even round-trip. Take
+			// only the LEADING timestamp digits (14 -> ~2e13, safely inside the integer range) for the numeric
+			// field callers may compare, and return the full stamp separately so a log can be tied to a build.
+			const 版本数字 = Number((String(Version).match(/\d/g) || []).slice(0, 14).join('')) || 0;
+			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
@@ -1064,7 +1070,7 @@ async function 处理XHTTP请求(request, yourUUID) {
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
-				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1133,6 +1139,8 @@ async function 处理XHTTP请求(request, yourUUID) {
 			XHTTP上行写入队列?.清空();
 			关闭连接全部Socket(remoteConnWrapper);
 			释放远端写入器();
+			// Bounded: an unbounded cancel() can leave this cleanup (and the pipe promise the WS teardown now
+			// observes) pending forever if the underlying socket shutdown never settles.
 			try { await withOperationTimeout(reader.cancel(), 500, 'reader cancel timed out') } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
@@ -1505,7 +1513,7 @@ async function 处理gRPC请求(request, yourUUID) {
 				关闭连接,
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
-				写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1648,6 +1656,8 @@ async function 处理gRPC请求(request, yourUUID) {
 			}
 			当前写入Socket = null;
 			关闭连接全部Socket(remoteConnWrapper);
+			// Bounded: an unbounded cancel() can leave this cleanup (and the pipe promise the WS teardown now
+			// observes) pending forever if the underlying socket shutdown never settles.
 			try { await withOperationTimeout(reader.cancel(), 500, 'reader cancel timed out') } catch (e) { }
 			try { reader.releaseLock() } catch (e) { }
 		}
@@ -4347,7 +4357,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -4525,7 +4535,7 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 		const nextBytes = queuedBytes + chunk.byteLength;
 		const nextItems = chunks.length - head + 1;
 		const retainedBytes = nextBytes + inFlightBytes;
-		if (retainedBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+		if (retainedBytes > 最大字节 || nextItems > 最大条目) {
 			closed = true;
 			if (统计) 统计.overflowCount++;
 			const err = Object.assign(new Error(`${名称}: upload queue overflow (${retainedBytes}B/${nextItems})`), { isQueueOverflow: true });
@@ -8051,6 +8061,7 @@ async function DoH查询(域名, 记录类型, DoH解析服务 = DEFAULT_DOH_LOO
 		}
 
 
+		if (Number(response.headers?.get?.('content-length') || 0) > 65535) { cancelBodyQuietly(response); log(`[DoH lookup] Declared response too large for ${域名} via ${DoH解析服务}`); return []; }
 		// Same media-type and body-deadline rules as the tunneled-DNS path. This function resolves ProxyIP
 		// (and preload-race) targets, so an endpoint that returns headers and then stalls its body used to
 		// hang name resolution here with no timer running — freezing relay setup before any dial began.
