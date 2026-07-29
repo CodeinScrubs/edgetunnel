@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-29 src:07fa92178a54 panel';
+const Version = '2026-07-29 src:cb60aff2f6c5 panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -585,16 +585,16 @@ export default {
 									if (!tcpSocket) throw new Error('Unable to connect to the proxy server');
 									tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true, timeout: 检测超时毫秒 });
 									await withOperationTimeout(tlsSocket.handshake(), 检测超时毫秒, 'Proxy check TLS handshake timed out', () => {
-										try { tlsSocket?.close() } catch (e) { }
+										closeRemoteSocketQuietly(tlsSocket);
 									});
 									await withOperationTimeout(tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`)), 检测超时毫秒, 'Proxy check request write timed out', () => {
-										try { tlsSocket?.close() } catch (e) { }
+										closeRemoteSocketQuietly(tlsSocket);
 									});
 									let responseBuffer = new Uint8Array(0), headerEndIndex = -1, contentLength = null, chunked = false;
 									const 最大响应字节 = 64 * 1024;
 									while (responseBuffer.length < 最大响应字节) {
 										const value = await withOperationTimeout(tlsSocket.read(), 检测超时毫秒, 'Proxy check response timed out', () => {
-											try { tlsSocket?.close() } catch (e) { }
+											closeRemoteSocketQuietly(tlsSocket);
 										});
 										if (!value) break;
 										if (value.byteLength === 0) continue;
@@ -1678,7 +1678,7 @@ async function 处理gRPC请求(request, yourUUID) {
 					} catch (e) {
 						// On ANY half-close failure (immediate reject or timeout), close THIS socket so the downstream
 						// read side ends and the awaited pipe below can't hang on a peer that never EOFs.
-						try { 半关闭Socket.close() } catch (e2) { }
+						closeRemoteSocketQuietly(半关闭Socket);
 					} finally { try { 半关闭写入器?.releaseLock() } catch (e) { } }
 					if (半关闭Pipe) { try { await 半关闭Pipe } catch (e) { } }
 				}
@@ -5168,7 +5168,7 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 	} catch (error) {
 		try { writer.releaseLock() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
-		try { socket.close() } catch (e) { }
+		closeRemoteSocketQuietly(socket);
 		throw error;
 	}
 }
@@ -5225,7 +5225,7 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 	} catch (error) {
 		try { writer.releaseLock() } catch (e) { }
 		try { reader.releaseLock() } catch (e) { }
-		try { socket.close() } catch (e) { }
+		closeRemoteSocketQuietly(socket);
 		throw error;
 	}
 }
@@ -5243,7 +5243,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 			await socketOpenedWithTimeout(proxySocket, timeoutMs, 'HTTPS proxy TCP connect timed out');
 			const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha, timeout: timeoutMs });
 			await withOperationTimeout(socket.handshake(), timeoutMs, 'HTTPS proxy TLS handshake timed out', () => {
-				try { socket.close() } catch (e) { }
+				closeRemoteSocketQuietly(socket);
 			});
 			log(`[HTTPS proxy] TLS version: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
 			return socket;
@@ -5264,13 +5264,13 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
 		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await withOperationTimeout(tlsSocket.write(encoder.encode(request)), timeoutMs, 'HTTPS proxy CONNECT write timed out', () => {
-			try { tlsSocket.close() } catch (e) { }
+			closeRemoteSocketQuietly(tlsSocket);
 		});
 
 		let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {
 			const value = await withOperationTimeout(tlsSocket.read(), timeoutMs, 'HTTPS proxy CONNECT response timed out', () => {
-				try { tlsSocket.close() } catch (e) { }
+				closeRemoteSocketQuietly(tlsSocket);
 			});
 			if (!value) throw new Error('HTTPS proxy closed the connection before returning a CONNECT response');
 			responseBuffer = 拼接字节数据(responseBuffer, value);
@@ -5285,7 +5285,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) throw new Error(`Connection failed: HTTP ${statusCode}`);
 
 		if (有效数据长度(initialData) > 0) await withOperationTimeout(tlsSocket.write(数据转Uint8Array(initialData)), timeoutMs, 'HTTPS proxy initial data write timed out', () => {
-			try { tlsSocket.close() } catch (e) { }
+			closeRemoteSocketQuietly(tlsSocket);
 		});
 		const bufferedData = bytesRead > headerEndIndex ? responseBuffer.subarray(headerEndIndex, bytesRead) : null;
 		let closedSettled = false, resolveClosed, rejectClosed;
@@ -5300,7 +5300,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 			rejectClosed = reject;
 		});
 		const close = () => {
-			try { tlsSocket.close() } catch (e) { }
+			closeRemoteSocketQuietly(tlsSocket);
 			settleClosed(resolveClosed);
 		};
 		const readable = new ReadableStream({
@@ -5335,7 +5335,7 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		});
 		return { readable, writable, closed, close };
 	} catch (error) {
-		try { tlsSocket?.close() } catch (e) { }
+		closeRemoteSocketQuietly(tlsSocket);
 		throw error;
 	}
 }
