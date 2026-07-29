@@ -19,7 +19,7 @@ Legend: **[C]** client app · **[E]** env var · **[S]** source/ENGINE_DEFAULTS 
 7. [C] Try alternate TLS ports (2053/2083/2087/2096/8443) — some are less throttled than 443 on some ISPs.
 8. [C] Avoid port 80 / non-TLS nodes — slower and more DPI-prone.
 9. [C] Use IPv4 literals on your IPv4-only network to avoid AAAA-lookup stalls.
-10. [C] Keep SNI = your real domain (cdn.a6w.ir) while fronting via the clean IP — best reachability + blends in.
+10. [C] Keep SNI = your real domain (cdn.example.com) while fronting via the clean IP — best reachability + blends in.
 11. [C] Rank candidates by lowest **jitter**, not just lowest average ping — jitter causes the saw-tooth you wanted to avoid.
 12. [C] Test at your real usage hours — Iran's international bandwidth is heavily time-of-day dependent; tune for peak congestion.
 

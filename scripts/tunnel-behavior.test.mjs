@@ -1129,7 +1129,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const first = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { PROXYIP: 'first.example.com' });
 	const second = await createTunnelContext(fakeRequest({ colo: 'AMS' }), { PROXYIP: 'second.example.com' });
 	const auto = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { PROXYIP: 'auto' });
-	const forced = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { FORCE_PROXY_HOSTS: 'xpanel.a6w.ir,*.panel.a6w.ir' });
+	const forced = await createTunnelContext(fakeRequest({ colo: 'SJC' }), { FORCE_PROXY_HOSTS: 'panel.example.com,*.sub.example.com' });
 
 	await applyProxyParamsToTunnelContext(new URL('https://worker.example.com/proxyip=clean.example.com/ws'), '00000000-0000-4000-8000-000000000000', first);
 	await applyProxyParamsToTunnelContext(new URL('https://worker.example.com/socks5=user:pass@socks.example.com:1080/ws?globalproxy=1'), '00000000-0000-4000-8000-000000000000', second);
@@ -1143,16 +1143,16 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.equal(second.parsedProxyAddress.hostname, 'socks.example.com');
 	assert.equal(auto.proxyIP, 'sjc.proxyip.cmliussss.net', 'PROXYIP=auto should use the colo auto ProxyIP, not a literal hostname');
 	assert.equal(auto.proxyFallbackEnabled, true);
-	assert.deepEqual(forced.forceProxyHosts, ['xpanel.a6w.ir', '*.panel.a6w.ir']);
-	assert.equal(matchesHostPattern('xpanel.a6w.ir', forced.forceProxyHosts[0]), true);
-	assert.equal(matchesHostPattern('api.panel.a6w.ir', forced.forceProxyHosts[1]), true);
+	assert.deepEqual(forced.forceProxyHosts, ['panel.example.com', '*.sub.example.com']);
+	assert.equal(matchesHostPattern('panel.example.com', forced.forceProxyHosts[0]), true);
+	assert.equal(matchesHostPattern('api.sub.example.com', forced.forceProxyHosts[1]), true);
 }
 
 {
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	const tunnel = await createTunnelContext(fakeRequest({ colo: 'SJC' }), {
 		PROXYIP: '198.51.100.10:443',
-		FORCE_PROXY_HOSTS: 'xpanel.a6w.ir,*.a6w.ir',
+		FORCE_PROXY_HOSTS: 'panel.example.com,*.example.com',
 	});
 	const connectCalls = [];
 	const upstreamWrites = [];
@@ -1174,7 +1174,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	};
 	const body = new ReadableStream({
 		start(controller) {
-			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'xpanel.a6w.ir', 2087, new Uint8Array([0xaa]))));
+			controller.enqueue(encodeGrpcDataFrame(makeVlessTcpRequest(uuid, 'panel.example.com', 2087, new Uint8Array([0xaa]))));
 			controller.close();
 		},
 	});
@@ -1195,7 +1195,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
 
 	assert.deepEqual(connectCalls, [{ hostname: '198.51.100.10', port: 443 }], 'forced host should dial ProxyIP instead of the target hostname');
-	assert.equal(connectCalls.some(call => call.hostname === 'xpanel.a6w.ir'), false, 'forced host must not be direct-dialed');
+	assert.equal(connectCalls.some(call => call.hostname === 'panel.example.com'), false, 'forced host must not be direct-dialed');
 	assert.deepEqual(upstreamWrites, [new Uint8Array([0xaa])]);
 	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
 }

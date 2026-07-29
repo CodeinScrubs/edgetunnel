@@ -27,7 +27,7 @@ Primary metrics:
 Deploy the optional deterministic target:
 
 ```powershell
-cd "C:\Users\Shayan\Desktop\Work\4_worker_codex_final\edgetunnel"
+cd "path\to\edgetunnel"
 npx wrangler deploy -c benchmarks/wrangler.benchmark-target.toml
 ```
 

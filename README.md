@@ -2,6 +2,15 @@
 
 This repository contains a Cloudflare Worker / Pages deployment with an admin panel, subscription generation, and configurable transport settings.
 
+> **Attribution.** This is a heavily modified fork of [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel),
+> which is itself derived from the upstream edgetunnel/zizifn worker lineage. Licensed under **GPL-2.0**,
+> same as upstream — see [LICENSE](LICENSE). The data plane, build pipeline, admin panel, test suite and
+> documentation here have diverged substantially from upstream; it is not drop-in compatible.
+
+> **No credentials are stored in this repository.** `ADMIN`, `KEY`, `UUID` and `PATH` are supplied at
+> runtime as Cloudflare environment variables. Never commit them. Example hostnames in the docs and tests
+> (`example.com`) are placeholders, not real deployments.
+
 ## Quick Start
 
 1. Create a Cloudflare Worker or Pages project.
