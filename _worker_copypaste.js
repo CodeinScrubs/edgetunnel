@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-29 src:11c0f8d6f4cb
+// Build: 2026-07-30 src:6a68fe0806e1
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-29 src:11c0f8d6f4cb';
+const Version = '2026-07-30 src:6a68fe0806e1';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -5137,9 +5137,24 @@ async function socks5Connect(targetHost, targetPort, initialData, TCP连接, pro
 			if (response[0] !== 0x01 || response[1] !== 0x00) throw new Error('S5 authentication failed');
 		} else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
 
-		const hostBytes = new TextEncoder().encode(targetHost);
-		if (hostBytes.byteLength > 255) throw new Error('S5 target hostname is too long');
-		const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
+		// RFC 1928 address types: 0x01 IPv4 (4 octets), 0x03 domain (length-prefixed), 0x04 IPv6 (16 octets).
+		// Every target used to be sent as ATYP 0x03, so a literal IP went out as the ASCII string "1.2.3.4".
+		// Lenient proxies re-parse that, but a strict one rejects it and others burn a pointless DNS lookup
+		// resolving a name that is already an address.
+		const 目标无括号 = stripIPv6Brackets(targetHost);
+		let connectPacket;
+		if (isIPv4(目标无括号)) {
+			const 八位组 = 目标无括号.split('.').map(Number);
+			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x01, ...八位组, targetPort >> 8, targetPort & 0xff]);
+		} else if (目标无括号.includes(':') && isIPHostname(目标无括号)) {
+			const 字节 = IPv6转字节(目标无括号);
+			if (!字节) throw new Error(`S5 target IPv6 address is invalid: ${目标无括号}`);
+			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x04, ...字节, targetPort >> 8, targetPort & 0xff]);
+		} else {
+			const hostBytes = new TextEncoder().encode(targetHost);
+			if (hostBytes.byteLength > 255) throw new Error('S5 target hostname is too long');
+			connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
+		}
 		await writeWithOperationTimeout(writer, connectPacket, timeoutMs, 'SOCKS5 proxy CONNECT write timed out');
 		response = await readExact(4, 'SOCKS5 proxy handshake timed out');
 		if (response[0] !== 0x05 || response[1] !== 0x00) throw new Error('S5 connection failed');
@@ -5184,7 +5199,9 @@ async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = fa
 		await socketOpenedWithTimeout(socket, timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy TCP connect timed out`);
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
+		// Bracket an IPv6 authority; unbracketed, "2001:db8::1:443" gives the proxy no way to split host from port.
+		const 目标授权 = 格式化主机端口(targetHost, targetPort);
+		const request = `CONNECT ${目标授权} HTTP/1.1\r\nHost: ${目标授权}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await writeWithOperationTimeout(writer, encoder.encode(request), timeoutMs, `${HTTPS代理 ? 'HTTPS' : 'HTTP'} proxy CONNECT write timed out`);
 		writer.releaseLock();
 
@@ -5260,7 +5277,9 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, prox
 		}
 
 		const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
+		// Bracket an IPv6 authority; unbracketed, "2001:db8::1:443" gives the proxy no way to split host from port.
+		const 目标授权 = 格式化主机端口(targetHost, targetPort);
+		const request = `CONNECT ${目标授权} HTTP/1.1\r\nHost: ${目标授权}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await withOperationTimeout(tlsSocket.write(encoder.encode(request)), timeoutMs, 'HTTPS proxy CONNECT write timed out', () => {
 			closeRemoteSocketQuietly(tlsSocket);
 		});
@@ -6037,6 +6056,46 @@ class TlsClient {
 function stripIPv6Brackets(hostname = '') {
 	const host = String(hostname || '').trim();
 	return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
+// 16 raw octets for a textual IPv6 address, or null when it is not one. Needed because SOCKS5 carries an
+// IPv6 target as ATYP 0x04 + 16 binary octets (RFC 1928), not as text. Handles `::` compression and the
+// IPv4-mapped tail form; returns null rather than guessing on anything malformed.
+function IPv6转字节(地址) {
+	let text = stripIPv6Brackets(地址).toLowerCase();
+	if (!text || text.indexOf(':') < 0) return null;
+	// Trailing IPv4 form, e.g. ::ffff:1.2.3.4 -> rewrite the tail as two hextets.
+	const v4尾 = text.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+	if (v4尾) {
+		const o = v4尾[1].split('.').map(Number);
+		if (o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+		const hex = ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16);
+		text = text.slice(0, v4尾.index) + hex;
+	}
+	const 双冒号 = text.split('::');
+	if (双冒号.length > 2) return null;
+	const 解析段 = (s) => (s ? s.split(':').filter((x) => x !== '') : []);
+	const 前 = 解析段(双冒号[0]);
+	const 后 = 双冒号.length === 2 ? 解析段(双冒号[1]) : [];
+	const 段 = 双冒号.length === 2
+		? [...前, ...new Array(8 - 前.length - 后.length).fill('0'), ...后]
+		: 前;
+	if (段.length !== 8) return null;
+	const out = new Uint8Array(16);
+	for (let i = 0; i < 8; i++) {
+		if (!/^[0-9a-f]{1,4}$/.test(段[i])) return null;
+		const v = parseInt(段[i], 16);
+		out[i * 2] = (v >>> 8) & 0xff;
+		out[i * 2 + 1] = v & 0xff;
+	}
+	return out;
+}
+
+// An IPv6 authority MUST be bracketed in a request-target / Host header (RFC 3986 §3.2.2, RFC 7230).
+// Without this, `CONNECT 2001:db8::1:443` is ambiguous — a proxy cannot tell the port from the address.
+function 格式化主机端口(host, port) {
+	const 裸 = stripIPv6Brackets(host);
+	return 裸.includes(':') ? `[${裸}]:${port}` : `${裸}:${port}`;
 }
 
 function isIPHostname(hostname = '') {
@@ -9735,8 +9794,13 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 	if (authPart) {
 		const 分隔 = authPart.indexOf(':');
 		if (分隔 < 0) throw new Error('Invalid proxy address format: the authentication part must be "username:password"');
-		username = authPart.slice(0, 分隔);
-		password = authPart.slice(分隔 + 1);
+		// Percent-decode the userinfo (RFC 3986 allows it, and it is the only way to carry '@' or ':' in a
+		// credential). Falls back to the raw text on malformed input so an existing password containing a
+		// bare '%' keeps working instead of throwing.
+		const 解码 = (v) => { try { return decodeURIComponent(v); } catch (_) { return v; } };
+		username = 解码(authPart.slice(0, 分隔));
+		password = 解码(authPart.slice(分隔 + 1));
+		if (!username) throw new Error('Invalid proxy address format: the username must not be empty');
 		if (!password) throw new Error('Invalid proxy address format: the authentication part must be "username:password"');
 	}
 
@@ -9765,6 +9829,10 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 
 	if (isNaN(port)) throw new Error('Invalid proxy address format: the port must be a number');
 	if (hostname.includes(":") && !IPv6方括号正则.test(hostname)) throw new Error('Invalid proxy address format: IPv6 addresses must be wrapped in brackets, for example [2001:db8::1]');
+	// An empty or bracket-only host was accepted and then dialled as "". Reject it here: a proxy address
+	// with no host is a configuration error, and failing at parse time names it instead of surfacing later
+	// as an opaque connect failure.
+	if (!stripIPv6Brackets(hostname)) throw new Error('Invalid proxy address format: the host must not be empty');
 	return { username, password, hostname, port };
 }
 

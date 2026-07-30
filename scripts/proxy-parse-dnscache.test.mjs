@@ -45,6 +45,48 @@ for (const file of BUILDS) {
 	assert.equal(parse('[2001:db8::1]:8443', 443).port, 8443, `${file}: IPv6 port`);
 	assert.throws(() => parse('u@host:1080', 443), /username:password/, `${file}: auth without a colon is refused`);
 
+	// ---- parser strictness ----
+	// Percent-encoded userinfo is the only way to carry ':' or '@' in a credential (RFC 3986).
+	const enc = parse('u%3Aname:p%3Aq@host:80', 443);
+	assert.equal(enc.username, 'u:name', `${file}: percent-decoded username`);
+	assert.equal(enc.password, 'p:q', `${file}: percent-decoded password`);
+	// A malformed escape must NOT throw -- an existing password with a bare '%' has to keep working.
+	assert.equal(parse('u:100%pure@host:80', 443).password, '100%pure', `${file}: bare % survives`);
+	// An empty host was accepted and then dialled as "".
+	for (const bad of ['u:p@:80', 'u:p@[]:80', ':p@host:80']) {
+		assert.throws(() => parse(bad, 443), /must not be empty/, `${file}: "${bad}" must be rejected`);
+	}
+
+	// ---- SOCKS5 / CONNECT wire format (RFC 1928 / RFC 7230) ----
+	const wire = new Function(
+		ex(src, 'stripIPv6Brackets') + ex(src, 'isIPv4') + ex(src, 'isIPHostname') +
+		ex(src, 'IPv6转字节') + ex(src, '格式化主机端口') +
+		'return { IPv6转字节, 格式化主机端口, isIPv4 };')();
+
+	// IPv6 -> 16 octets, including :: compression and the IPv4-mapped tail.
+	const full = wire.IPv6转字节('2001:0db8:0000:0000:0000:0000:0000:0001');
+	const compressed = wire.IPv6转字节('2001:db8::1');
+	assert.deepEqual([...compressed], [...full], `${file}: :: compression must expand identically`);
+	assert.equal(compressed.byteLength, 16, `${file}: IPv6 must encode to 16 octets`);
+	assert.deepEqual([...wire.IPv6转字节('::1')].slice(-1), [1], `${file}: ::1 loopback`);
+	const mapped = wire.IPv6转字节('::ffff:1.2.3.4');
+	assert.deepEqual([...mapped].slice(-6), [0xff, 0xff, 1, 2, 3, 4], `${file}: IPv4-mapped tail`);
+	for (const bad of ['not-an-ip', '2001:db8::1::2', '', '1.2.3.4', 'gggg::1']) {
+		assert.equal(wire.IPv6转字节(bad), null, `${file}: "${bad}" must not parse as IPv6`);
+	}
+
+	// CONNECT authority must bracket IPv6 and leave everything else alone.
+	assert.equal(wire.格式化主机端口('2001:db8::1', 443), '[2001:db8::1]:443', `${file}: IPv6 authority must be bracketed`);
+	assert.equal(wire.格式化主机端口('[2001:db8::1]', 443), '[2001:db8::1]:443', `${file}: already-bracketed stays single-bracketed`);
+	assert.equal(wire.格式化主机端口('1.2.3.4', 443), '1.2.3.4:443', `${file}: IPv4 authority unchanged`);
+	assert.equal(wire.格式化主机端口('example.com', 8443), 'example.com:8443', `${file}: domain authority unchanged`);
+
+	// The SOCKS5 CONNECT packet must select ATYP by address family, not always 0x03.
+	const s5 = ex(src, 'socks5Connect');
+	assert.match(s5, /0x05, 0x01, 0x00, 0x01, \.\.\.八位组/, `${file}: SOCKS5 must send ATYP 0x01 for a literal IPv4`);
+	assert.match(s5, /0x05, 0x01, 0x00, 0x04, \.\.\.字节/, `${file}: SOCKS5 must send ATYP 0x04 for a literal IPv6`);
+	assert.match(s5, /0x05, 0x01, 0x00, 0x03, hostBytes\.length/, `${file}: SOCKS5 must still send ATYP 0x03 for a domain`);
+
 	// ---- parsed DNS cache must be byte-bounded, not entry-bounded only ----
 	assert.match(src, /const DNS_RESULT_CACHE_MAX_BYTES = /, `${file}: DNS_RESULT_CACHE needs a byte ceiling`);
 	assert.match(src, /const DNS_RESULT_CACHE_MAX_ENTRY_BYTES = /, `${file}: DNS_RESULT_CACHE needs a per-entry ceiling`);
