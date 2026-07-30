@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-30 src:39c6a5d4de31 panel';
+const Version = '2026-07-30 src:279d6906c267 panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -6075,11 +6075,19 @@ function IPv6转字节(地址) {
 		const hex = ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16);
 		text = text.slice(0, v4尾.index) + hex;
 	}
+	// ':::' is never legal, and it is the one form the split-based logic below cannot see: '1:::2' splits
+	// into '1' and ':2', whose leading empty component used to be filtered away.
+	if (text.includes(':::')) return null;
 	const 双冒号 = text.split('::');
 	if (双冒号.length > 2) return null;
-	const 解析段 = (s) => (s ? s.split(':').filter((x) => x !== '') : []);
+	// Do NOT filter empty components. Filtering silently accepted a stray leading or trailing colon
+	// (':1:2:3:4:5:6:7:8' and '1:2:3:4:5:6:7:8:' both encoded as if they were the well-formed address),
+	// which means a malformed configured address was converted into a DIFFERENT valid one and dialled.
+	// An empty component is meaningful only as part of exactly one '::', which the split already consumed.
+	const 解析段 = (s) => (s === '' ? [] : s.split(':'));
 	const 前 = 解析段(双冒号[0]);
 	const 后 = 双冒号.length === 2 ? 解析段(双冒号[1]) : [];
+	if (前.some((x) => x === '') || 后.some((x) => x === '')) return null;
 	let 段;
 	if (双冒号.length === 2) {
 		// RFC 4291: `::` stands for ONE OR MORE omitted zero groups. Computing the fill length without
@@ -6090,7 +6098,9 @@ function IPv6转字节(地址) {
 		if (缺少 < 1) return null;
 		段 = [...前, ...new Array(缺少).fill('0'), ...后];
 	} else {
-		段 = 前;
+		// No '::' at all, so every one of the eight groups must be written out explicitly.
+		段 = text.split(':');
+		if (段.some((x) => x === '')) return null;
 	}
 	if (段.length !== 8) return null;
 	const out = new Uint8Array(16);
