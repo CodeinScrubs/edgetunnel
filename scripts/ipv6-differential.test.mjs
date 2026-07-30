@@ -35,13 +35,31 @@ function corpus() {
 			out.add(new Array(left).fill('1').join(':') + '::' + new Array(right).fill('2').join(':'));
 		}
 	}
-	// IPv4-mapped / embedded forms.
-	for (const v4 of ['1.2.3.4', '255.255.255.255', '0.0.0.0', '256.1.1.1', '1.2.3', '1.2.3.4.5']) {
+	// IPv4-mapped / embedded forms. A 106-case corpus missed "::ffff:01.2.3.4" -- a leading zero in the
+	// dotted tail -- so the octet spellings are now generated systematically rather than listed. Leading
+	// zeros, out-of-range values, wrong arity and non-digits all have to be covered.
+	const octets = ['0', '1', '9', '10', '99', '100', '255', '256', '00', '01', '007', '0255', '1000', '', 'a', '-1', '+1', ' 1'];
+	for (const o of octets) {
+		out.add(`::ffff:${o}.2.3.4`);
+		out.add(`::ffff:1.${o}.3.4`);
+		out.add(`::ffff:1.2.3.${o}`);
+	}
+	for (const v4 of ['1.2.3.4', '255.255.255.255', '0.0.0.0', '256.1.1.1', '1.2.3', '1.2.3.4.5', '01.2.3.4', '1.02.3.4', '1.2.3.04']) {
 		out.add('::ffff:' + v4);
 		out.add('::' + v4);
 		out.add('64:ff9b::' + v4);
 		out.add('1:2:3:4:5:6:' + v4);
+		out.add('1:2:3:4:5:6:7:' + v4);
 	}
+	// Exhaustive hextet spellings, including over-long and non-hex.
+	for (const h of ['0', '00', '000', '0000', '00000', '1', 'ffff', 'fffff', 'g', '0x1', '-1', '+1', ' 1', '1 ']) {
+		out.add(`${h}:2:3:4:5:6:7:8`);
+		out.add(`1:2:3:4:5:6:7:${h}`);
+		out.add(`${h}::1`);
+		out.add(`1::${h}`);
+	}
+	// Every colon-count variant of a short address, to sweep malformed separators.
+	for (let n = 0; n <= 10; n++) out.add('1' + ':'.repeat(n) + '2');
 	// Systematic malformations of a known-good base.
 	const base = '2001:db8::1';
 	for (const bad of [

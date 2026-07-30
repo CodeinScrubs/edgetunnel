@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-30 src:279d6906c267 panel';
+const Version = '2026-07-30 src:f7448192fc0e panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -6070,7 +6070,12 @@ function IPv6转字节(地址) {
 	// Trailing IPv4 form, e.g. ::ffff:1.2.3.4 -> rewrite the tail as two hextets.
 	const v4尾 = text.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
 	if (v4尾) {
-		const o = v4尾[1].split('.').map(Number);
+		const 八位组文本 = v4尾[1].split('.');
+		// Each octet must be spelled canonically: no leading zeros. "01.2.3.4" is not a valid dotted quad
+		// (the leading zero is an octal ambiguity other resolvers read differently), and accepting it here
+		// normalised a malformed literal into a valid, DIFFERENT-looking address.
+		if (八位组文本.some((part) => !/^(?:0|[1-9]\d{0,2})$/.test(part))) return null;
+		const o = 八位组文本.map(Number);
 		if (o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
 		const hex = ((o[0] << 8) | o[1]).toString(16) + ':' + ((o[2] << 8) | o[3]).toString(16);
 		text = text.slice(0, v4尾.index) + hex;
