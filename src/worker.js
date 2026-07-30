@@ -5964,9 +5964,18 @@ function IPv6转字节(地址) {
 	const 解析段 = (s) => (s ? s.split(':').filter((x) => x !== '') : []);
 	const 前 = 解析段(双冒号[0]);
 	const 后 = 双冒号.length === 2 ? 解析段(双冒号[1]) : [];
-	const 段 = 双冒号.length === 2
-		? [...前, ...new Array(8 - 前.length - 后.length).fill('0'), ...后]
-		: 前;
+	let 段;
+	if (双冒号.length === 2) {
+		// RFC 4291: `::` stands for ONE OR MORE omitted zero groups. Computing the fill length without
+		// checking it accepted "1:2:3:4:5:6:7::8" (eight explicit hextets AND a compression marker, so the
+		// marker covers nothing), and for an overfull address the length went negative and `new Array(-1)`
+		// threw RangeError — breaking this function's contract of returning null for anything malformed.
+		const 缺少 = 8 - 前.length - 后.length;
+		if (缺少 < 1) return null;
+		段 = [...前, ...new Array(缺少).fill('0'), ...后];
+	} else {
+		段 = 前;
+	}
 	if (段.length !== 8) return null;
 	const out = new Uint8Array(16);
 	for (let i = 0; i < 8; i++) {
@@ -9702,10 +9711,16 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 		return 值;
 	};
 	let hostname = hostPart, port = 默认端口;
-	if (hostPart.includes("]:")) {
-		const [ipv6Host, ipv6Port = ""] = hostPart.split("]:");
-		hostname = ipv6Host + "]";
-		port = 解析端口(ipv6Port);
+	if (hostPart.startsWith("[")) {
+		// ONE anchored match for the whole bracketed authority. Splitting on "]:" and destructuring two
+		// elements silently discarded any extra segment, so "[2001:db8::1]:80]:90" parsed as port 80 with
+		// the trailing junk ignored, and "[notipv6]" / "[1:2:3]" were accepted as hosts without ever being
+		// checked as addresses.
+		const 括号匹配 = hostPart.match(/^\[([0-9a-fA-F:.]+)\](?::(\d+))?$/);
+		if (!括号匹配) throw new Error(`Invalid proxy address format: malformed bracketed host "${hostPart}"`);
+		if (!IPv6转字节(括号匹配[1])) throw new Error(`Invalid proxy address format: "${括号匹配[1]}" is not a valid IPv6 address`);
+		hostname = `[${括号匹配[1]}]`;
+		port = 括号匹配[2] === undefined ? 默认端口 : 解析端口(括号匹配[2]);
 	} else if (!hostPart.startsWith("[")) {
 		const parts = hostPart.split(":");
 		if (parts.length === 2) {

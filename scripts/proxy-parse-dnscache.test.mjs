@@ -23,7 +23,9 @@ for (const file of BUILDS) {
 		// Use the REAL constants from the build; a looser stub sent single-character auth down the
 		// base64 branch and made the test fail on its own fixture rather than on the code.
 		src.match(/const SOCKS5账号Base64正则 = [^\n]+/)[0] +
-		ex(src, 'stripIPv6Brackets') + ex(src, '获取SOCKS5账号') + 'return 获取SOCKS5账号;')();
+		// 获取SOCKS5账号 validates a bracketed authority through IPv6转字节, which is a hoisted top-level
+		// function in the real build, so the harness must provide it too.
+		ex(src, 'stripIPv6Brackets') + ex(src, 'IPv6转字节') + ex(src, '获取SOCKS5账号') + 'return 获取SOCKS5账号;')();
 
 	// A password may contain colons; only the FIRST colon separates it from the username.
 	const withColons = parse('user:pa:ss:word@host:1080', 443);
@@ -43,6 +45,11 @@ for (const file of BUILDS) {
 	assert.equal(parse('host', 443).port, 443, `${file}: default port applies`);
 	assert.equal(parse('[2001:db8::1]:8443', 443).hostname, '[2001:db8::1]', `${file}: IPv6 host`);
 	assert.equal(parse('[2001:db8::1]:8443', 443).port, 8443, `${file}: IPv6 port`);
+	assert.equal(parse('[2001:db8::1]', 443).port, 443, `${file}: bracketed host without a port takes the default`);
+	// A bracketed authority is matched as a whole: contents must be a real address and nothing may trail it.
+	for (const bad of ['[notipv6]:80', '[1:2:3]:80', '[2001:db8::1]:80]:90', '[2001:db8::1]:80x', '[]:80']) {
+		assert.throws(() => parse(bad, 443), /Invalid proxy address format/, `${file}: "${bad}" must be rejected`);
+	}
 	assert.throws(() => parse('u@host:1080', 443), /username:password/, `${file}: auth without a colon is refused`);
 
 	// ---- parser strictness ----
@@ -53,7 +60,8 @@ for (const file of BUILDS) {
 	// A malformed escape must NOT throw -- an existing password with a bare '%' has to keep working.
 	assert.equal(parse('u:100%pure@host:80', 443).password, '100%pure', `${file}: bare % survives`);
 	// An empty host was accepted and then dialled as "".
-	for (const bad of ['u:p@:80', 'u:p@[]:80', ':p@host:80']) {
+	// "[]" is rejected by the stricter bracketed-authority matcher below, with its own message.
+	for (const bad of ['u:p@:80', ':p@host:80']) {
 		assert.throws(() => parse(bad, 443), /must not be empty/, `${file}: "${bad}" must be rejected`);
 	}
 
@@ -71,9 +79,21 @@ for (const file of BUILDS) {
 	assert.deepEqual([...wire.IPv6转字节('::1')].slice(-1), [1], `${file}: ::1 loopback`);
 	const mapped = wire.IPv6转字节('::ffff:1.2.3.4');
 	assert.deepEqual([...mapped].slice(-6), [0xff, 0xff, 1, 2, 3, 4], `${file}: IPv4-mapped tail`);
-	for (const bad of ['not-an-ip', '2001:db8::1::2', '', '1.2.3.4', 'gggg::1']) {
-		assert.equal(wire.IPv6转字节(bad), null, `${file}: "${bad}" must not parse as IPv6`);
+	// `::` must stand for AT LEAST ONE omitted zero group (RFC 4291). Eight explicit hextets plus a
+	// compression marker is malformed, and an overfull address must return null rather than throwing
+	// RangeError from a negative fill length.
+	for (const bad of ['not-an-ip', '2001:db8::1::2', '', '1.2.3.4', 'gggg::1',
+		'1:2:3:4:5:6:7::8', '1:2:3:4:5:6:7:8::', '::1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8:9']) {
+		let got;
+		assert.doesNotThrow(() => { got = wire.IPv6转字节(bad); }, `${file}: "${bad}" must return null, not throw`);
+		assert.equal(got, null, `${file}: "${bad}" must not parse as IPv6`);
 	}
+	// The overfull-with-compression case previously threw RangeError; it must now be null.
+	let overfull;
+	assert.doesNotThrow(() => { overfull = wire.IPv6转字节('1:2:3:4:5:6:7:8::9'); }, `${file}: overfull IPv6 must not throw`);
+	assert.equal(overfull, null, `${file}: overfull IPv6 must return null`);
+	// `::` alone is the unspecified address and IS valid (eight omitted groups).
+	assert.deepEqual([...wire.IPv6转字节('::')], new Array(16).fill(0), `${file}: :: is all-zero, still valid`);
 
 	// CONNECT authority must bracket IPv6 and leave everything else alone.
 	assert.equal(wire.格式化主机端口('2001:db8::1', 443), '[2001:db8::1]:443', `${file}: IPv6 authority must be bracketed`);
