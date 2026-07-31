@@ -139,6 +139,38 @@ for (const file of BUILDS) {
 		assert.match(r.原因 || '', /timed out/);
 	}
 
+	// 6b. WS EARLY DATA is a third ingress path. 解码WS早期数据 used to require a COMPLETE inner header
+	// (>=18 bytes for 魏烈思, >=58 for 木马), so a header split across [early data][first message] had its
+	// opening fragment silently discarded and the first real message began mid-header. Decoding must now
+	// validate only encoding and size, and hand every byte to the accumulator.
+	{
+		const decode = new Function(
+			'const WS早期数据最大字节 = 8192, WS早期数据最大头长度 = 10924;' +
+			ex(src, '解码WS早期数据') + 'return 解码WS早期数据;')();
+		const b64url = (bytes) => Buffer.from(bytes).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+		// Every prefix length, including ones far too short to be a recognisable header, must survive decoding.
+		for (const cut of [1, 5, 10, 17, 18, 30, headerLen]) {
+			const decoded = decode(b64url(header.subarray(0, cut)), UUID);
+			assert.ok(decoded && decoded.byteLength === cut,
+				`${file}: a ${cut}-byte early-data prefix must decode intact, not be discarded as "not a header"`);
+		}
+		// And the split must complete end-to-end through the accumulator.
+		for (let cut = 1; cut < header.length; cut++) {
+			const acc = mod.创建预认证累积器(UUID);
+			const early = decode(b64url(header.subarray(0, cut)), UUID);
+			assert.ok(early, `${file}: early-data cut=${cut} decoded to null`);
+			const a = acc.推入(early);
+			if (a.状态 === 'ok') continue;            // whole header fitted in early data
+			assert.equal(a.状态, 'need_more', `${file}: early-data cut=${cut} was rejected (${a.原因})`);
+			const b = acc.推入(header.subarray(cut));
+			assert.equal(b.状态, 'ok', `${file}: early-data cut=${cut} failed once the first message arrived`);
+			assert.equal(b.结果.hostname, 'example.com', `${file}: early-data cut=${cut} wrong destination`);
+		}
+		// Size and encoding are still enforced.
+		assert.equal(decode('!!!not-base64!!!', UUID), null, `${file}: malformed base64url must be refused`);
+		assert.throws(() => decode(b64url(new Uint8Array(9000)), UUID), /too large/, `${file}: oversized early data must throw`);
+	}
+
 	// 7. Both transports must actually USE the accumulator, not their own inline classifier.
 	assert.match(src, /WS预认证 = 创建预认证累积器\(yourUUID\)/, `${file}: WS must use the shared accumulator`);
 	assert.match(src, /gRPC预认证 = 创建预认证累积器\(yourUUID\)/, `${file}: gRPC must use the shared accumulator`);

@@ -123,7 +123,17 @@ for (const file of BUILDS) {
 	}
 
 	// ---- proxy cache key must not collide ----
-	const ck = new Function('const PROXY_RESOLUTION_CACHE_VERSION = 2;' + ex(src, 'proxyCacheKey') + 'return proxyCacheKey;')();
+	// proxyCacheKey digests its tuple, so the harness needs sha224 and its LRU memo.
+	const ck = new Function(
+		'const PROXY_RESOLUTION_CACHE_VERSION = 3;' +
+		'const SHA224_RESULT_CACHE = new Map(); const HASH_CACHE_MAX_ENTRIES = 256;' +
+		ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224') +
+		ex(src, 'proxyCacheKey') + 'return proxyCacheKey;')();
+	// Fixed-length and credential-free: Workers KV caps a key at 512 bytes, and a plaintext key also put
+	// the UUID into KV key NAMES where listings expose it.
+	const 巨型 = ck('p'.repeat(500), 'h'.repeat(500) + '.example.com', '8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04');
+	assert.ok(new TextEncoder().encode(巨型).byteLength <= 512, `${file}: cache key must fit KV's 512-byte limit, got ${new TextEncoder().encode(巨型).byteLength}`);
+	assert.ok(!巨型.includes('8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04'), `${file}: the UUID must not appear in the cache key`);
 	// This exact pair collides under the old 32-bit stableHashText (both -> 4a10ac9e), which meant two
 	// unrelated destinations shared one proxy-resolution entry.
 	assert.notEqual(ck('p', 'me4ass0cl38u.com', 'u'), ck('p', 'twm7ryzpvqkh.com', 'u'),

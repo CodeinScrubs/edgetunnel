@@ -1795,7 +1795,13 @@ function 解码WS早期数据(header, token) {
 	}
 
 	if (bytes.byteLength > WS早期数据最大字节) throw new Error('early data is too large');
-	return 是有效WS早期数据(bytes, token) ? bytes : null;
+	// Return the bytes WITHOUT requiring a complete inner header. 是有效WS早期数据 demanded >=18 bytes for
+	// 魏烈思 or >=58 for 木马, so a header split across [early data][first message] had its opening fragment
+	// SILENTLY DISCARDED and the first real message then began mid-header. That is the same
+	// transport-unit-equals-protocol-packet mistake the accumulator exists to remove — it just lived on a
+	// different ingress path. Decoding now validates only encoding and size; the accumulator decides
+	// need_more / invalid / ok, exactly as it does for ordinary messages.
+	return bytes;
 }
 
 
@@ -10478,11 +10484,18 @@ function stableHashText(value) {
 // is length-prefixed so the separator cannot be forged by a value that itself contains one ('a:b' + 'c'
 // must not key the same as 'a' + 'b:c'). Version bumped so old 32-bit entries are never read back.
 function proxyCacheKey(proxyIP, targetHost = '', UUID = '') {
+	// Length-prefixed so a value containing the separator cannot forge one: 'a:b'+'c' must not key the same
+	// as 'a'+'b:c'. Then DIGESTED, for two reasons the plaintext version got wrong:
+	//   - Workers KV caps a key at 512 bytes, and proxyIP + hostname + UUID can exceed that for long but
+	//     entirely legitimate values, which would fail the read and the write rather than just miss.
+	//   - A plaintext key put the UUID — a live credential — into KV key NAMES, where it shows up in key
+	//     listings and any administrative tooling that enumerates them.
+	// sha224 is already memoised here, so this costs nothing on the hot path and the key is fixed-length.
 	const 规范 = (value) => {
 		const text = String(value ?? '').trim().toLowerCase();
 		return `${text.length}:${text}`;
 	};
-	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${规范(proxyIP)}|${规范(targetHost)}|${规范(UUID)}`;
+	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${sha224(`${规范(proxyIP)}|${规范(targetHost)}|${规范(UUID)}`)}`;
 }
 
 function proxyEndpointKey(endpoint) {
