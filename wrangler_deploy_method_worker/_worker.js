@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-31 src:48ca6d363ec1
+// Build: 2026-07-31 src:ec31d9d884bf
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-31 src:48ca6d363ec1';
+const Version = '2026-07-31 src:ec31d9d884bf';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -165,6 +165,11 @@ const XHTTP_FIRST_PACKET_MAX_BYTES = ENGINE_DEFAULTS.XHTTP_FIRST_PACKET_MAX_BYTE
 // Whole-phase deadline for reading an XHTTP first packet, before any Response exists. Generous: a real
 // client sends its header immediately, so this only ever fires on a stalled or hostile peer.
 const XHTTP_PREAUTH_TIMEOUT_MS = 10000;
+// Shared inner-header pre-auth budget for WS and gRPC. The byte cap bounds memory; the timeout is an
+// ABSOLUTE deadline from connection acceptance, never restarted per message, so a peer cannot hold an
+// unauthenticated connection open by drip-feeding one byte at a time under every other limit.
+const 预认证最大字节 = 64 * 1024;
+const 预认证超时毫秒 = 10000;
 const PROXY_RESOLUTION_CACHE_VERSION = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_VERSION;
 const PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES;
 const PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS = ENGINE_DEFAULTS.PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS;
@@ -1187,6 +1192,176 @@ function 有效数据长度(data) {
 	return 0;
 }
 
+// ONE tri-state inner-header parser pair, shared by every transport.
+//
+// These lived as closures inside 读取XHTTP首包, so only XHTTP could parse a header incrementally. WS and
+// gRPC each re-implemented "assume this message IS a complete header", which meant a legitimate client
+// that split a valid inner header across two WebSocket messages or two protobuf fields was
+// rejected outright. Transport framing is not protocol framing: nothing guarantees one WS message or one
+// gRPC data field carries a whole header.
+//
+// 'need_more' = valid so far, keep accumulating. 'invalid' = definitively not this protocol. 'ok' = the
+// complete header plus its trailing application bytes.
+// Its OWN decoder, not an alias of the later one. A module-level `const x = y` where y is declared further
+// down the file throws at module-init time (temporal dead zone) — the function bodies below would have been
+// fine, because they only run per request, but this assignment does not wait for them.
+const 预认证解码器 = new TextDecoder();
+
+function 解析魏烈思首包三态(data, token) {
+	const length = data.byteLength;
+	if (length < 18) return { 状态: 'need_more' };
+	if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
+
+	const optLen = data[17];
+	const cmdIndex = 18 + optLen;
+	if (length < cmdIndex + 1) return { 状态: 'need_more' };
+
+	const cmd = data[cmdIndex];
+	if (cmd !== 1 && cmd !== 2) return { 状态: 'invalid' };
+
+	const portIndex = cmdIndex + 1;
+	if (length < portIndex + 3) return { 状态: 'need_more' };
+
+	const port = (data[portIndex] << 8) | data[portIndex + 1];
+	const addressType = data[portIndex + 2];
+	const addressIndex = portIndex + 3;
+	let headerLen = -1;
+	let hostname = '';
+
+	if (addressType === 1) {
+		if (length < addressIndex + 4) return { 状态: 'need_more' };
+		hostname = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
+		headerLen = addressIndex + 4;
+	} else if (addressType === 2) {
+		if (length < addressIndex + 1) return { 状态: 'need_more' };
+		const domainLen = data[addressIndex];
+		if (length < addressIndex + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = 预认证解码器.decode(data.subarray(addressIndex + 1, addressIndex + 1 + domainLen));
+		headerLen = addressIndex + 1 + domainLen;
+	} else if (addressType === 3) {
+		if (length < addressIndex + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = addressIndex + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		headerLen = addressIndex + 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'vl' + 'ess',
+			hostname,
+			port,
+			isUDP: cmd === 2,
+			rawData: data.subarray(headerLen),
+			respHeader: new Uint8Array([data[0], 0]),
+		}
+	};
+};
+
+
+function 解析木马首包三态(data, token) {
+	const length = data.byteLength;
+	if (length < 58) return { 状态: 'need_more' };
+	if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
+	const 密码哈希 = sha224(token);
+	const 密码哈希字节 = new TextEncoder().encode(密码哈希);
+	for (let i = 0; i < 56; i++) {
+		if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
+	}
+
+	const socksStart = 58;
+	if (length < socksStart + 2) return { 状态: 'need_more' };
+	const cmd = data[socksStart];
+	if (cmd !== 1 && cmd !== 3) return { 状态: 'invalid' };
+	const isUDP = cmd === 3;
+
+	const atype = data[socksStart + 1];
+	let cursor = socksStart + 2;
+	let hostname = '';
+
+	if (atype === 1) {
+		if (length < cursor + 4) return { 状态: 'need_more' };
+		hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
+		cursor += 4;
+	} else if (atype === 3) {
+		if (length < cursor + 1) return { 状态: 'need_more' };
+		const domainLen = data[cursor];
+		if (length < cursor + 1 + domainLen) return { 状态: 'need_more' };
+		hostname = 预认证解码器.decode(data.subarray(cursor + 1, cursor + 1 + domainLen));
+		cursor += 1 + domainLen;
+	} else if (atype === 4) {
+		if (length < cursor + 16) return { 状态: 'need_more' };
+		const ipv6 = [];
+		for (let i = 0; i < 8; i++) {
+			const base = cursor + i * 2;
+			ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
+		}
+		hostname = ipv6.join(':');
+		cursor += 16;
+	} else return { 状态: 'invalid' };
+
+	if (!hostname) return { 状态: 'invalid' };
+	if (length < cursor + 4) return { 状态: 'need_more' };
+
+	const port = (data[cursor] << 8) | data[cursor + 1];
+	if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { 状态: 'invalid' };
+	const dataOffset = cursor + 4;
+
+	return {
+		状态: 'ok',
+		结果: {
+			协议: 'trojan',
+			hostname,
+			port,
+			isUDP,
+			rawData: data.subarray(dataOffset),
+			respHeader: null,
+		}
+	};
+}
+
+// Bounded accumulator shared by WS and gRPC. Owns its buffer (grows geometrically), enforces one ABSOLUTE
+// deadline that does not restart per message, and caps total pre-auth bytes.
+function 创建预认证累积器(token, 最大字节 = 预认证最大字节, 超时毫秒 = 预认证超时毫秒) {
+	let buffer = new Uint8Array(1024);
+	let offset = 0;
+	const 截止 = Date.now() + 超时毫秒;
+	return {
+		get 已缓冲() { return offset; },
+		get 已超时() { return Date.now() >= 截止; },
+		剩余毫秒() { return Math.max(0, 截止 - Date.now()); },
+		推入(chunk) {
+			if (Date.now() >= 截止) return { 状态: 'invalid', 原因: 'pre-auth timed out' };
+			const bytes = 数据转Uint8Array(chunk);
+			if (offset + bytes.byteLength > 最大字节) return { 状态: 'invalid', 原因: 'pre-auth data too large' };
+			if (offset + bytes.byteLength > buffer.byteLength) {
+				const grown = new Uint8Array(Math.max(buffer.byteLength * 2, offset + bytes.byteLength));
+				grown.set(buffer.subarray(0, offset));
+				buffer = grown;
+			}
+			buffer.set(bytes, offset);
+			offset += bytes.byteLength;
+			const 当前 = buffer.subarray(0, offset);
+			// 木马 first: its 56-byte hash prefix is a definitive match, so it cannot be mistaken for a
+			// 魏烈思 header that merely has not arrived yet.
+			const 木马 = 解析木马首包三态(当前, token);
+			if (木马.状态 === 'ok') return { 状态: 'ok', 协议: 'trojan', 结果: 木马.结果 };
+			const 魏烈思 = 解析魏烈思首包三态(当前, token);
+			if (魏烈思.状态 === 'ok') return { 状态: 'ok', 协议: 'vless', 结果: 魏烈思.结果 };
+			// Only give up when BOTH parsers have definitively rejected. Either still saying need_more means
+			// the header may simply be incomplete -- which is the whole bug this exists to fix.
+			if (木马.状态 === 'invalid' && 魏烈思.状态 === 'invalid') return { 状态: 'invalid', 原因: 'not a valid inner header' };
+			return { 状态: 'need_more' };
+		},
+	};
+}
+
 async function 读取XHTTP首包(reader, token) {
 	const decoder = VLESS文本解码器;
 
@@ -1366,6 +1541,8 @@ async function 处理gRPC请求(request, yourUUID) {
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	const 魏烈思UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马 = null;
+	// Shared incremental inner-header accumulator; also carries the absolute pre-auth deadline.
+	let gRPC预认证 = null;
 	let 当前写入Socket = null;
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
@@ -1559,7 +1736,14 @@ async function 处理gRPC请求(request, yourUUID) {
 				let 正常结束 = false;
 				let 预认证帧数 = 0, 预认证无数据帧数 = 0;
 				while (true) {
-					const { done, value } = await reader.read();
+					// Bound the READ itself while unauthenticated, against ONE absolute deadline that never
+					// restarts per read. Frame and byte caps bound memory but not time, so a peer that sends
+					// nothing at all previously held the request, its parser state and its queue open forever.
+					const 读取前已认证 = Boolean(remoteConnWrapper.socket) || isDnsQuery;
+					if (!读取前已认证 && !gRPC预认证) gRPC预认证 = 创建预认证累积器(yourUUID);
+					const { done, value } = 读取前已认证
+						? await reader.read()
+						: await readWithOperationTimeout(reader, Math.max(1, gRPC预认证.剩余毫秒()), 'gRPC pre-authentication timed out');
 					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
 					if (!value || value.byteLength === 0) continue;
 					let 待并入 = value instanceof Uint8Array ? value : new Uint8Array(value);
@@ -1593,44 +1777,34 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (remoteConnWrapper.socket) {
 							if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
 						} else {
-							const 首包bytes = 数据转Uint8Array(payload);
-							if (判断是否是木马 === null) {
-								// Authenticate 魏烈思 by UUID first; only fall to the 木马 CRLF heuristic when it isn't ours.
-								const 是魏烈思 = 首包bytes.byteLength >= 18 && UUID字节匹配(首包bytes, 1, yourUUID);
-								判断是否是木马 = !是魏烈思 && 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
+							// ACCUMULATE across protobuf fields. A gRPC data field is not a protocol packet — the
+							// spec is explicit that HTTP/2 DATA-frame boundaries are unrelated to message
+							// boundaries — so a valid header split across two fields was previously rejected.
+							if (!gRPC预认证) gRPC预认证 = 创建预认证累积器(yourUUID);
+							const 预认证结果 = gRPC预认证.推入(payload);
+							if (预认证结果.状态 === 'need_more') continue;  // valid so far; wait for the rest
+							if (预认证结果.状态 === 'invalid') throw new Error(`Invalid inner header: ${预认证结果.原因}`);
+							const 首包 = 预认证结果.结果;
+							判断是否是木马 = 预认证结果.协议 === 'trojan';
+							gRPC预认证 = null;                              // release the pre-auth buffer
+							// Protocol名 stays non-ASCII on purpose: the dashboard-signature gate caps how many plain
+						// "VLESS"/"Trojan" tokens the artifact may carry, because that density is what tripped the
+						// Cloudflare 1101 characteristic check before.
+						log(`[gRPC] ${判断是否是木马 ? '木马' : '魏烈思'} first packet: ${首包.hostname}:${首包.port} | UDP: ${首包.isUDP ? 'yes' : 'no'}`);
+							if (isSpeedTestSite(首包.hostname)) throw new Error('Speedtest site is blocked');
+							if (首包.isUDP) {
+								if (!判断是否是木马 && 首包.port !== 53) throw new Error('UDP is not supported');
+								isDnsQuery = true;
+								if (首包.respHeader) grpcBridge.send(首包.respHeader);
+								if (有效数据长度(首包.rawData) > 0) {
+									if (判断是否是木马) await 转发木马UDP数据(首包.rawData, grpcBridge, 木马UDP上下文, request);
+									else await forwardataudp(首包.rawData, grpcBridge, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
+								}
+								continue;
 							}
-							if (判断是否是木马) {
-								const 解析结果 = 解析木马请求(首包bytes, yourUUID);
-								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-								const { port, hostname, rawClientData, isUDP } = 解析结果;
-								log(`[gRPC] Trojan first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
-								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-								if (isUDP) {
-									isDnsQuery = true;
-									if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
-								} else {
-									await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
-								}
-							} else {
-								判断是否是木马 = false;
-								const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
-								if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid VLESS request');
-								const { port, hostname, version, isUDP, rawClientData } = 解析结果;
-								log(`[gRPC] VLESS first packet: ${hostname}:${port} | UDP: ${isUDP ? 'yes' : 'no'}`);
-								if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-								if (isUDP) {
-									if (port !== 53) throw new Error('UDP is not supported');
-									isDnsQuery = true;
-								}
-								const respHeader = new Uint8Array([version, 0]);
-								grpcBridge.send(respHeader);
-								const rawData = rawClientData;
-								if (isDnsQuery) {
-									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-									else await forwardataudp(rawData, grpcBridge, null, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
-								}
-								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
-							}
+							if (首包.respHeader) grpcBridge.send(首包.respHeader);
+							await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request);
+							continue;
 						}
 						}
 						刷新发送队列();
@@ -1797,6 +1971,10 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS强制关闭定时器 = null;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	// Shared incremental inner-header accumulator + its ABSOLUTE deadline, armed at accept() and never
+	// restarted per message. Released the moment authentication completes.
+	let WS预认证 = null, WS预认证定时器 = null;
+	const 清除WS预认证定时器 = () => { if (WS预认证定时器) { try { clearTimeout(WS预认证定时器) } catch (e) { } WS预认证定时器 = null; } };
 	let ss上下文 = null, ss初始化任务 = null;
 
 	const 释放远端写入器 = () => {
@@ -1836,6 +2014,19 @@ async function 处理WS请求(request, yourUUID, url) {
 	const 写入远端 = async (chunk, allowRetry = true) => {
 		return 上行写入队列.写入并等待(chunk, allowRetry);
 	};
+
+	// Absolute pre-auth deadline. WS answers 101 immediately, so without this an unauthenticated peer holds
+	// the connection, its parser state and its queue open indefinitely by simply sending nothing — the byte
+	// and frame caps bound memory but never time. Armed once here, never restarted per message; every exit
+	// path clears it via 清除WS预认证定时器. 1008 = policy violation.
+	WS预认证定时器 = setTimeout(() => {
+		WS预认证定时器 = null;
+		if (判断协议类型 !== null || isDnsQuery) return; // already authenticated
+		log(`[WS forwarding] pre-authentication timed out after ${预认证超时毫秒}ms; closing`);
+		try { 上行写入队列.清空() } catch (e) { }
+		关闭连接全部Socket(remoteConnWrapper);
+		closeSocketQuietly(serverSock, 1008);
+	}, 预认证超时毫秒);
 
 	// WS first packet must be parsed before a remote TCP socket exists. The upload queue is only
 	// valid after forwardataTCP() has created remoteConnWrapper.socket. If we enqueue the first
@@ -2108,24 +2299,48 @@ async function 处理WS请求(request, yourUUID, url) {
 		}
 		if (await 尝试写入已存在远端(chunk)) return;
 
-		if (判断协议类型 === null) {
-			if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
-			else {
-				当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-				const bytes = 当前块字节;
-				// Authenticate the 魏烈思 UUID first; only fall to the 木马 CRLF heuristic when it isn't ours
-				// (a 魏烈思 packet whose bytes 56-57 coincidentally equal CRLF must not be misrouted to 木马).
-				const 是魏烈思 = bytes.byteLength >= 18 && UUID字节匹配(bytes, 1, yourUUID);
-				判断协议类型 = (!是魏烈思 && bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a) ? 'trojan' : 'vless';
-			}
-			判断是否是木马 = 判断协议类型 === 'trojan';
-			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
+		if (判断协议类型 === null && url.searchParams.get('enc')) {
+			判断协议类型 = 'ss';
+			判断是否是木马 = false;
+			log(`[WS forwarding] Protocol: ss | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
 		}
 
 		if (判断协议类型 === 'ss') {
 			await 处理SS数据(chunk);
 			return;
 		}
+
+		// ACCUMULATE the inner header instead of assuming this one message contains all of it. A WebSocket
+		// message boundary is not a protocol boundary: a client is free to split a valid inner header
+		// across two frames, and classifying on the first partial frame rejected it outright. The shared
+		// accumulator also carries the absolute pre-auth deadline, so an unauthenticated peer cannot hold the
+		// connection open by drip-feeding.
+		if (判断协议类型 === null) {
+			if (!WS预认证) WS预认证 = 创建预认证累积器(yourUUID);
+			const 结果 = WS预认证.推入(chunk);
+			if (结果.状态 === 'need_more') return;                       // valid so far; wait for the rest
+			if (结果.状态 === 'invalid') throw new Error(`Invalid inner header: ${结果.原因}`);
+			判断协议类型 = 结果.协议 === 'trojan' ? 'trojan' : 'vless';
+			判断是否是木马 = 判断协议类型 === 'trojan';
+			WS预认证 = null;                                              // release the pre-auth buffer
+			清除WS预认证定时器();
+			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
+			const 首包 = 结果.结果;
+			if (isSpeedTestSite(首包.hostname)) throw new Error('Speedtest site is blocked');
+			if (首包.isUDP) {
+				if (判断是否是木马) {
+					isDnsQuery = true;
+					if (有效数据长度(首包.rawData) > 0) return 转发木马UDP数据(首包.rawData, serverSock, 木马UDP上下文, request);
+					return;
+				}
+				if (首包.port !== 53) throw new Error('UDP is not supported');
+				isDnsQuery = true;
+				return forwardataudp(首包.rawData, serverSock, 首包.respHeader, request, null, 魏烈思UDP上下文, remoteConnWrapper.追踪);
+			}
+			await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, serverSock, 首包.respHeader, remoteConnWrapper, yourUUID, request);
+			return;
+		}
+
 		if (await 尝试写入已存在远端(chunk)) return;
 		if (判断协议类型 === 'trojan') {
 			const 解析结果 = 解析木马请求(chunk, yourUUID);
@@ -2171,6 +2386,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		// no err text, because the failure flag was set here while the error itself was dropped — and the WS
 		// close listener then labelled the connection a plain client_close. An error you cannot name is not
 		// diagnosable.
+		清除WS预认证定时器();
 		if (!WS传输错误文本) WS传输错误文本 = msg;
 		if (msg.includes('Network connection lost') || msg.includes('ReadableStream is closed')) {
 			log(`[WS forwarding] Connection ended: ${msg}`);
@@ -2323,6 +2539,7 @@ async function 处理WS请求(request, yourUUID, url) {
 		// Mark this as a CLIENT-initiated close so the downlink pipe doesn't score the (possibly healthy)
 		// route as failed or burn a ProxyIP fallback dial on a connection the client already abandoned.
 		remoteConnWrapper.客户端已关闭 = true;
+		清除WS预认证定时器();
 		// Record the WS-level close facts and the LIVE queue/socket state. Every hung invocation in a capture
 		// ended right here with reason=client_close and nothing after it, and the existing close event only
 		// carries historical maxima (q_max_*), so it cannot show whether a write was still outstanding at this
