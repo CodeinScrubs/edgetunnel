@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 const {
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
+	PROXY_RESOLUTION_CACHE_VERSION,
 	PROXY_RESOLUTION_CACHE_KV_TTL_SECONDS,
 	PROXY_RESOLUTION_L1_CACHE,
 	DNS_RESULT_CACHE,
@@ -189,7 +190,7 @@ function decodeDnsQuestion(packet) {
 
 {
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		createdAt: now - 1_000,
 		updatedAt: now - 1_000,
 		endpoints: [
@@ -221,7 +222,7 @@ function decodeDnsQuestion(packet) {
 
 {
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now - 30 * 60 * 1000,
 		endpoints: [['1.1.1.1', 443]],
 	}, now);
@@ -232,7 +233,7 @@ function decodeDnsQuestion(packet) {
 
 {
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now - 7 * 60 * 60 * 1000,
 		endpoints: [['1.1.1.1', 443]],
 	}, now);
@@ -270,7 +271,7 @@ function decodeDnsQuestion(packet) {
 
 {
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now,
 		endpoints: [['a.example', 443]],
 		health: {},
@@ -288,7 +289,7 @@ function decodeDnsQuestion(packet) {
 {
 	const resolutionUpdatedAt = now - 30 * 60 * 1000;
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: resolutionUpdatedAt,
 		endpoints: [['freshness.example', 443]],
 		health: {},
@@ -344,7 +345,7 @@ function decodeDnsQuestion(packet) {
 	PROXY_RESOLUTION_L1_CACHE.clear();
 	const cacheKey = proxyCacheKey('proxy.example.com');
 	const stored = JSON.stringify({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now,
 		endpoints: [['kv.example.com', 443]],
 		health: { 'kv.example.com:443': { successes: 3, latencyMs: 90, lastSeenAt: now } },
@@ -389,7 +390,7 @@ function decodeDnsQuestion(packet) {
 		},
 	};
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now,
 		endpoints: [['write.example.com', 443]],
 		health: {},
@@ -407,21 +408,34 @@ function decodeDnsQuestion(packet) {
 }
 
 {
-	// Persistent proxy KV cache is ON by default now (writes are globally throttled + TTL'd).
-	assert.equal(isProxyResolutionKvCacheEnabled({}), true, 'proxy KV cache is on by default');
+	// Persistent proxy KV cache is OPT-IN. It used to default ON, justified by the global write throttle —
+	// but that throttle is a MODULE variable, so it is per-isolate, not account-wide, and several isolates
+	// or colos each keep their own clock. It therefore bounds write rate without being able to guarantee
+	// the free plan's 1000 writes/day. A quota-consuming background write should not be on by default.
+	assert.equal(isProxyResolutionKvCacheEnabled({}), false, 'proxy KV cache must be opt-in');
+	assert.equal(isProxyResolutionKvCacheEnabled({ ENABLE_KV_PROXY_CACHE: '' }), false, 'an empty value is not opt-in');
+	assert.equal(isProxyResolutionKvCacheEnabled({ ENABLE_KV_PROXY_CACHE: '1' }), true, 'explicit 1 enables it');
 	assert.equal(isProxyResolutionKvCacheEnabled({ OFF_PROXY_CACHE: '1' }), false, 'OFF_PROXY_CACHE disables it');
 	assert.equal(isProxyResolutionKvCacheEnabled({ ENABLE_KV_PROXY_CACHE: '0' }), false, 'explicit 0 disables it');
 
 	resetProxyCacheKvThrottle();
+	// No flag => no KV write at all, which is the point of making it opt-in.
+	const offByDefaultPuts = [];
+	scheduleProxyCacheWrite({ KV: { put(k, v, o) { offByDefaultPuts.push({ k }); return Promise.resolve(); } } },
+		null, 'cache-key', normalizeProxyCacheRecord({ version: PROXY_RESOLUTION_CACHE_VERSION, updatedAt: now, endpoints: [['on.example.com', 443]], health: {} }, now), now, true);
+	assert.equal(offByDefaultPuts.length, 0, 'no KV write without an explicit opt-in flag');
+
+	// With the flag set it writes exactly once.
+	resetProxyCacheKvThrottle();
 	const onPuts = [];
-	scheduleProxyCacheWrite({ KV: { put(k, v, o) { onPuts.push({ k }); return Promise.resolve(); } } },
-		null, 'cache-key', normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['on.example.com', 443]], health: {} }, now), now, true);
-	assert.equal(onPuts.length, 1, 'default-on cache writes without an explicit flag');
+	scheduleProxyCacheWrite({ ENABLE_KV_PROXY_CACHE: '1', KV: { put(k, v, o) { onPuts.push({ k }); return Promise.resolve(); } } },
+		null, 'cache-key', normalizeProxyCacheRecord({ version: PROXY_RESOLUTION_CACHE_VERSION, updatedAt: now, endpoints: [['on.example.com', 443]], health: {} }, now), now, true);
+	assert.equal(onPuts.length, 1, 'an explicit opt-in flag enables the write');
 
 	resetProxyCacheKvThrottle();
 	const offPuts = [];
 	scheduleProxyCacheWrite({ OFF_PROXY_CACHE: '1', KV: { put(k, v, o) { offPuts.push({ k }); return Promise.resolve(); } } },
-		null, 'cache-key', normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['off.example.com', 443]], health: {} }, now), now, true);
+		null, 'cache-key', normalizeProxyCacheRecord({ version: PROXY_RESOLUTION_CACHE_VERSION, updatedAt: now, endpoints: [['off.example.com', 443]], health: {} }, now), now, true);
 	assert.equal(offPuts.length, 0, 'OFF_PROXY_CACHE suppresses the write');
 }
 
@@ -430,8 +444,8 @@ function decodeDnsQuestion(packet) {
 	resetProxyCacheKvThrottle();
 	const puts = [];
 	const env = { ENABLE_KV_PROXY_CACHE: '1', KV: { put(k, v, o) { puts.push({ k }); return Promise.resolve(); } } };
-	const recA = normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['a.example.com', 443]], health: {} }, now);
-	const recB = normalizeProxyCacheRecord({ version: 1, updatedAt: now, endpoints: [['b.example.com', 443]], health: {} }, now);
+	const recA = normalizeProxyCacheRecord({ version: PROXY_RESOLUTION_CACHE_VERSION, updatedAt: now, endpoints: [['a.example.com', 443]], health: {} }, now);
+	const recB = normalizeProxyCacheRecord({ version: PROXY_RESOLUTION_CACHE_VERSION, updatedAt: now, endpoints: [['b.example.com', 443]], health: {} }, now);
 	scheduleProxyCacheWrite(env, null, 'key-a', recA, now, true);
 	scheduleProxyCacheWrite(env, null, 'key-b', recB, now + 1_000, true);
 	assert.equal(puts.length, 1, 'second distinct-key write within the global interval is throttled');
@@ -441,7 +455,7 @@ function decodeDnsQuestion(packet) {
 
 {
 	const record = normalizeProxyCacheRecord({
-		version: 1,
+		version: PROXY_RESOLUTION_CACHE_VERSION,
 		updatedAt: now,
 		endpoints: [['throw.example.com', 443]],
 		health: {},

@@ -66,7 +66,7 @@ const ENGINE_DEFAULTS = {
 	WS_BUFFERED_AMOUNT_MAX_WAIT_MS: 1000,
 	GRPC_MAX_FRAME_PAYLOAD_BYTES: 4 * 1024 * 1024,
 	XHTTP_FIRST_PACKET_MAX_BYTES: 64 * 1024,
-	PROXY_RESOLUTION_CACHE_VERSION: 1,
+	PROXY_RESOLUTION_CACHE_VERSION: 2,
 	PROXY_RESOLUTION_CACHE_MAX_L1_ENTRIES: 64,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS: 8,
 	PROXY_RESOLUTION_CACHE_FRESH_TTL_MS: 10 * 60 * 1000,
@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-07-30 src:f7448192fc0e panel';
+const Version = '2026-07-31 src:6ef58d77482e panel';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -263,9 +263,11 @@ function isProxyResolutionKvCacheEnabled(env = {}) {
 	// shared with panel config, disable with OFF_PROXY_CACHE=1 or ENABLE_KV_PROXY_CACHE=0; the bounded
 	// in-memory L1 cache keeps working either way.
 	if (isEnabledEnvFlag(env.OFF_PROXY_CACHE) || isEnabledEnvFlag(env.DISABLE_KV_PROXY_CACHE)) return false;
-	const explicit = String(env.ENABLE_KV_PROXY_CACHE ?? env.KV_PROXY_CACHE ?? '').trim().toLowerCase();
-	if (['0', 'false', 'no', 'off'].includes(explicit)) return false;
-	return true;
+	// OPT-IN. This defaulted ON, but the write throttle above is a MODULE variable — per isolate, not
+	// account-wide — so several isolates or colos each keep their own clock and the free plan's 1000
+	// writes/day cannot be guaranteed by it. Defaulting a quota-consuming background write to on is the
+	// wrong trade for a free-plan build; the bounded in-memory L1 cache still works either way.
+	return isEnabledEnvFlag(env.ENABLE_KV_PROXY_CACHE ?? env.KV_PROXY_CACHE);
 }
 
 function getDohLookupUrl(env = {}) {
@@ -945,6 +947,13 @@ export default {
 			try { const u = new URL(伪装页URL); 伪装页URL = u.protocol + '//' + u.host } catch (e) { 伪装页URL = 'nginx' }
 		}
 		if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 530, statusText: 'Origin Error', headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		// Only GET/HEAD may reach the camouflage origin. This used to forward request.method AND request.body,
+		// so a wrong PATH, a bad credential or a malformed tunnel POST shipped raw tunnel bytes — which can
+		// carry the inner header and payload — to a third-party site the operator merely chose to imitate.
+		// Anything else gets the built-in page, which is what an ordinary web server would answer anyway.
+		if (request.method !== 'GET' && request.method !== 'HEAD') {
+			return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+		}
 		try {
 			const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
 			// Never forward our own auth cookie or client-identifying headers to the camouflage origin.
@@ -9583,11 +9592,11 @@ function stableHashText(value) {
 }
 
 function proxyCacheKey(proxyIP, targetHost = '', UUID = '') {
-	const baseKey = `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${stableHashText(String(proxyIP || '').toLowerCase())}`;
-	const targetKey = String(targetHost || '').toLowerCase();
-	const uuidKey = String(UUID || '').toLowerCase();
-	if (!targetKey && !uuidKey) return baseKey;
-	return `${baseKey}:${stableHashText(targetKey)}:${stableHashText(uuidKey)}`;
+	const 规范 = (value) => {
+		const text = String(value ?? '').trim().toLowerCase();
+		return `${text.length}:${text}`;
+	};
+	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${规范(proxyIP)}|${规范(targetHost)}|${规范(UUID)}`;
 }
 
 function proxyEndpointKey(endpoint) {
@@ -9834,9 +9843,16 @@ function recordProxyEndpointResult(record, endpoint, success, latencyMs, now = D
 function parsePreferredEndpointText(value) {
 	if (typeof value !== 'string') return null;
 	const text = value.trim();
-	const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+	// Dots belong inside the brackets too: '[::ffff:1.2.3.4]' is a legitimate IPv4-mapped address and was
+	// being refused for containing them. The bracket contents are validated properly by IPv6转字节 below,
+	// so this character class only has to admit the candidate, not decide it.
+	const regex = /^(\[[\da-fA-F:.]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
 	const match = text.match(regex);
 	if (!match) return null;
+	// A bracketed authority must contain a REAL IPv6 address. The regex alone allowed any hex-and-colon
+	// run, so '[:::]' and '[1:2:3]' were accepted while the valid '[::ffff:1.2.3.4]' was refused for
+	// containing dots. Route it through the one parser that actually decodes an address.
+	if (match[1].startsWith('[') && !IPv6转字节(match[1])) return null;
 	const port = match[2] || '443';
 	const portNumber = Number(port);
 	if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;

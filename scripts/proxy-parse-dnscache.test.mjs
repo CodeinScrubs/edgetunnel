@@ -107,6 +107,43 @@ for (const file of BUILDS) {
 	assert.match(s5, /0x05, 0x01, 0x00, 0x04, \.\.\.字节/, `${file}: SOCKS5 must send ATYP 0x04 for a literal IPv6`);
 	assert.match(s5, /0x05, 0x01, 0x00, 0x03, hostBytes\.length/, `${file}: SOCKS5 must still send ATYP 0x03 for a domain`);
 
+	// ---- endpoint parser must agree with IPv6转字节, not its own regex ----
+	const endpoint = new Function(
+		'const IPv6方括号正则 = /^\\[.*\\]$/;' +
+		ex(src, 'stripIPv6Brackets') + ex(src, 'IPv6转字节') + ex(src, 'parsePreferredEndpointText') +
+		'return parsePreferredEndpointText;')();
+	// Valid IPv4-mapped form was refused for containing dots.
+	assert.ok(endpoint('[::ffff:1.2.3.4]:443'), `${file}: [::ffff:1.2.3.4] is valid and must be accepted`);
+	// Shape-only matches that are not addresses were accepted.
+	for (const bad of ['[:::]:443', '[1:2:3]:443', '[notipv6]:443', '[]:443']) {
+		assert.equal(endpoint(bad), null, `${file}: "${bad}" must be rejected`);
+	}
+	for (const good of ['[2001:db8::1]:443', '1.2.3.4:443', 'example.com:443', 'example.com']) {
+		assert.ok(endpoint(good), `${file}: "${good}" must still parse`);
+	}
+
+	// ---- proxy cache key must not collide ----
+	const ck = new Function('const PROXY_RESOLUTION_CACHE_VERSION = 2;' + ex(src, 'proxyCacheKey') + 'return proxyCacheKey;')();
+	// This exact pair collides under the old 32-bit stableHashText (both -> 4a10ac9e), which meant two
+	// unrelated destinations shared one proxy-resolution entry.
+	assert.notEqual(ck('p', 'me4ass0cl38u.com', 'u'), ck('p', 'twm7ryzpvqkh.com', 'u'),
+		`${file}: known-colliding hosts must produce different cache keys`);
+	// Separators must not be forgeable by a value containing one.
+	assert.notEqual(ck('a:b', 'c', ''), ck('a', 'b:c', ''), `${file}: length prefixes must make the key unambiguous`);
+	assert.notEqual(ck('a', '', ''), ck('', 'a', ''), `${file}: field position must matter`);
+	assert.equal(ck('P', 'H', 'U'), ck('p', 'h', 'u'), `${file}: case is normalised`);
+
+	// ---- the camouflage origin must never receive a request body ----
+	assert.match(src, /request\.method !== 'GET' && request\.method !== 'HEAD'/,
+		`${file}: only GET/HEAD may reach the decoy origin; a wrong-path POST would forward raw tunnel bytes`);
+
+	// ---- persistent KV proxy cache must be opt-in on a free-plan build ----
+	const kv = new Function(ex(src, 'isEnabledEnvFlag') + ex(src, 'isProxyResolutionKvCacheEnabled') + 'return isProxyResolutionKvCacheEnabled;')();
+	assert.equal(kv({}), false, `${file}: KV proxy cache must default OFF`);
+	assert.equal(kv({ ENABLE_KV_PROXY_CACHE: '' }), false, `${file}: an empty value is not opt-in`);
+	assert.equal(kv({ ENABLE_KV_PROXY_CACHE: '1' }), true, `${file}: explicit 1 enables it`);
+	assert.equal(kv({ ENABLE_KV_PROXY_CACHE: '1', OFF_PROXY_CACHE: '1' }), false, `${file}: the off switch still wins`);
+
 	// ---- parsed DNS cache must be byte-bounded, not entry-bounded only ----
 	assert.match(src, /const DNS_RESULT_CACHE_MAX_BYTES = /, `${file}: DNS_RESULT_CACHE needs a byte ceiling`);
 	assert.match(src, /const DNS_RESULT_CACHE_MAX_ENTRY_BYTES = /, `${file}: DNS_RESULT_CACHE needs a per-entry ceiling`);
