@@ -93,6 +93,22 @@ for (const file of BUILDS) {
 	assert.match(src, /\} catch \(err\) \{ readError = err \}[\s\S]{0,500}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
 		`${file}: the final flush must run outside the read try, so accepted bytes are not lost on error`);
 
+	// The SAME bug existed on the gRPC path, which is the default transport here — so it was the widest-reaching
+	// instance of it. The bridge had no fail(), so failClientTransportQuietly fell through to close(), and
+	// 关闭连接() ran controller.close() from a finally whose catch swallowed the error without rethrowing. Every
+	// post-auth gRPC failure therefore ended as a clean, successful, empty response.
+	assert.match(src, /const 关闭连接 = \(错误\) => \{/, `${file}: 关闭连接 must be able to report a failure`);
+	assert.match(src, /if \(错误\) \{ try \{ controller\.error\(错误 instanceof Error \? 错误 : new Error\(String\(错误 \|\| 'gRPC forwarding failed'\)\)\) \} catch \(e\) \{ \} \}\s*\n\s*else \{ try \{ controller\.close\(\) \} catch \(e\) \{ \} \}/,
+		`${file}: a gRPC failure must error the response; only a clean end may close it`);
+	assert.match(src, /if \(!是流取消错误\(err\) && !remoteConnWrapper\.客户端已关闭\) 关闭原因 = err;/,
+		`${file}: the swallowed gRPC error must reach the finally, and cancellation must stay a clean close`);
+	assert.match(src, /关闭连接\(关闭原因\);/, `${file}: the gRPC finally must pass the failure through`);
+	assert.match(src, /new Error\(String\(error \|\| 'gRPC forwarding failed'\)\)/, `${file}: the gRPC bridge needs fail()`);
+	// fail() must drain complete frames before erroring — each queued item is a whole frame, so dropping them
+	// would discard body bytes the remote had already returned.
+	assert.match(src, /fail\(error\) \{[\s\S]{0,600}?刷新发送队列\(true\);/,
+		`${file}: gRPC fail() must flush complete frames before erroring`);
+
 	// Regression guard: the old shape must not come back.
 	assert.doesNotMatch(src, /if \(!是流取消错误\(error\) && !\(pipeMeta\?\.wrapper\?\.客户端已关闭\)\) log\(`\[Stream pipe\][^\n]*\n\s*closeSocketQuietly\(webSocket\);/,
 		`${file}: the remote-read catch is swallowing failures again`);

@@ -1550,6 +1550,28 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
 					} catch (e) { }
 					try { controller.close() } catch (e) { }
+				},
+				// Same rule as the XHTTP bridge: controller.close() ends the gRPC response cleanly, which is a
+				// CLAIM OF SUCCESS. Without a fail(), failClientTransportQuietly fell through to close() and every
+				// post-authentication failure on the gRPC path — dial refused, upstream reset, write failure —
+				// reached the client as a successful, empty response it had no reason to retry. gRPC is the
+				// default transport here, so this was the widest-reaching instance of that bug.
+				fail(error) {
+					if (this.readyState === WebSocket.CLOSED) return;
+					// Flush FIRST. Every queued item is a complete frame from encodeGrpcDataFrame, never a partial
+					// one, so draining them delivers the body the remote already returned and only then reports the
+					// failure — same rule as the downlink flush in connectStreams: bytes already accepted from the
+					// remote belong to the client whether or not the connection ends badly.
+					刷新发送队列(true);
+					已关闭 = true;
+					释放下行背压();
+					this.readyState = WebSocket.CLOSED;
+					GRPC上行写入队列?.清空();
+					try {
+						const cancelPromise = reader.cancel();
+						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
+					} catch (e) { }
+					try { controller.error(error instanceof Error ? error : new Error(String(error || 'gRPC forwarding failed'))) } catch (e) { }
 				}
 			};
 
@@ -1599,7 +1621,11 @@ async function 处理gRPC请求(request, yourUUID) {
 				});
 			};
 
-			const 关闭连接 = () => {
+			// 错误 optional: when set, the gRPC response is ERRORED instead of closed. The finally below runs on
+			// both the success and the failure path, and its catch swallows the error without rethrowing, so the
+			// outer .catch's 下行控制器.error() was unreachable for uplink failures — every one of them ended here
+			// as controller.close(), i.e. a clean successful empty response for a tunnel that never worked.
+			const 关闭连接 = (错误) => {
 				if (已清理) return;
 				已清理 = true;
 				GRPC上行写入队列?.清空();
@@ -1615,7 +1641,10 @@ async function 处理gRPC请求(request, yourUUID) {
 				当前写入Socket = null;
 				try { reader.releaseLock() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
-				try { controller.close() } catch (e) { }
+				// The flush above already drained any complete frames, so an error here still delivers the body
+				// the remote returned before reporting the failure.
+				if (错误) { try { controller.error(错误 instanceof Error ? 错误 : new Error(String(错误 || 'gRPC forwarding failed'))) } catch (e) { } }
+				else { try { controller.close() } catch (e) { } }
 			};
 
 			const 释放远端写入器 = () => {
@@ -1653,6 +1682,8 @@ async function 处理gRPC请求(request, yourUUID) {
 				return 上行写入队列.写入并等待(payload, allowRetry);
 			};
 
+			// Declared OUTSIDE the try so the finally can see what the catch caught.
+			let 关闭原因 = null;
 			try {
 				let pending = new Uint8Array(0);
 				let 正常结束 = false;
@@ -1766,11 +1797,14 @@ async function 处理gRPC请求(request, yourUUID) {
 				// event, not a tunnel failure — don't log it at error level or record it as reason=error.
 				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
+				// Carry the failure into the finally so the response is errored rather than closed. Cancellation
+				// and our own teardown stay a clean close — those are not tunnel failures.
+				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) 关闭原因 = err;
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
 				释放远端写入器();
-				关闭连接();
+				关闭连接(关闭原因);
 			}
 			})().catch(err => { if (!是流取消错误(err)) log(`[gRPC tunnel] ${err?.message || err}`); try { 下行控制器?.error?.(err) } catch (e) { } });
 		},
