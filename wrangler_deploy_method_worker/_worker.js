@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:1500c7a2096a wrangler
+// Build: 2026-08-01 src:c2c54bee62aa wrangler
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:1500c7a2096a wrangler';
+const Version = '2026-08-01 src:c2c54bee62aa wrangler';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -881,7 +881,7 @@ export default {
 							try {
 								const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' } });
 								if (response.ok) {
-									订阅内容 = await response.text();
+									订阅内容 = await 读取有限响应文本(response, 2 * 1024 * 1024, 15000, 'subscription converter');
 									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
 								} else return new Response('Subscription conversion backend error: ' + response.statusText, { status: response.status });
 							} catch (error) {
@@ -3007,9 +3007,19 @@ async function 读取有限请求体(request, 最大字节) {
 	return total === output.byteLength ? output : output.slice(0, total);
 }
 
+// Text/JSON wrappers so a control-plane caller gets the same size+time bound as a byte reader without
+// hand-rolling a decode at each site. Control-plane bodies arrive in ordinary HTTP-sized chunks and can
+// legitimately be a few hundred KiB, so they pass a higher chunk cap than the DoH default.
+async function 读取有限响应文本(response, 最大字节, timeoutMs, label = 'response') {
+	return new TextDecoder().decode(await 读取有限响应体(response, 最大字节, timeoutMs, label, 4096));
+}
+async function 读取有限响应JSON(response, 最大字节, timeoutMs, label = 'response') {
+	return JSON.parse(await 读取有限响应文本(response, 最大字节, timeoutMs, label));
+}
+
 // Response-body counterpart of 读取有限请求体, with its own deadline. fetch()'s AbortSignal stops applying
 // once the response headers land, so a body that never finishes is otherwise unbounded in BOTH time and size.
-async function 读取有限响应体(response, 最大字节, timeoutMs, label = 'response') {
+async function 读取有限响应体(response, 最大字节, timeoutMs, label = 'response', 最大分片数 = 256) {
 	const 期限毫秒 = Math.max(1, Number(timeoutMs) || 1000);
 	// Some responses expose no streaming body. Still bound it in TIME (the whole point here) by racing the
 	// buffered read against the same deadline, then enforce the size cap on the result.
@@ -3029,7 +3039,6 @@ async function 读取有限响应体(response, 最大字节, timeoutMs, label = 
 	// whatever the source enqueued, so the source may reuse and overwrite that buffer before the next read.
 	// Copying on arrival keeps the bytes owned while still right-sizing the allocation. The caps below bound
 	// both total bytes and total work.
-	const 最大分片数 = 256;
 	const 声明长度 = Number(response.headers?.get?.('content-length'));
 	let 容量 = Number.isInteger(声明长度) && 声明长度 > 0 && 声明长度 <= 最大字节 ? 声明长度 : Math.min(1024, 最大字节);
 	let output = new Uint8Array(容量);
@@ -3806,9 +3815,17 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
 				const 所有反代数组 = await 解析地址端口(proxyIP, host, yourUUID, env, ctx);
-				const proxyFallbackEndpoint = parsePreferredEndpointText(proxyIP) || { address: proxyIP, port: '443' };
-				const proxyFallbackHost = stripIPv6Brackets(proxyFallbackEndpoint.address);
-				newSocket = await connectProxyIP(proxyFallbackHost, Number(proxyFallbackEndpoint.port) || 443, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
+				// `|| { address: proxyIP }` used to fabricate an endpoint out of whatever the parser had just
+				// REJECTED, which made the validation decorative: an unparseable ProxyIP was dialled anyway.
+				// connectProxyIP only reaches this fallback once the resolved array is exhausted, so when there
+				// is also nothing resolved there is nothing dialable at all — say so instead of spending a
+				// connect and its timeout proving it. A valid ProxyIP behaves exactly as before.
+				const proxyFallbackEndpoint = parsePreferredEndpointText(proxyIP);
+				if (!proxyFallbackEndpoint && !(所有反代数组 && 所有反代数组.length)) {
+					throw new Error(`configured ProxyIP is not a usable endpoint: ${proxyIP}`);
+				}
+				const proxyFallbackHost = proxyFallbackEndpoint ? stripIPv6Brackets(proxyFallbackEndpoint.address) : '';
+				newSocket = await connectProxyIP(proxyFallbackHost, Number(proxyFallbackEndpoint?.port) || 443, 本次首包数据, 所有反代数组, proxyFallbackEnabled);
 			}
 			if (本次发送首包) 已通过代理发送首包 = true;
 			// Install the new socket BEFORE tearing down any previous one, so the previous socket's own pipe
@@ -5542,7 +5559,7 @@ function validateTunnelTarget(host, port) {
 	// A dotted quad must be spelled canonically. isIPHostname's octet pattern accepts a leading zero, so
 	// "01.2.3.4" passed as a valid IP literal — and a leading zero is octal to some resolvers, meaning the
 	// address actually dialled can differ from the one that was validated.
-	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(unbracketedHost) && !/^(?:0|[1-9]\d{0,2})(\.(?:0|[1-9]\d{0,2})){3}$/.test(unbracketedHost)) {
+	if (/^[\d.]+$/.test(unbracketedHost) && unbracketedHost.includes('.') && !是规范IPv4文本(unbracketedHost)) {
 		throw new Error(`non-canonical IPv4 literal: ${hostname}`);
 	}
 	if (isPrivateOrLocalIPv4(unbracketedHost)) throw new Error(`private/local target blocked: ${hostname}`);
@@ -9602,7 +9619,7 @@ async function fetchEnglishStaticPage(path, statusOverride) {
 		const statusText = upstream.statusText;
 		const contentType = headers.get('Content-Type') || '';
 		const isHTML = /text\/html|application\/xhtml\+xml/i.test(contentType);
-		let body = await upstream.text();
+		let body = await 读取有限响应文本(upstream, 2 * 1024 * 1024, 10000, 'camouflage upstream');
 		if (isHTML) {
 			// Also strip any inline CSP meta tag for the same reason.
 			body = body.replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, '');
@@ -9923,7 +9940,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			if (CF_JSON.UsageAPI) {
 				try {
 					const response = await fetch(CF_JSON.UsageAPI);
-					const Usage = await response.json();
+					const Usage = await 读取有限响应JSON(response, 256 * 1024, 10000, 'usage API');
 					config_JSON.CF.Usage = Usage;
 				} catch (err) {
 					debugError(`CF_JSON.UsageAPI request failed: ${err.message}`);
@@ -9990,7 +10007,7 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const cfname = 运营商名称映射[运营商文件标识] || 'CF Official Preferred';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
-	try { const res = await fetchWithTimeout(cidr_url, {}, 5000); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	try { const res = await fetchWithTimeout(cidr_url, {}, 5000); cidrList = res.ok ? await 整理成数组(await 读取有限响应文本(res, 1024 * 1024, 5000, 'CIDR list')) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
 
 	const generateRandomIPFromCIDR = (cidr) => {
 		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength, 10);
@@ -10057,7 +10074,9 @@ async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: response too large`);
 			return [优选IP, 其他节点LINK];
 		}
-		const 优选订阅生成器原始文本 = await response.text();
+		// The content-length pre-check above only helps when the header is present; a body that omits it and
+		// streams forever bypassed it entirely, and the length check below ran only after buffering the lot.
+		const 优选订阅生成器原始文本 = await 读取有限响应文本(response, 512 * 1024, 10000, 'preferred-sub generator');
 		if (优选订阅生成器原始文本.length > 512 * 1024) {
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: response too large`);
 			return [优选IP, 其他节点LINK];
@@ -10136,7 +10155,7 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 			clearTimeout(timeoutId);
 			let text = '';
 			try {
-				const buffer = await response.arrayBuffer();
+				const buffer = await 读取有限响应体(response, 2 * 1024 * 1024, 10000, 'preferred-source', 4096);
 				const contentType = (response.headers.get('content-type') || '').toLowerCase();
 				const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
 
@@ -10362,7 +10381,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
 			});
 			if (!r.ok) throw new Error(`Failed to fetch account: ${r.status}`);
-			const d = await r.json();
+			const d = await 读取有限响应JSON(r, 256 * 1024, 10000, 'account API');
 			if (!d?.result?.length) throw new Error("Account not found");
 			const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
 			AccountID = d.result[idx >= 0 ? idx : 0]?.id;
@@ -10387,7 +10406,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 		});
 
 		if (!res.ok) throw new Error(`Query failed: ${res.status}`);
-		const result = await res.json();
+		const result = await 读取有限响应JSON(res, 512 * 1024, 10000, 'GraphQL API');
 		if (result.errors?.length) throw new Error(result.errors[0].message);
 
 		const acc = result?.data?.viewer?.accounts?.[0];
@@ -11113,6 +11132,14 @@ function recordProxyEndpointResult(record, endpoint, success, latencyMs, now = D
 	return current;
 }
 
+// One rule for "is this text a canonical dotted quad", shared by the endpoint parser and the target guard.
+// Leading zeros matter: some resolvers read 01.2.3.4 as octal, so a non-canonical literal can resolve to a
+// DIFFERENT address than the one that was validated.
+function 是规范IPv4文本(text) {
+	if (!/^(?:0|[1-9]\d{0,2})(\.(?:0|[1-9]\d{0,2})){3}$/.test(text)) return false;
+	return text.split('.').every((part) => Number(part) <= 255);
+}
+
 function parsePreferredEndpointText(value) {
 	if (typeof value !== 'string') return null;
 	const text = value.trim();
@@ -11126,6 +11153,11 @@ function parsePreferredEndpointText(value) {
 	// run, so '[:::]' and '[1:2:3]' were accepted while the valid '[::ffff:1.2.3.4]' was refused for
 	// containing dots. Route it through the one parser that actually decodes an address.
 	if (match[1].startsWith('[') && !IPv6转字节(match[1])) return null;
+	// The bare [\d.]+ alternative in the regex admits ANY run of digits and dots, so '999.1.1.1' and
+	// '01.2.3.4' parsed as endpoint addresses and were carried into dials that could only fail — and into
+	// generated subscription nodes, where they become endpoints a client retries forever. A digits-and-dots
+	// authority is only ever meant to be a dotted quad here, so require a canonical one.
+	if (/^[\d.]+$/.test(match[1]) && !是规范IPv4文本(match[1])) return null;
 	const port = match[2] || '443';
 	const portNumber = Number(port);
 	if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;

@@ -110,7 +110,7 @@ for (const file of BUILDS) {
 	// ---- endpoint parser must agree with IPv6转字节, not its own regex ----
 	const endpoint = new Function(
 		'const IPv6方括号正则 = /^\\[.*\\]$/;' +
-		ex(src, 'stripIPv6Brackets') + ex(src, 'IPv6转字节') + ex(src, 'parsePreferredEndpointText') +
+		ex(src, 'stripIPv6Brackets') + ex(src, 'IPv6转字节') + ex(src, '是规范IPv4文本') + ex(src, 'parsePreferredEndpointText') +
 		'return parsePreferredEndpointText;')();
 	// Valid IPv4-mapped form was refused for containing dots.
 	assert.ok(endpoint('[::ffff:1.2.3.4]:443'), `${file}: [::ffff:1.2.3.4] is valid and must be accepted`);
@@ -120,6 +120,13 @@ for (const file of BUILDS) {
 	}
 	for (const good of ['[2001:db8::1]:443', '1.2.3.4:443', 'example.com:443', 'example.com']) {
 		assert.ok(endpoint(good), `${file}: "${good}" must still parse`);
+	}
+	// The bare digits-and-dots alternative accepted ANY such run, so these parsed as endpoint addresses and
+	// were carried into dials that could only fail -- and into generated subscription nodes, where a client
+	// retries them forever. A leading zero is octal to some resolvers, so 01.2.3.4 can also resolve to a
+	// different address than the one that was validated.
+	for (const bad of ['999.1.1.1:80', '01.2.3.4:80', '1.2.3:443', '1.2.3.4.5:443', '256.1.1.1:443']) {
+		assert.equal(endpoint(bad), null, `${file}: "${bad}" is not a canonical dotted quad and must be rejected`);
 	}
 
 	// ---- proxy cache key must not collide ----
