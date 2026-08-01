@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-01 src:cc0eb30bc20c panel';
+const Version = '2026-08-01 src:981af16793c3 panel:62ed1173';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();

@@ -82,10 +82,24 @@ if (!VERSION_RE.test(bundled)) {
 	throw new Error('Build could not find the Version literal to stamp');
 }
 const stamped = bundled.replace(VERSION_RE, `const Version = '${版本串}';`);
-const 打上变体戳 = (text, variant) => text.replace(VERSION_RE, `const Version = '${版本串} ${variant}';`);
+// Stamp the artifact's OWN content hash, not just the source hash. Two generated builds share one source
+// and therefore one src: hash, so /version could not distinguish them -- and a hand-edited build could drift
+// from its stamp entirely while still claiming to be current. Hashing the artifact directly is circular
+// (writing the hash in changes the hash), so hash the text with BOTH stamp sites normalised to a
+// placeholder first: that value is stable, unique per artifact, and changes whenever anything else does.
+const 归一化戳 = (text) => text
+	.replace(VERSION_RE, "const Version = '<stamp>';")
+	.replace(/^\/\/ Build: .*$/m, '// Build: <stamp>');
+const 产物哈希 = (text) => createHash('sha256').update(归一化戳(text)).digest('hex').slice(0, 8);
 
 // --- Copy-paste / Dashboard build: identical bundle, request.fetcher.connect. ---
-const copypasteOutput = banner('copypaste') + 打上变体戳(stamped, 'copypaste');
+// Hash the FINISHED artifact, not the pre-banner bundle, so the value matches what a verifier recomputes
+// from the file on disk. Non-circular because 归一化戳 blanks both stamp sites first: the draft below and
+// the final output differ only in those two lines, so they normalise to identical text and therefore to the
+// same hash. (panel-drift recomputes exactly this and fails if a build was edited after being stamped.)
+const copypasteDraft = banner('copypaste') + stamped;
+const copypasteId = `copypaste:${产物哈希(copypasteDraft)}`;
+const copypasteOutput = banner(copypasteId) + stamped.replace(VERSION_RE, `const Version = '${版本串} ${copypasteId}';`);
 
 // --- Wrangler build: same bundle, but the connect factory also uses cloudflare:sockets. ---
 // The Dashboard editor mishandles the cloudflare:sockets module import (Error 1101), so this
@@ -101,7 +115,10 @@ if (!stamped.includes(FETCHER_CONNECT_BODY)) {
 	throw new Error('Build could not find the connect factory to produce the Wrangler (cloudflare:sockets) variant');
 }
 const wranglerBundle = stamped.replace(FETCHER_CONNECT_BODY, SOCKETS_CONNECT_BODY);
-const wranglerOutput = "import { connect as cloudflareConnect } from 'cloudflare:sockets';\n" + banner('wrangler') + 打上变体戳(wranglerBundle, 'wrangler');
+const wranglerPrefix = "import { connect as cloudflareConnect } from 'cloudflare:sockets';\n";
+const wranglerDraft = wranglerPrefix + banner('wrangler') + wranglerBundle;
+const wranglerId = `wrangler:${产物哈希(wranglerDraft)}`;
+const wranglerOutput = wranglerPrefix + banner(wranglerId) + wranglerBundle.replace(VERSION_RE, `const Version = '${版本串} ${wranglerId}';`);
 
 // The build stamp changes on every run (timestamp + git sha), so a byte-for-byte parity check would
 // always fail. Normalise ONLY the two stamped lines before comparing — everything else must still match

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 // src_static_ui/worker_test.js is the DEPLOYED artifact: it is the copy-paste data plane plus the inline
 // panel, and it is hand-maintained, so `npm run build` never regenerates it and never notices when it
@@ -330,3 +331,51 @@ if (missing.length || differs.length) {
 	process.exit(1);
 }
 console.log('[panel-drift] OK: the deployed panel build matches the canonical data plane');
+
+// The panel build is hand-maintained, so its version marker was hand-maintained too and could drift
+// arbitrarily far from the file's real contents while still claiming to be current -- /version could not be
+// trusted to say what was running. Every surface must carry an artifact-unique stamp, and all of them must
+// agree on the source they came from.
+{
+	const 读取戳 = (f) => (readFileSync(f, 'utf8').match(/^const Version = '([^']*)';/m) || [])[1] || '';
+	const 各戳 = [
+		['panel', 读取戳('src_static_ui/worker_test.js')],
+		['copypaste', 读取戳('_worker_copypaste.js')],
+		['wrangler', 读取戳('wrangler_deploy_method_worker/_worker.js')],
+	];
+	const 文件 = { panel: 'src_static_ui/worker_test.js', copypaste: '_worker_copypaste.js', wrangler: 'wrangler_deploy_method_worker/_worker.js' };
+	// Recompute each artifact's hash the same way the stamper does -- normalise BOTH stamp sites, then hash.
+	// Checking only the stamp's SHAPE would pass a file that was hand-edited after being stamped, which is
+	// exactly the drift this exists to catch (verified by editing a build and watching this fail).
+	const 实际哈希 = (f) => createHash('sha256').update(
+		readFileSync(f, 'utf8')
+			.replace(/^const Version = '[^']*';/m, "const Version = '<stamp>';")
+			.replace(/^\/\/ Build: .*$/m, '// Build: <stamp>')
+	).digest('hex').slice(0, 8);
+	const 戳问题 = [];
+	for (const [variant, stamp] of 各戳) {
+		if (!new RegExp(`src:[0-9a-f]+ ${variant}:[0-9a-f]{8}$`).test(stamp)) {
+			戳问题.push(`${variant} build has no artifact-unique stamp (got "${stamp}") -- run npm run build && npm run stamp-panel`);
+			continue;
+		}
+		const 声明哈希 = stamp.slice(stamp.lastIndexOf(':') + 1);
+		const 真实哈希 = 实际哈希(文件[variant]);
+		if (声明哈希 !== 真实哈希) {
+			戳问题.push(`${variant} build was modified after it was stamped: claims ${声明哈希}, content hashes to ${真实哈希} -- run npm run build && npm run stamp-panel`);
+		}
+	}
+	const 源部分 = (stamp) => (stamp.match(/src:[0-9a-f]+/) || [''])[0];
+	const 各源 = 各戳.map(([, stamp]) => 源部分(stamp));
+	if (new Set(各源).size > 1) {
+		戳问题.push(`surfaces disagree on their source: ${各戳.map(([v, st]) => `${v}=${源部分(st)}`).join(', ')} -- a build is stale`);
+	}
+	if (new Set(各戳.map(([, stamp]) => stamp)).size !== 各戳.length) {
+		戳问题.push('two artifacts with different bytes report the same identity');
+	}
+	if (戳问题.length) {
+		console.error(`[panel-drift] FAIL: build identity (${戳问题.length}):`);
+		for (const p of 戳问题) console.error(`  - ${p}`);
+		process.exit(1);
+	}
+	console.log('[panel-drift] OK: every surface carries an artifact-unique, source-agreeing build stamp');
+}
