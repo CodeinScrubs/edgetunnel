@@ -127,7 +127,7 @@ for (const file of BUILDS) {
 	const ck = new Function(
 		'const PROXY_RESOLUTION_CACHE_VERSION = 3;' +
 		'const SHA224_RESULT_CACHE = new Map(); const HASH_CACHE_MAX_ENTRIES = 256;' +
-		ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224') +
+		ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224未缓存') + ex(src, 'sha224') +
 		ex(src, 'proxyCacheKey') + 'return proxyCacheKey;')();
 	// Fixed-length and credential-free: Workers KV caps a key at 512 bytes, and a plaintext key also put
 	// the UUID into KV key NAMES where listings expose it.

@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-07-31 src:373554d8886c
+// Build: 2026-08-01 src:4041329c5cf1
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-07-31 src:373554d8886c';
+const Version = '2026-08-01 src:4041329c5cf1';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1883,9 +1883,19 @@ function 是有效WS早期数据(bytes, token) {
 	return true;
 }
 
-function 解码WS早期数据(header, token) {
+// 允许部分 comes from the client DECLARING early data via `?ed=<n>`, which this project's own generated
+// configs already emit. Without that declaration, Sec-WebSocket-Protocol is just an ordinary subprotocol
+// header, and ordinary tokens are decodable: 'chat', 'mqtt', 'binary' and 'graphql-ws' all yield bytes.
+// Feeding those to the accumulator made a normal WebSocket client stall until the pre-auth deadline (魏烈思)
+// or be rejected outright (木马) — a compatibility regression introduced by accepting any decodable value.
+// So: with `ed`, accept a partial header; without it, accept only an already-complete one, exactly as
+// before. 是有效WS早期数据 is retained deliberately for that second case.
+function 解码WS早期数据(header, token, 允许部分 = false) {
 	if (!header) return null;
 	if (header.length > WS早期数据最大头长度) throw new Error('early data is too large');
+	// Strict base64url. The previous fallback normalised '+' and '/' and tolerated padding, so it accepted
+	// standard base64 too — which is what let arbitrary subprotocol tokens through.
+	if (!/^[A-Za-z0-9_-]+$/.test(header)) return null;
 
 	let bytes;
 	const Uint8ArrayBase64 = /** @type {any} */ (Uint8Array);
@@ -1909,13 +1919,12 @@ function 解码WS早期数据(header, token) {
 	}
 
 	if (bytes.byteLength > WS早期数据最大字节) throw new Error('early data is too large');
-	// Return the bytes WITHOUT requiring a complete inner header. 是有效WS早期数据 demanded >=18 bytes for
-	// 魏烈思 or >=58 for 木马, so a header split across [early data][first message] had its opening fragment
-	// SILENTLY DISCARDED and the first real message then began mid-header. That is the same
-	// transport-unit-equals-protocol-packet mistake the accumulator exists to remove — it just lived on a
-	// different ingress path. Decoding now validates only encoding and size; the accumulator decides
-	// need_more / invalid / ok, exactly as it does for ordinary messages.
-	return bytes;
+	// With `ed` declared, hand every byte to the accumulator so a header split across
+	// [early data][first message] works — that split previously had its opening fragment discarded and the
+	// first real message then began mid-header. Without `ed`, keep the original completeness requirement so
+	// an ordinary subprotocol token is ignored rather than parsed as tunnel bytes.
+	if (允许部分) return bytes;
+	return 是有效WS早期数据(bytes, token) ? bytes : null;
 }
 
 
@@ -2622,7 +2631,11 @@ async function 处理WS请求(request, yourUUID, url) {
 
 	if (!SS模式禁用EarlyData && earlyDataHeader) {
 		try {
-			const bytes = 解码WS早期数据(earlyDataHeader, yourUUID);
+			// `?ed=<n>` is how a client DECLARES it is sending early data; this project's own generated
+			// configs emit it. Treat Sec-WebSocket-Protocol as tunnel bytes only when it is declared,
+			// otherwise an ordinary subprotocol token would be parsed as a partial header.
+			const ed声明 = /^\d+$/.test(url.searchParams.get('ed') || '') && Number(url.searchParams.get('ed')) > 0;
+			const bytes = 解码WS早期数据(earlyDataHeader, yourUUID, ed声明);
 			// Pass the VIEW, not .buffer: the decoders happen to return exact-size arrays today, so .buffer is
 			// currently equivalent, but any future decode that returns a subarray would silently ship the whole
 			// backing buffer as early data.
@@ -10159,13 +10172,20 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 	}
 }
 
+// Memoised wrapper for the AUTHENTICATION path, where the same password is hashed on every frame. Callers
+// that hash a per-destination value must use sha224未缓存 instead: the memo is keyed on the full preimage,
+// so caching those both retains their contents in module memory and evicts the auth entry that matters.
 function sha224(s) {
 	const cacheKey = String(s);
 	const cached = getLruCacheValue(SHA224_RESULT_CACHE, cacheKey);
 	if (cached !== undefined) return cached;
+	return setLruCacheValue(SHA224_RESULT_CACHE, cacheKey, sha224未缓存(cacheKey), HASH_CACHE_MAX_ENTRIES);
+}
+
+function sha224未缓存(s) {
 	const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
 	const r = (n, b) => ((n >>> b) | (n << (32 - b))) >>> 0;
-	s = unescape(encodeURIComponent(cacheKey));
+	s = unescape(encodeURIComponent(String(s)));
 	const l = s.length * 8; s += String.fromCharCode(0x80);
 	while ((s.length * 8) % 512 !== 448) s += String.fromCharCode(0);
 	const h = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
@@ -10192,7 +10212,7 @@ function sha224(s) {
 	for (let i = 0; i < 7; i++) {
 		for (let j = 24; j >= 0; j -= 8)hex += ((h[i] >>> j) & 0xFF).toString(16).padStart(2, '0');
 	}
-	return setLruCacheValue(SHA224_RESULT_CACHE, cacheKey, hex, HASH_CACHE_MAX_ENTRIES);
+	return hex;
 }
 
 function getWorkerRequestContext(request) {
@@ -10606,12 +10626,16 @@ function proxyCacheKey(proxyIP, targetHost = '', UUID = '') {
 	//     entirely legitimate values, which would fail the read and the write rather than just miss.
 	//   - A plaintext key put the UUID — a live credential — into KV key NAMES, where it shows up in key
 	//     listings and any administrative tooling that enumerates them.
-	// sha224 is already memoised here, so this costs nothing on the hot path and the key is fixed-length.
+	// Deliberately the UNCACHED digest. Routing this through the memoised sha224 was wrong twice over: its
+	// memo is keyed on the full preimage, so it would RETAIN the UUID in module memory even though the
+	// returned key hides it, and per-destination proxy keys would evict the 木马 authentication hash that
+	// shares the same bounded cache — turning a hot-path lookup back into a recomputation during ordinary
+	// multi-host browsing. A cache key is computed once per lookup; it does not need memoising.
 	const 规范 = (value) => {
 		const text = String(value ?? '').trim().toLowerCase();
 		return `${text.length}:${text}`;
 	};
-	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${sha224(`${规范(proxyIP)}|${规范(targetHost)}|${规范(UUID)}`)}`;
+	return `proxy-resolution:${PROXY_RESOLUTION_CACHE_VERSION}:${sha224未缓存(`${规范(proxyIP)}|${规范(targetHost)}|${规范(UUID)}`)}`;
 }
 
 function proxyEndpointKey(endpoint) {

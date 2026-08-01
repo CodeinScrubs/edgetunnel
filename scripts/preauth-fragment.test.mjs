@@ -38,7 +38,7 @@ for (const file of BUILDS) {
 		'const 预认证最大字节 = 65536, 预认证超时毫秒 = 10000;' +
 		'const UUID字节缓存 = new Map(); const SHA224_RESULT_CACHE = new Map(); const HASH_CACHE_MAX_ENTRIES = 256;' +
 		ex(src, '数据转Uint8Array') + ex(src, '读取十六进制半字节') + ex(src, '获取UUID字节') + ex(src, 'UUID字节匹配') +
-		ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224') +
+		ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224未缓存') + ex(src, 'sha224') +
 		ex(src, '解析魏烈思首包三态') + ex(src, '解析木马首包三态') + ex(src, '创建预认证累积器') +
 		'return { 创建预认证累积器, 解析魏烈思首包三态 };')();
 
@@ -108,7 +108,7 @@ for (const file of BUILDS) {
 		// Built from the real sha224 the parser uses, so the hash prefix matches byte for byte.
 		const hash = new Function(
 			'const SHA224_RESULT_CACHE = new Map(); const HASH_CACHE_MAX_ENTRIES = 256;' +
-			ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224') + 'return sha224;')()(UUID);
+			ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224未缓存') + ex(src, 'sha224') + 'return sha224;')()(UUID);
 		const host = new TextEncoder().encode('example.com');
 		const t = Uint8Array.from([
 			...new TextEncoder().encode(hash), 0x0d, 0x0a,
@@ -146,18 +146,40 @@ for (const file of BUILDS) {
 	{
 		const decode = new Function(
 			'const WS早期数据最大字节 = 8192, WS早期数据最大头长度 = 10924;' +
+			'const SHA224_RESULT_CACHE = new Map(); const HASH_CACHE_MAX_ENTRIES = 256;' +
+			'const UUID字节缓存 = new Map();' +
+			ex(src, 'getLruCacheValue') + ex(src, 'setLruCacheValue') + ex(src, 'sha224未缓存') + ex(src, 'sha224') +
+			ex(src, '读取十六进制半字节') + ex(src, '获取UUID字节') + ex(src, 'UUID字节匹配') + ex(src, '是有效WS早期数据') +
 			ex(src, '解码WS早期数据') + 'return 解码WS早期数据;')();
+
+		// An ordinary Sec-WebSocket-Protocol token is NOT early data. Without `?ed` these must be ignored,
+		// not decoded into tunnel bytes — accepting any decodable value made a normal client stall until the
+		// pre-auth deadline (魏烈思) or be rejected (木马).
+		for (const token of ['chat', 'mqtt', 'binary', 'graphql-ws', 'soap', 'wamp']) {
+			assert.equal(decode(token, UUID, false), null,
+				`${file}: ordinary subprotocol "${token}" must be ignored when ?ed is absent`);
+		}
+		// Strict base64url only: standard-base64 characters and padding are not early data.
+		for (const bad of ['AA/', 'AA+', 'AA==', 'a b', '!!']) {
+			assert.equal(decode(bad, UUID, false), null, `${file}: "${bad}" is not strict base64url`);
+		}
+		// Without `ed`, a COMPLETE header in early data still works (backward compatibility).
+		{
+			const b64 = Buffer.from(header).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+			const r = decode(b64, UUID, false);
+			assert.ok(r && r.byteLength === header.length, `${file}: a complete early-data header must still be accepted without ?ed`);
+		}
 		const b64url = (bytes) => Buffer.from(bytes).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 		// Every prefix length, including ones far too short to be a recognisable header, must survive decoding.
 		for (const cut of [1, 5, 10, 17, 18, 30, headerLen]) {
-			const decoded = decode(b64url(header.subarray(0, cut)), UUID);
+			const decoded = decode(b64url(header.subarray(0, cut)), UUID, true);
 			assert.ok(decoded && decoded.byteLength === cut,
 				`${file}: a ${cut}-byte early-data prefix must decode intact, not be discarded as "not a header"`);
 		}
 		// And the split must complete end-to-end through the accumulator.
 		for (let cut = 1; cut < header.length; cut++) {
 			const acc = mod.创建预认证累积器(UUID);
-			const early = decode(b64url(header.subarray(0, cut)), UUID);
+			const early = decode(b64url(header.subarray(0, cut)), UUID, true);
 			assert.ok(early, `${file}: early-data cut=${cut} decoded to null`);
 			const a = acc.推入(early);
 			if (a.状态 === 'ok') continue;            // whole header fitted in early data
@@ -167,8 +189,8 @@ for (const file of BUILDS) {
 			assert.equal(b.结果.hostname, 'example.com', `${file}: early-data cut=${cut} wrong destination`);
 		}
 		// Size and encoding are still enforced.
-		assert.equal(decode('!!!not-base64!!!', UUID), null, `${file}: malformed base64url must be refused`);
-		assert.throws(() => decode(b64url(new Uint8Array(9000)), UUID), /too large/, `${file}: oversized early data must throw`);
+		assert.equal(decode('!!!not-base64!!!', UUID, true), null, `${file}: malformed base64url must be refused`);
+		assert.throws(() => decode(b64url(new Uint8Array(9000)), UUID, true), /too large/, `${file}: oversized early data must throw`);
 	}
 
 	// 7. Both transports must actually USE the accumulator, not their own inline classifier.
