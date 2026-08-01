@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:981af16793c3 copypaste:187ba6c8
+// Build: 2026-08-01 src:a56a272dbb14 copypaste:f19ab850
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:981af16793c3 copypaste:187ba6c8';
+const Version = '2026-08-01 src:a56a272dbb14 copypaste:f19ab850';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -464,17 +464,21 @@ export default {
 			return new Response(JSON.stringify({ Version: 版本数字, Build: String(Version) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
 		} else if (隧道凭据可用 && upgradeHeader === 'websocket' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
-			log(`[WebSocket] Matched request: ${url.pathname}${url.search}`);
+			const 代理配置错误 = await 代理配置被拒(workerRequestContext.tunnel);
+			if (代理配置错误) return 代理配置错误;
+			log(`[WebSocket] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
 			return await 处理WS请求(request, userID, url);
 		} else if (隧道凭据可用 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
+			const 代理配置错误 = await 代理配置被拒(workerRequestContext.tunnel);
+			if (代理配置错误) return 代理配置错误;
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
-				log(`[gRPC] Matched request: ${url.pathname}${url.search}`);
+				log(`[gRPC] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
 				return await 处理gRPC请求(request, userID);
 			}
-			log(`[XHTTP] Matched request: ${url.pathname}${url.search}`);
+			log(`[XHTTP] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
 			return await 处理XHTTP请求(request, userID);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
@@ -2292,9 +2296,12 @@ async function 处理WS请求(request, yourUUID, url) {
 						if (serverSock.readyState !== WebSocket.OPEN) throw new Error('SS client transport is closed');
 						const 已初始化出站加密器 = await 获取出站加密器();
 						await 已初始化出站加密器.加密并发送(chunk, async (encryptedChunk) => {
-							if (encryptedChunk.byteLength > 0 && serverSock.readyState === WebSocket.OPEN) {
-								await WebSocket发送并等待(serverSock, encryptedChunk.buffer);
-							}
+							if (!encryptedChunk.byteLength) return;
+							// The readyState check at the top of the queue entry is not enough: the socket can close
+							// between there and here, and skipping the send silently let the queue RESOLVE as if the
+							// ciphertext had gone out. Undelivered bytes must reject, not disappear.
+							if (serverSock.readyState !== WebSocket.OPEN) throw new Error('SS client transport closed before ciphertext delivery');
+							await WebSocket发送并等待(serverSock, encryptedChunk.buffer);
 						});
 					}).catch((error) => {
 						log(`[SS send] Encryption failed: ${error?.message || error}`);
@@ -2987,12 +2994,17 @@ function 拼接字节数据(...chunkList) {
 // streaming body omits that header entirely, so `await request.text()` would buffer the whole thing. This
 // counts actual bytes and cancels the stream the moment the cap is crossed, which matters most on the
 // public pre-auth /login route (a 128 MiB isolate is shared with live tunnels).
-async function 读取有限请求体(request, 最大字节) {
+// 超时毫秒/最大分片数: a byte cap alone does not bound an invocation. A peer can drip one byte every few
+// seconds, stay far below the cap forever, and hold the invocation (and its memory) open the whole time —
+// the cap can only reject a body that is too BIG, never one that is too SLOW.
+async function 读取有限请求体(request, 最大字节, 超时毫秒 = 15000, 最大分片数 = 4096) {
 	const 过大 = () => Object.assign(new Error('Request body too large'), { 请求体过大: true });
 	const declared = Number(request.headers.get('content-length') || 0);
 	if (Number.isFinite(declared) && declared > 最大字节) throw 过大();
 	if (!request.body) return new Uint8Array(0);
 	const reader = request.body.getReader();
+	const 截止时刻 = Date.now() + Math.max(1, Number(超时毫秒) || 15000);
+	let 分片数 = 0;
 	// Copy into an OWNED buffer rather than retaining the returned views: a default reader hands back
 	// whatever the source enqueued, so the source may reuse that buffer on a later read. Same ownership
 	// rule as 读取有限响应体 below — the two helpers should not have different guarantees.
@@ -3001,7 +3013,10 @@ async function 读取有限请求体(request, 最大字节) {
 	let total = 0;
 	try {
 		for (; ;) {
-			const { done, value } = await reader.read();
+			const 剩余毫秒 = 截止时刻 - Date.now();
+			if (剩余毫秒 <= 0) throw new Error('Request body timed out');
+			const { done, value } = await readWithOperationTimeout(reader, 剩余毫秒, 'Request body timed out');
+			if (++分片数 > 最大分片数) throw new Error('Too many request body chunks');
 			if (done) break;
 			const chunk = 数据转Uint8Array(value);
 			if (!chunk.byteLength) continue;
@@ -5080,7 +5095,24 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连�
 	};
 }
 
-function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput = null, env = null) {
+function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput = null, env = null, 异步失败回调 = null) {
+	// A SCHEDULED flush runs detached from whoever queued the bytes, so its rejection has no caller to
+	// return to. It used to be handled with `.catch(() => closeSocketQuietly(webSocket))`, which closed the
+	// client with a NORMAL 1000 and resolved the operation — so a downstream send that genuinely failed was
+	// indistinguishable from a stream that finished cleanly, and connectStreams never learned the bytes had
+	// not been delivered. Same failure-as-success class as the four transports; this is the fifth place it
+	// lived, and the only one where the failure is asynchronous and therefore ownerless by construction.
+	// Record it, tell the owner, and make every later call surface it instead of silently continuing.
+	let 终止发送错误 = null;
+	const 记录发送失败 = (error) => {
+		if (!终止发送错误) {
+			终止发送错误 = error instanceof Error ? error : new Error(String(error || 'downstream send failed'));
+			try { 异步失败回调?.(终止发送错误); } catch (e) { }
+		}
+		return 终止发送错误;
+	};
+	const 若已失败则抛出 = () => { if (终止发送错误) throw 终止发送错误; };
+	const 调度刷新 = () => { flush().catch((error) => 记录发送失败(error)); };
 	const wsSendLimits = { bufferedLimitBytes: getWsBufferedAmountLimitBytes(env), maxWaitMs: getWsBufferedAmountMaxWaitMs(env) };
 	const packetCapCandidate = Number(packetCapInput);
 	const packetCap = Number.isFinite(packetCapCandidate) && packetCapCandidate > 0 ? Math.round(packetCapCandidate) : 下行Grain包字节;
@@ -5133,14 +5165,14 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 			microtaskQueued = false;
 			if (!pendingBytes || flushTimer) return;
 			if (packetCap - pendingBytes < tailBytes) {
-				flush().catch(() => closeSocketQuietly(webSocket));
+				调度刷新();
 				return;
 			}
 			flushTimer = setTimeout(() => {
 				flushTimer = null;
 				if (!pendingBytes) return;
 				if (packetCap - pendingBytes < tailBytes) {
-					flush().catch(() => closeSocketQuietly(webSocket));
+					调度刷新();
 					return;
 				}
 				// Wait for more ONLY if more actually arrived during the last round. The old condition also
@@ -5156,19 +5188,21 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 					scheduleFlush();
 					return;
 				}
-				flush().catch(() => closeSocketQuietly(webSocket));
+				调度刷新();
 			}, Math.max(下行Grain静默毫秒, 1));
 		});
 	};
 
 	return {
 		async 直接发送(data) {
+			若已失败则抛出();
 			let chunk = 数据转Uint8Array(data);
 			if (!chunk.byteLength) return;
 			chunk = 附加响应头(chunk);
 			await 发送原始块(chunk);
 		},
 		async 发送(data) {
+			若已失败则抛出();
 			let chunk = 数据转Uint8Array(data);
 			if (!chunk.byteLength) return;
 			chunk = 附加响应头(chunk);
@@ -5191,7 +5225,9 @@ function 创建下行Grain发送器(webSocket, headerData = null, packetCapInput
 				else scheduleFlush();
 			}
 		},
-		flush
+		// flush() is also called directly by connectStreams at end-of-stream; it must report a failure that
+		// a scheduled flush already recorded rather than resolving as if the tail had gone out.
+		async flush() { 若已失败则抛出(); await flush(); 若已失败则抛出(); }
 	};
 }
 
@@ -5212,13 +5248,25 @@ function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firs
 
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs = 0, pipeMeta = null) {
 	let header = headerData, hasData = false, reader, useBYOB = false;
+	// The one place a terminal failure is recorded, set by whichever layer actually detects it. First writer
+	// wins, so the original cause survives any teardown that follows it. A null here means nothing failed —
+	// the connection simply ended, and it must be reported to the client as exactly that.
+	let 终止错误 = null;
+	const 设置终止错误 = (err) => { if (!终止错误) 终止错误 = err instanceof Error ? err : new Error(String(err || 'tunnel failed')); };
 	let readError = null;
 	const 追踪 = pipeMeta?.wrapper?.追踪 || null; // DEBUG-only connection tracer (null when DEBUG off)
 	// Fire onFirstByte exactly once, when the remote actually returns data (used for ProxyIP health scoring).
 	const 标记首字节 = () => { if (hasData) return; hasData = true; if (首字节计时器) { clearTimeout(首字节计时器); 首字节计时器 = null; } if (pipeMeta?.wrapper) pipeMeta.wrapper.已向客户端下发数据 = true; 追踪首字节(追踪); try { pipeMeta?.onFirstByte?.(); } catch (e) { } };
 	const BYOB单次读取上限 = 64 * 1024;
 	const downlinkGrainBytes = getDownlinkGrainBytes(pipeMeta?.env);
-	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env);
+	// A scheduled grain flush fails with no caller to return to, so the sender hands the failure here. Treat
+	// it exactly like a read error: stop reading, drop the remote, and let the terminal block below fail the
+	// client transport. Without this the pipe completed normally while the client had received nothing.
+	const 下行发送器 = 创建下行Grain发送器(webSocket, header, downlinkGrainBytes, pipeMeta?.env, (error) => {
+		设置终止错误(error);
+		cancelReaderQuietly(reader, 'downstream send failed');
+		closeRemoteSocketQuietly(remoteSocket);
+	});
 	header = null;
 
 	try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
@@ -5230,11 +5278,6 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// connection instead of hanging. Armed whenever firstByteTimeoutMs > 0 — the caller decides the value
 	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
 	let 管道已结束 = false;
-	// The one place a terminal failure is recorded, set by whichever layer actually detects it. First writer
-	// wins, so the original cause survives any teardown that follows it. A null here means nothing failed —
-	// the connection simply ended, and it must be reported to the client as exactly that.
-	let 终止错误 = null;
-	const 设置终止错误 = (err) => { if (!终止错误) 终止错误 = err instanceof Error ? err : new Error(String(err || 'tunnel failed')); };
 	// When the caller sends a data-carrying first packet on the direct path, replaying it is unsafe — so a
 	// first-byte TIMEOUT must close-only (no retry) while a socket close/EOF may still fall back to ProxyIP.
 	// This flag records that the read ended via the timeout, so the retry gate below skips replay in that case.
@@ -10323,6 +10366,30 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 	return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
 }
 
+// Reject a rejected proxy configuration BEFORE any transport handler accepts the connection. Checking it
+// only inside forwardataTCP left two holes: a DNS/UDP session never calls that function at all, and by the
+// time it does run the 101/200 has already been sent. Returning the decoy keeps a misconfigured tunnel
+// indistinguishable from an ordinary page to anyone probing it, while the operator sees why under DEBUG.
+async function 代理配置被拒(tunnelContext) {
+	if (!tunnelContext?.proxyConfigError) return null;
+	log(`[Tunnel] Explicit proxy configuration rejected: ${tunnelContext.proxyConfigError}`);
+	return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
+}
+
+// Log the path, never the raw query. A tunnel URL can carry socks5=user:password@host, http=/https= with
+// the same shape, proxyip=, and other operator configuration; log() is DEBUG-gated, but DEBUG is exactly what
+// gets switched on to troubleshoot, and `wrangler tail` output is the last place a proxy password should
+// appear. Keys are kept so a log still shows WHICH parameters were present.
+function 脱敏查询串(search) {
+	if (!search || search.length < 2) return '';
+	const 敏感 = /^(socks5|http|https|turn|sstp|proxyip|pyip|ip|ed|uuid|token|pw|password|key)$/i;
+	const 各项 = [];
+	for (const [名, 值] of new URLSearchParams(search)) {
+		各项.push(敏感.test(名) || 值.includes('@') ? `${名}=<redacted>` : `${名}=${值}`);
+	}
+	return 各项.length ? '?' + 各项.join('&') : '';
+}
+
 async function 反代参数获取(url, uuid, tunnelContext = emptyTunnelContext()) {
 	return applyProxyParamsToTunnelContext(url, uuid, tunnelContext);
 }
@@ -10604,16 +10671,31 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 			tunnelContext.proxyFallbackEnabled = false;
 			tunnelContext.globalProxyEnabled = true;
 			tunnelContext.proxyType = String(type).toLowerCase();
+			// The port bound added to 获取SOCKS5账号 did NOT cover this path — the encoded /video/ chain proxy
+			// parses its own JSON and never calls that helper, so -1, 1.5, 65536 and Infinity all passed
+			// isNaN() and were carried into a connect. Claiming that fix was complete after changing one of
+			// two parsers was the error; both are bounded now.
+			const 链式端口 = Number(链式代理地址.port);
+			if (!Number.isInteger(链式端口) || 链式端口 < 1 || 链式端口 > 65535) throw new Error(`Invalid chain proxy port: ${链式代理地址.port}`);
+			const 链式主机 = String(链式代理地址.hostname || '').trim();
+			if (!链式主机) throw new Error('Invalid chain proxy host');
+			validateTunnelTarget(链式主机, 链式端口);
 			tunnelContext.parsedProxyAddress = {
 				username: 链式代理地址.username,
 				password: 链式代理地址.password,
-				hostname: 链式代理地址.hostname,
-				port: Number(链式代理地址.port)
+				hostname: 链式主机,
+				port: 链式端口
 			};
-			if (isNaN(tunnelContext.parsedProxyAddress.port)) throw new Error('Invalid chain proxy port');
 			return tunnelContext;
 		} catch (err) {
 			debugError('Failed to parse chain proxy parameters:', err.message);
+			// Falling through here resumed ordinary query-parameter parsing, so a malformed chain proxy became
+			// whatever the query said — or a plain DIRECT dial. The caller asked for a specific chain; sending
+			// their traffic somewhere else instead is the one outcome that must never happen silently.
+			tunnelContext.proxyConfigError = err?.message || 'invalid chain proxy configuration';
+			tunnelContext.proxyType = null;
+			tunnelContext.parsedProxyAddress = {};
+			return tunnelContext;
 		}
 	}
 
@@ -11318,6 +11400,8 @@ async function resolveProxyEndpointsLiveWithEnv(env, proxyIP, 目标域名 = 'da
 export const __testPerformanceHelpers = {
 	validateTunnelTarget,
 	解析SS目标三态,
+	创建下行Grain发送器,
+	脱敏查询串,
 	SS首包最大字节,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	// Exported so tests pin their fixtures to the LIVE version rather than a literal. A hardcoded

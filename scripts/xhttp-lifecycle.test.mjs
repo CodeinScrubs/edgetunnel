@@ -157,4 +157,43 @@ for (const file of BUILDS) {
 		`${file}: the unconditional graceful close on the failure path is back`);
 }
 
+// A SCHEDULED grain flush runs detached from whoever queued the bytes, so its rejection has no caller to
+// return to. It was handled with `.catch(() => closeSocketQuietly(webSocket))`: the client got a NORMAL 1000
+// close and the operation RESOLVED, so a downstream send that genuinely failed looked exactly like a stream
+// that finished cleanly and connectStreams never learned the bytes were undelivered. Fifth home of the same
+// failure-as-success class, and the only one where the failure is ownerless by construction.
+// Driven for real rather than asserted structurally, because the bug lives in the asynchronous path.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	let ownerErr = null;
+	const closes = [];
+	const ws = {
+		readyState: 1, bufferedAmount: 0,
+		send() { return Promise.reject(new Error('DOWNSTREAM_SEND_FAILED')); },
+		close(code) { closes.push(code ?? null); this.readyState = 3; },
+		addEventListener() { }, removeEventListener() { },
+	};
+	const sender = H.创建下行Grain发送器(ws, null, 65536, null, (e) => { ownerErr = e; });
+	// Three bytes take the small-tail SCHEDULED path rather than an inline await — that is the whole point.
+	await sender.发送(new Uint8Array([9, 8, 7]));
+	await new Promise(r => setTimeout(r, 30));
+
+	assert.ok(ownerErr, 'a scheduled flush rejection must reach the pipe that owns the stream');
+	assert.match(ownerErr.message, /DOWNSTREAM_SEND_FAILED/, 'the original cause must survive');
+	await assert.rejects(() => sender.flush(), /DOWNSTREAM_SEND_FAILED/,
+		'flush() must report a failure a scheduled flush already recorded, not resolve as if the tail went out');
+	await assert.rejects(() => sender.发送(new Uint8Array([1])), /DOWNSTREAM_SEND_FAILED/,
+		'sending after a terminal failure must not silently succeed');
+	assert.deepEqual(closes, [],
+		'the sender must not close the client itself — closing 1000 here is what disguised the failure as a clean finish');
+}
+
+for (const file of BUILDS) {
+	const src = readFileSync(file, 'utf8');
+	assert.doesNotMatch(src, /flush\(\)\.catch\(\(\) => closeSocketQuietly\(webSocket\)\)/,
+		`${file}: a scheduled flush must not swallow its rejection into a clean close`);
+	assert.match(src, /cancelReaderQuietly\(reader, 'downstream send failed'\)/,
+		`${file}: connectStreams must own the grain sender's asynchronous failure`);
+}
+
 console.log('xhttp lifecycle tests passed');

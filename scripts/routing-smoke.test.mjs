@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // The entry handler had never been EXECUTED by any test -- every suite tested extracted functions. That
 // gap let a real regression ship: identity resolution moved into 解析显式UUID, the local `uuidRegex`
@@ -131,4 +132,47 @@ for (const [label, spec] of BUILDS) {
 }
 
 globalThis.fetch = realFetch;
+
+// A tunnel URL carries operator configuration: socks5=user:password@host, the http=/https= forms with the
+// same shape, proxyip=, tokens. Those were logged verbatim. log() is DEBUG-gated, but DEBUG is precisely
+// what gets switched on to troubleshoot, and `wrangler tail` is the last place a proxy password belongs.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const r = H.脱敏查询串;
+	const 秘密 = r('?socks5=user:pass@host:1080');
+	assert.ok(!秘密.includes('pass'), 'a proxy password must never reach a log line');
+	assert.ok(秘密.includes('socks5'), 'the parameter NAME should survive so a log still shows what was set');
+	assert.ok(!r('?http=u:p@h:8080').includes('p@h'), 'the http= form carries credentials too');
+	assert.ok(!r('?proxyip=1.2.3.4').includes('1.2.3.4'), 'the configured relay is operator configuration');
+	assert.equal(r(''), '', 'no query means no output');
+	assert.equal(r('?'), '', 'an empty query means no output');
+	assert.ok(r('?foo=bar').includes('foo=bar'), 'ordinary parameters stay readable — over-redacting makes logs useless');
+}
+
+// The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port
+// bound added there did not cover it: -1, 1.5, 65536 and Infinity all passed isNaN() and were dialled.
+// Its catch also fell through to ordinary query parsing, so a malformed chain became a DIRECT dial.
+for (const [file] of BUILDS) {
+	const src = readFileSync(file, 'utf8');
+	assert.match(src, /if \(!Number\.isInteger\(链式端口\) \|\| 链式端口 < 1 \|\| 链式端口 > 65535\)/,
+		`${file}: the chain-proxy port must be range-checked, not just isNaN-checked`);
+	assert.match(src, /tunnelContext\.proxyConfigError = err\?\.message \|\| 'invalid chain proxy configuration';/,
+		`${file}: a malformed chain proxy must fail closed, never fall through to direct`);
+	assert.doesNotMatch(src, /if \(isNaN\(tunnelContext\.parsedProxyAddress\.port\)\)/,
+		`${file}: the old isNaN-only chain port check must not come back`);
+	// The rejection must be enforced before ANY transport handler — checking only inside forwardataTCP left
+	// DNS/UDP sessions uncovered and ran after the 101/200 had already been sent.
+	assert.match(src, /const 代理配置错误 = await 代理配置被拒\(workerRequestContext\.tunnel\);\s+if \(代理配置错误\) return 代理配置错误;/,
+		`${file}: proxy configuration must be rejected before the transport handler accepts`);
+	// Request bodies were bounded in bytes but not in time: one byte every few seconds held an invocation open.
+	assert.match(src, /if \(剩余毫秒 <= 0\) throw new Error\('Request body timed out'\);/,
+		`${file}: request bodies need an absolute deadline, not only a byte cap`);
+	assert.match(src, /if \(\+\+分片数 > 最大分片数\) throw new Error\('Too many request body chunks'\);/,
+		`${file}: a drip-feed must also be bounded by chunk count`);
+	// SS could close between the queue's readyState check and the encrypt callback, and the skipped send
+	// resolved as if the ciphertext had gone out.
+	assert.match(src, /throw new Error\('SS client transport closed before ciphertext delivery'\);/,
+		`${file}: an undelivered SS chunk must reject, not silently disappear`);
+}
+
 console.log('routing smoke tests passed');
