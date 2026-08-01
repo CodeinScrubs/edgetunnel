@@ -61,10 +61,17 @@ const { createHash } = await import('node:crypto');
 const 源哈希 = createHash('sha256').update(bundled).digest('hex').slice(0, 12);
 const 版本串 = `${new Date().toISOString().slice(0, 10)} src:${源哈希}`;
 
-const banner = [
+// Tag each artifact with its own variant name. The stamp is a hash of the SOURCE, so every generated
+// build carried one identical marker and /version could not say which file was actually deployed --
+// two artifacts with different bytes reported the same identity, which is exactly when you most need
+// to tell them apart. The variant is appended rather than replacing the source hash: src: still
+// answers "which source" and the suffix answers "which artifact". The hand-maintained panel build
+// already used a ' panel' suffix, so this follows an existing convention. Hashing the artifact itself
+// is not usable here -- stamping the hash into the file would change the file, and so the hash.
+const banner = (variant) => [
 	'// Generated from src/worker.js by scripts/build-worker.mjs.',
 	'// Edit src/worker.js or src/core/config.js, then run npm run build.',
-	`// Build: ${版本串}`,
+	`// Build: ${版本串} ${variant}`,
 	'',
 ].join('\n');
 
@@ -75,9 +82,10 @@ if (!VERSION_RE.test(bundled)) {
 	throw new Error('Build could not find the Version literal to stamp');
 }
 const stamped = bundled.replace(VERSION_RE, `const Version = '${版本串}';`);
+const 打上变体戳 = (text, variant) => text.replace(VERSION_RE, `const Version = '${版本串} ${variant}';`);
 
 // --- Copy-paste / Dashboard build: identical bundle, request.fetcher.connect. ---
-const copypasteOutput = banner + stamped;
+const copypasteOutput = banner('copypaste') + 打上变体戳(stamped, 'copypaste');
 
 // --- Wrangler build: same bundle, but the connect factory also uses cloudflare:sockets. ---
 // The Dashboard editor mishandles the cloudflare:sockets module import (Error 1101), so this
@@ -93,7 +101,7 @@ if (!stamped.includes(FETCHER_CONNECT_BODY)) {
 	throw new Error('Build could not find the connect factory to produce the Wrangler (cloudflare:sockets) variant');
 }
 const wranglerBundle = stamped.replace(FETCHER_CONNECT_BODY, SOCKETS_CONNECT_BODY);
-const wranglerOutput = "import { connect as cloudflareConnect } from 'cloudflare:sockets';\n" + banner + wranglerBundle;
+const wranglerOutput = "import { connect as cloudflareConnect } from 'cloudflare:sockets';\n" + banner('wrangler') + 打上变体戳(wranglerBundle, 'wrangler');
 
 // The build stamp changes on every run (timestamp + git sha), so a byte-for-byte parity check would
 // always fail. Normalise ONLY the two stamped lines before comparing — everything else must still match

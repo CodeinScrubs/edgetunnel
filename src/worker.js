@@ -962,6 +962,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 						已关闭 = true;
 						this.readyState = WebSocket.CLOSED;
 						释放下行背压();
+						// The response stream is gone, so nothing can consume the remote any more. Setting the local
+						// closed flags alone left the upstream socket open and the upload queue running with
+						// nowhere to deliver: send() then no-ops while the downlink pipe keeps draining a remote
+						// whose bytes are discarded. Own the teardown here, exactly as close()/fail() do.
+						XHTTP上行写入队列?.清空();
+						关闭连接全部Socket(remoteConnWrapper);
 						return;
 					}
 					return 等待下行可写();
@@ -1000,10 +1006,6 @@ async function 处理XHTTP请求(request, yourUUID) {
 			const 上行写入队列 = XHTTP上行写入队列 = 创建上行写入队列({
 				获取写入器: 获取远端写入器,
 				释放写入器: 释放远端写入器,
-				重试连接: async () => {
-					if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-					await remoteConnWrapper.retryConnect();
-				},
 				// The queue passes its failure through. Closing gracefully here marked the bridge closed
 				// BEFORE the rethrown error reached the outer catch, so fail() there became a no-op and a
 				// steady-state upload write failure still reached the client as a clean, successful EOF.
@@ -1545,6 +1547,10 @@ async function 处理gRPC请求(request, yourUUID) {
 								已关闭 = true;
 								grpcBridge.readyState = WebSocket.CLOSED;
 								释放下行背压();
+								// Same ownership rule as the XHTTP bridge: a dead response stream must tear the
+								// upstream down rather than leave it draining into nothing.
+								GRPC上行写入队列?.清空();
+								关闭连接全部Socket(remoteConnWrapper);
 							}
 						}
 						return 等待下行可写();
@@ -1625,6 +1631,9 @@ async function 处理gRPC请求(request, yourUUID) {
 					已关闭 = true;
 					grpcBridge.readyState = WebSocket.CLOSED;
 					释放下行背压();
+					// Same ownership rule: the batched-frame path can fail the response stream too.
+					GRPC上行写入队列?.清空();
+					关闭连接全部Socket(remoteConnWrapper);
 				}
 			};
 
@@ -1689,10 +1698,6 @@ async function 处理gRPC请求(request, yourUUID) {
 					return 远端写入器;
 				},
 				释放写入器: 释放远端写入器,
-				重试连接: async () => {
-					if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-					await remoteConnWrapper.retryConnect();
-				},
 				关闭连接,
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
@@ -1997,10 +2002,6 @@ async function 处理WS请求(request, yourUUID, url) {
 			return 远端写入器;
 		},
 		释放写入器: 释放远端写入器,
-		重试连接: async () => {
-			if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-			await remoteConnWrapper.retryConnect();
-		},
 		关闭连接: () => {
 			关闭连接全部Socket(remoteConnWrapper);
 			closeSocketQuietly(serverSock);
@@ -2206,6 +2207,7 @@ async function 处理WS请求(request, yourUUID, url) {
 					入站解密器,
 					回包Socket,
 					首包已建立: false,
+					首包缓存: SS空块,
 					目标主机: '',
 					目标端口: 0,
 				};
@@ -2228,7 +2230,11 @@ async function 处理WS请求(request, yourUUID, url) {
 				// WS-forwarding handler and is logged as an opaque failure instead of a decrypt failure.
 				if (err?.name === 'OperationError' || msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
 				log(`[SS inbound] Decryption failed; connection closed: ${msg}`);
-				closeSocketQuietly(serverSock);
+				// A decrypt failure is a FAILURE. closeSocketQuietly ends the socket with a normal 1000, which
+				// tells the client the session finished cleanly and gives it no reason to re-dial with correct
+				// credentials or a fresh session — the same "reported success for a dead tunnel" shape fixed
+				// across the other transports.
+				failClientTransportQuietly(serverSock, err);
 				return;
 			}
 			throw err;
@@ -2246,36 +2252,19 @@ async function 处理WS请求(request, yourUUID, url) {
 				await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
 				continue;
 			}
+			// Accumulate across records: the header may be split, and a record after a complete header may carry
+			// payload for a destination we have not parsed yet. Bounded so an authenticated-but-malformed peer
+			// cannot grow this without limit.
 			const 明文数据 = 数据转Uint8Array(明文块);
-			if (明文数据.byteLength < 3) throw new Error('invalid ss data');
-			const addressType = 明文数据[0];
-			let cursor = 1;
-			let hostname = '';
-			if (addressType === 1) {
-				if (明文数据.byteLength < cursor + 4 + 2) throw new Error('invalid ss ipv4 length');
-				hostname = `${明文数据[cursor]}.${明文数据[cursor + 1]}.${明文数据[cursor + 2]}.${明文数据[cursor + 3]}`;
-				cursor += 4;
-			} else if (addressType === 3) {
-				if (明文数据.byteLength < cursor + 1) throw new Error('invalid ss domain length');
-				const domainLength = 明文数据[cursor];
-				cursor += 1;
-				if (明文数据.byteLength < cursor + domainLength + 2) throw new Error('invalid ss domain data');
-				hostname = SS文本解码器.decode(明文数据.subarray(cursor, cursor + domainLength));
-				cursor += domainLength;
-			} else if (addressType === 4) {
-				if (明文数据.byteLength < cursor + 16 + 2) throw new Error('invalid ss ipv6 length');
-				const ipv6 = [];
-				const ipv6View = new DataView(明文数据.buffer, 明文数据.byteOffset + cursor, 16);
-				for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
-				hostname = ipv6.join(':');
-				cursor += 16;
-			} else {
-				throw new Error(`invalid ss addressType: ${addressType}`);
-			}
-			if (!hostname) throw new Error(`invalid ss address: ${addressType}`);
-			const port = (明文数据[cursor] << 8) | 明文数据[cursor + 1];
-			cursor += 2;
-			const rawClientData = 明文数据.subarray(cursor);
+			上下文.首包缓存 = 上下文.首包缓存.byteLength ? 拼接字节数据(上下文.首包缓存, 明文数据) : 明文数据;
+			if (上下文.首包缓存.byteLength > SS首包最大字节) throw new Error('SS destination header too large');
+			const SS首包 = 解析SS目标三态(上下文.首包缓存);
+			if (SS首包.状态 === 'need_more') continue;
+			if (SS首包.状态 === 'invalid') throw new Error(SS首包.原因);
+			上下文.首包缓存 = SS空块;
+			const hostname = SS首包.hostname;
+			const port = SS首包.port;
+			const rawClientData = SS首包.rawData;
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			上下文.首包已建立 = true;
 			// AEAD decrypt succeeded AND a full destination header parsed — this, not the presence of
@@ -2816,6 +2805,46 @@ function 数据转Uint8Array(data) {
 	if (data instanceof ArrayBuffer) return new Uint8Array(data);
 	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 	return new Uint8Array(data || 0);
+}
+
+const SS空块 = new Uint8Array(0);
+// SS carries its destination header in a BYTE STREAM. An AEAD record boundary is not a header boundary, so
+// a client is free to split [ATYP][address][port] across two records — and the old code assumed every
+// decrypted record began with a complete header, killing such a connection with "invalid ss ipv4 length".
+// Tri-state so the caller can accumulate instead of guessing, exactly like the 魏烈思/木马 accumulator.
+const SS首包最大字节 = 16 * 1024;
+function 解析SS目标三态(data) {
+	if (data.byteLength < 1) return { 状态: 'need_more' };
+	const addressType = data[0];
+	let cursor = 1;
+	let hostname = '';
+	if (addressType === 1) {
+		if (data.byteLength < cursor + 4 + 2) return { 状态: 'need_more' };
+		hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
+		cursor += 4;
+	} else if (addressType === 3) {
+		if (data.byteLength < cursor + 1) return { 状态: 'need_more' };
+		const domainLength = data[cursor];
+		cursor += 1;
+		if (domainLength === 0) return { 状态: 'invalid', 原因: 'invalid ss domain length' };
+		if (data.byteLength < cursor + domainLength + 2) return { 状态: 'need_more' };
+		hostname = SS文本解码器.decode(data.subarray(cursor, cursor + domainLength));
+		cursor += domainLength;
+	} else if (addressType === 4) {
+		if (data.byteLength < cursor + 16 + 2) return { 状态: 'need_more' };
+		const ipv6 = [];
+		const ipv6View = new DataView(data.buffer, data.byteOffset + cursor, 16);
+		for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
+		hostname = ipv6.join(':');
+		cursor += 16;
+	} else {
+		return { 状态: 'invalid', 原因: `invalid ss addressType: ${addressType}` };
+	}
+	if (!hostname) return { 状态: 'invalid', 原因: `invalid ss address: ${addressType}` };
+	const port = (data[cursor] << 8) | data[cursor + 1];
+	cursor += 2;
+	if (port < 1) return { 状态: 'invalid', 原因: 'invalid ss port' };
+	return { 状态: 'ok', hostname, port, rawData: data.subarray(cursor) };
 }
 
 function 拼接字节数据(...chunkList) {
@@ -3647,26 +3676,19 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			} else if (proxyType === 'turn') {
 				log(`[TURN proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = await turnConnect(proxyAddressForConnect, host, portNum, TCP连接);
-				if (有效数据长度(本次首包数据) > 0) {
-					// Close the socket if the first-packet write fails, matching connectDirect/connectProxyIP —
-					// otherwise a socket that connected but rejected its first write leaks (never assigned to
-					// remoteConnWrapper.socket, so nothing else closes it).
-					try {
-						const writer = newSocket.writable.getWriter();
-						try { await writer.write(数据转Uint8Array(本次首包数据)) }
-						finally { try { writer.releaseLock() } catch (e) { } }
-					} catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
-				}
+				// Go through the shared first-write owner rather than writing raw. The hand-rolled write here
+				// skipped everything 写入首包 exists for: publishing 待处理Socket (so a client that leaves during
+				// an unsettled write can reject it instead of parking the invocation until the runtime kills it
+				// with "your Worker's code had hung"), the INITIAL_WRITE_TIMEOUT_MS deadline, and the
+				// already-disconnected pre-check. The surrounding close-on-failure is kept.
+				try { await 写入首包(newSocket, 本次首包数据); }
+				catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
 			} else if (proxyType === 'sstp') {
 				log(`[SSTP proxy] Proxying to: ${host}:${portNum}`);
 				newSocket = await sstpConnect(proxyAddressForConnect, host, portNum, TCP连接);
-				if (有效数据长度(本次首包数据) > 0) {
-					try {
-						const writer = newSocket.writable.getWriter();
-						try { await writer.write(数据转Uint8Array(本次首包数据)) }
-						finally { try { writer.releaseLock() } catch (e) { } }
-					} catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
-				}
+				// Same shared first-write owner as the TURN branch above.
+				try { await 写入首包(newSocket, 本次首包数据); }
+				catch (err) { closeRemoteSocketQuietly(newSocket); throw err; }
 			} else {
 				log(`[ProxyIP connection] Proxying to: ${host}:${portNum}`);
 				const 所有反代数组 = await 解析地址端口(proxyIP, host, yourUUID, env, ctx);
@@ -4668,7 +4690,7 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 }
 
 // 最大字节/最大条目 default to the module constants, so an omitted option is exactly the old behaviour.
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
 	const 执行远端写入 = 写入超时毫秒 > 0
@@ -4689,10 +4711,16 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
 	let bundleBuffer = null;
 	let idleResolvers = [];
 	let activeCompletions = null;
-	// True once any chunk has been successfully written to the remote. After that a reconnect
-	// retry is unsafe: 重试连接 reconnects and replays only the original first packet, so retrying
-	// once data has already flowed would desync the upstream stream. Mirrors the download path's
-	// `!hasData` retry gate (see pipeRemoteToClient).
+	// True once any chunk has been successfully written to the remote. It gates coalescing/replay decisions
+	// the same way the download path's `!hasData` gate does (see pipeRemoteToClient).
+	//
+	// The queue used to also accept a reconnect callback, and every transport passed one -- but nothing ever
+	// called it. A dormant recovery hook reads as if recovery exists, so the next person here would
+	// reasonably assume a failed writer gets retried. It does not. The parameter and its three call-site
+	// closures are removed rather than wired up: a retry is only safe BEFORE writer.write() is entered,
+	// because once it is called delivery is indeterminate and replaying the first packet on a reconnect can
+	// duplicate a non-idempotent request. Reinstating it needs that pre-write boundary enforced explicitly
+	// and tested, not a call bolted into the drain loop.
 	let 已交付远端字节 = false;
 
 	const settleCompletions = (completions, err = null) => {
@@ -5326,10 +5354,18 @@ function isValidIPv6Literal(host) {
 function isPrivateOrLocalIPv4(host) {
 	const m = String(host || '').match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
 	if (!m) return false;
-	const a = Number(m[1]), b = Number(m[2]);
+	const a = Number(m[1]), b = Number(m[2]), c = Number(m[3]);
 	return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
 		|| (a === 100 && b >= 64 && b <= 127) // CGNAT 100.64.0.0/10
-		|| (a === 198 && (b === 18 || b === 19)); // benchmarking 198.18.0.0/15
+		|| (a === 198 && (b === 18 || b === 19)) // benchmarking 198.18.0.0/15
+		// Everything at or above 224 is multicast (224/4) or reserved (240/4, which includes the
+		// 255.255.255.255 broadcast address). None of it is a reachable unicast destination, so dialling it
+		// only burns a connection attempt and its timeout before failing.
+		|| a >= 224
+		|| (a === 192 && b === 0 && c === 2)    // TEST-NET-1 192.0.2.0/24
+		|| (a === 198 && b === 51 && c === 100) // TEST-NET-2 198.51.100.0/24
+		|| (a === 203 && b === 0 && c === 113)  // TEST-NET-3 203.0.113.0/24
+		|| (a === 192 && b === 88 && c === 99); // 6to4 relay anycast 192.88.99.0/24 (deprecated)
 }
 
 function isLocalhostName(host) {
@@ -5347,24 +5383,26 @@ function getFirstIpv6Hextet(host) {
 }
 
 function isPrivateOrLocalIPv6(host) {
-	const value = stripIPv6Brackets(String(host || '').trim()).toLowerCase();
-	// Unwrap IPv4-mapped (::ffff:a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) forms to the embedded IPv4 FIRST —
-	// isValidIPv6Literal rejects the mixed-dotted notation, so this must run before it. Prevents e.g.
-	// ::ffff:127.0.0.1 or 64:ff9b::a9fe:a9fe smuggling a private target past the guard.
-	if (value.startsWith('::ffff:') || value.startsWith('64:ff9b:')) {
-		const dotted = value.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-		if (dotted) return isPrivateOrLocalIPv4(dotted[1]);
-		const groups = value.split(':').filter(g => g.length > 0);
-		if (groups.length >= 2) {
-			const hi = parseInt(groups[groups.length - 2], 16), lo = parseInt(groups[groups.length - 1], 16);
-			if (Number.isFinite(hi) && Number.isFinite(lo)) return isPrivateOrLocalIPv4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
-		}
-	}
-	if (!isValidIPv6Literal(value)) return false;
-	if (value === '::' || value === '0:0:0:0:0:0:0:0' || value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
-	const first = getFirstIpv6Hextet(value);
-	if (first === null) return false;
-	return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80; // fc00::/7 ULA, fe80::/10 link-local.
+	// Classify the 16 BYTES rather than the text. The previous version tested string prefixes plus the first
+	// hextet, which unwrapped ::ffff: and 64:ff9b: but silently allowed IPv4-COMPATIBLE ::a.b.c.d (so
+	// ::127.0.0.1 reached the dialler), and had no notion of multicast, documentation or discard space.
+	// IPv6转字节 already parses every legal spelling, including the mixed dotted-quad tail, and rejects
+	// malformed ones — so one parse replaces every string-shape special case.
+	const bytes = IPv6转字节(stripIPv6Brackets(String(host || '').trim()).toLowerCase());
+	if (!bytes) return false;
+	if (bytes[0] === 0xff) return true;                                   // ff00::/8 multicast
+	if ((bytes[0] & 0xfe) === 0xfc) return true;                          // fc00::/7 unique-local
+	if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return true;     // fe80::/10 link-local
+	if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0d && bytes[3] === 0xb8) return true; // 2001:db8::/32 docs
+	if (bytes[0] === 0x01 && bytes[1] === 0x00 && bytes.subarray(2, 8).every(v => v === 0)) return true; // 100::/64 discard
+	// IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96, which also covers :: and ::1) and NAT64
+	// (64:ff9b::/96) all carry an IPv4 address in the last four bytes. Judge them by that address so a
+	// private or otherwise unusable v4 target cannot be smuggled through in v6 clothing.
+	const v4映射 = bytes[10] === 0xff && bytes[11] === 0xff && bytes.subarray(0, 10).every(v => v === 0);
+	const v4兼容 = bytes.subarray(0, 12).every(v => v === 0);
+	const nat64 = bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b;
+	if (v4映射 || v4兼容 || nat64) return isPrivateOrLocalIPv4(`${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`);
+	return false;
 }
 
 function isProbablyValidDomain(host) {
@@ -5387,6 +5425,12 @@ function validateTunnelTarget(host, port) {
 	if (portNum === 25) throw new Error('SMTP port 25 is not allowed');
 	if (!hostname) throw new Error('empty target host');
 	if (isLocalhostName(hostname)) throw new Error(`localhost target blocked: ${hostname}`);
+	// A dotted quad must be spelled canonically. isIPHostname's octet pattern accepts a leading zero, so
+	// "01.2.3.4" passed as a valid IP literal — and a leading zero is octal to some resolvers, meaning the
+	// address actually dialled can differ from the one that was validated.
+	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(unbracketedHost) && !/^(?:0|[1-9]\d{0,2})(\.(?:0|[1-9]\d{0,2})){3}$/.test(unbracketedHost)) {
+		throw new Error(`non-canonical IPv4 literal: ${hostname}`);
+	}
 	if (isPrivateOrLocalIPv4(unbracketedHost)) throw new Error(`private/local target blocked: ${hostname}`);
 	if (isPrivateOrLocalIPv6(unbracketedHost)) throw new Error(`private/local IPv6 target blocked: ${hostname}`);
 	if (!isIPHostname(hostname) && !isProbablyValidDomain(hostname)) throw new Error(`invalid target hostname: ${hostname}`);
@@ -11082,6 +11126,8 @@ async function resolveProxyEndpointsLiveWithEnv(env, proxyIP, 目标域名 = 'da
 
 export const __testPerformanceHelpers = {
 	validateTunnelTarget,
+	解析SS目标三态,
+	SS首包最大字节,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	// Exported so tests pin their fixtures to the LIVE version rather than a literal. A hardcoded
 	// `version: 1` silently stopped matching the moment the constant was bumped, and the record was

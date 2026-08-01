@@ -199,4 +199,47 @@ for (const file of BUILDS) {
 	assert.match(src, /pre-authentication timed out after/, `${file}: WS must arm an absolute pre-auth deadline`);
 }
 
+// Shadowsocks has the same class of bug, and it survived the WS/gRPC round because SS carries its
+// destination header in an AEAD-record byte stream: a record boundary is not a header boundary. Every
+// decrypted record was assumed to start with a complete [ATYP][address][port], so a client that split one
+// across two records was killed with "invalid ss ipv4 length". Drive the real parser at every split point.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const enc = new TextEncoder();
+	const host = enc.encode('example.com');
+	const full = new Uint8Array(1 + 1 + host.length + 2 + 3);
+	full[0] = 3;                                   // ATYP = domain
+	full[1] = host.length;
+	full.set(host, 2);
+	full[2 + host.length] = 0x01;                  // port 443
+	full[3 + host.length] = 0xbb;
+	full.set([9, 8, 7], 4 + host.length);          // trailing payload
+
+	for (let cut = 1; cut < full.length; cut++) {
+		const partial = H.解析SS目标三态(full.subarray(0, cut));
+		assert.notEqual(partial.状态, 'invalid',
+			`a header split at byte ${cut} must be need_more, never invalid — that is the bug (${partial.原因 || ''})`);
+	}
+	const done = H.解析SS目标三态(full);
+	assert.equal(done.状态, 'ok');
+	assert.equal(done.hostname, 'example.com');
+	assert.equal(done.port, 443);
+	assert.deepEqual(Array.from(done.rawData), [9, 8, 7], 'payload after the header must survive intact');
+
+	// Malformed input must still fail closed rather than accumulate forever.
+	assert.equal(H.解析SS目标三态(new Uint8Array([9])).状态, 'invalid', 'an unknown address type is invalid, not need_more');
+	assert.equal(H.解析SS目标三态(new Uint8Array([3, 0, 0, 0])).状态, 'invalid', 'a zero-length domain is invalid');
+	assert.ok(H.SS首包最大字节 > 0 && H.SS首包最大字节 <= 64 * 1024, 'the accumulator must stay bounded');
+}
+
+for (const file of BUILDS) {
+	const src = readFileSync(file, 'utf8');
+	assert.match(src, /上下文\.首包缓存 = 上下文\.首包缓存\.byteLength \? 拼接字节数据/,
+		`${file}: SS must accumulate its destination header across AEAD records`);
+	assert.match(src, /SS destination header too large/, `${file}: the SS header accumulator must be bounded`);
+	// A decrypt failure closed the socket with a normal 1000, i.e. "session finished fine".
+	assert.match(src, /failClientTransportQuietly\(serverSock, err\);/,
+		`${file}: an SS decrypt failure must fail the transport, not close it as a clean success`);
+}
+
 console.log('pre-auth fragmentation tests passed');

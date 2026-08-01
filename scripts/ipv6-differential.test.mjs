@@ -111,4 +111,65 @@ for (const file of BUILDS) {
 	console.log(`  ${file}: ${cases.length} cases, 0 divergences from net.isIPv6`);
 }
 
+// validateTunnelTarget must reject every address a tunnel can never usefully reach. Each of these was
+// ACCEPTED before byte-based classification replaced the string-prefix rules, so a client asking for one
+// spent a full dial attempt plus its timeout before failing. The must-allow half of the table matters just
+// as much: over-blocking here silently breaks real destinations, which is far worse than the gap it fixes.
+{
+	const BLOCK = [
+		['224.0.0.1', 'IPv4 multicast 224/4'],
+		['239.255.255.250', 'IPv4 multicast (SSDP)'],
+		['240.0.0.1', 'IPv4 reserved 240/4'],
+		['255.255.255.255', 'IPv4 broadcast'],
+		['192.0.2.1', 'TEST-NET-1'],
+		['198.51.100.1', 'TEST-NET-2'],
+		['203.0.113.1', 'TEST-NET-3'],
+		['192.88.99.1', '6to4 relay anycast'],
+		['::127.0.0.1', 'IPv4-compatible IPv6 loopback'],
+		['::ffff:127.0.0.1', 'IPv4-mapped loopback'],
+		['64:ff9b::7f00:1', 'NAT64-embedded loopback'],
+		['ff02::1', 'IPv6 multicast'],
+		['ff05::1:3', 'IPv6 multicast'],
+		['2001:db8::1', 'IPv6 documentation'],
+		['100::1', 'IPv6 discard-only'],
+		['fe80::1', 'IPv6 link-local'],
+		['fc00::1', 'IPv6 unique-local'],
+		['::1', 'IPv6 loopback'],
+		['::', 'IPv6 unspecified'],
+		['127.0.0.1', 'IPv4 loopback'],
+		['10.0.0.1', 'RFC1918'],
+		['169.254.1.1', 'IPv4 link-local'],
+		['100.64.0.1', 'CGNAT'],
+		['999.1.1.1', 'non-numeric-TLD guard'],
+		['01.2.3.4', 'leading-zero octet reads as octal to some resolvers'],
+	];
+	const ALLOW = [
+		['1.1.1.1', 'public resolver'],
+		['8.8.8.8', 'public resolver'],
+		['142.250.185.78', 'google'],
+		['223.255.255.255', 'last unicast address before multicast'],
+		['2606:4700:4700::1111', 'public IPv6 resolver'],
+		['2a03:2880:f10c::', 'public IPv6'],
+		['example.com', 'domain'],
+		['www.youtube.com', 'domain'],
+	];
+	// Only the two builds Node can actually load: the wrangler variant imports cloudflare:sockets, which is
+	// unresolvable outside the Workers runtime. It is generated from the same source and the connect layer is
+	// the only permitted difference, so verify-generated already covers it.
+	for (const file of ['_worker_copypaste.js', 'src_static_ui/worker_test.js']) {
+		const { __testPerformanceHelpers: H } = await import('../' + file);
+		for (const [host, why] of BLOCK) {
+			let blocked = false;
+			try { H.validateTunnelTarget(host, 443); } catch (e) { blocked = true; }
+			assert.equal(blocked, true, `${file}: ${host} must be blocked (${why})`);
+		}
+		for (const [host, why] of ALLOW) {
+			let err = null;
+			try { H.validateTunnelTarget(host, 443); } catch (e) { err = e; }
+			assert.equal(err, null, `${file}: ${host} must stay reachable (${why}) — over-blocking breaks real traffic`);
+		}
+		console.log(`  ${file}: ${BLOCK.length} blocked, ${ALLOW.length} allowed`);
+	}
+}
+
 console.log('ipv6 differential tests passed');
