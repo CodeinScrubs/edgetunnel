@@ -63,6 +63,29 @@ for (const file of BUILDS) {
 	assert.match(src, /if \(是正常收尾\) closeSocketQuietly\(webSocket\);/,
 		`${file}: normal teardown must still close quietly, not report a failure`);
 
+	// connectStreams sits UPSTREAM of pipeRemoteToClient, so pre-closing there defeated the fix below it:
+	// the bridge set 已关闭 and every downstream fail() became a no-op. This is the layer that KNOWS the
+	// remote read or the fallback failed, so it must be the layer that says so.
+	assert.doesNotMatch(src, /closeSocketQuietly\(webSocket\);\s*\n\s*throw/,
+		`${file}: connectStreams must not close the client gracefully before rethrowing a failure`);
+	assert.match(src, /failClientTransportQuietly\(webSocket, retryError\);\s*\n\s*throw retryError;/,
+		`${file}: a failed fallback dial must fail the transport`);
+	assert.match(src, /failClientTransportQuietly\(webSocket, readError\);\s*\n\s*throw readError;/,
+		`${file}: a remote-read failure must fail the transport`);
+
+	// A watchdog cancels the reader, so read() can resolve done=true and leave readError null. "We sent a
+	// request and got nothing back" is a failure; reporting it as a clean close is what leaves a client
+	// sitting on a dead connection instead of re-dialling.
+	assert.match(src, /remote closed before returning a response/,
+		`${file}: request-sent-but-no-response must terminate as a failure`);
+	assert.match(src, /new Error\('remote first-byte timeout'\)/, `${file}: first-byte timeout must be named`);
+	assert.match(src, /new Error\('remote idle timeout'\)/, `${file}: idle timeout must be named`);
+
+	// Buffered downlink bytes must survive a read error. flush() used to be the last statement INSIDE the
+	// read try, so an error skipped it and a small response fragment was silently discarded.
+	assert.match(src, /\} catch \(err\) \{ readError = err \}[\s\S]{0,500}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
+		`${file}: the final flush must run outside the read try, so accepted bytes are not lost on error`);
+
 	// Regression guard: the old shape must not come back.
 	assert.doesNotMatch(src, /if \(!是流取消错误\(error\) && !\(pipeMeta\?\.wrapper\?\.客户端已关闭\)\) log\(`\[Stream pipe\][^\n]*\n\s*closeSocketQuietly\(webSocket\);/,
 		`${file}: the remote-read catch is swallowing failures again`);

@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:aa5d943e8f1d
+// Build: 2026-08-01 src:899b5e4962e0
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:aa5d943e8f1d';
+const Version = '2026-08-01 src:899b5e4962e0';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -5205,8 +5205,13 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				重置空闲计时器();
 			}
 		}
-		await 下行发送器.flush();
 	} catch (err) { readError = err }
+	// Flush OUTSIDE the try. This used to be the last statement inside it, so a read error jumped straight
+	// to the catch and the grain sender's buffered bytes were discarded: a remote could deliver a small
+	// response fragment and then reset, and the client received nothing at all rather than the partial
+	// body plus an error. Bytes already accepted from the remote belong to the client either way.
+	try { await 下行发送器.flush(); }
+	catch (flushErr) { if (!readError) readError = flushErr; }
 	finally {
 		管道已结束 = true;
 		// Record WHY the downlink ended so the close event is specific (remote_eof / …_no_data) instead of a
@@ -5246,14 +5251,31 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			await retryFunc();
 			return;
 		} catch (retryError) {
-			closeSocketQuietly(webSocket);
+			// A failed fallback is a FAILURE. Closing gracefully here marked the transport closed, so the
+			// fail() call downstream in pipeRemoteToClient became a no-op and the client saw a clean EOF for
+			// a connection that never reached its destination.
+			failClientTransportQuietly(webSocket, retryError);
 			throw retryError;
 		}
 	}
 	if (!hasData) { closeRemoteSocketQuietly(remoteSocket); }
 	if (readError) {
-		closeSocketQuietly(webSocket);
+		// Same ownership rule: this is the layer that KNOWS the remote read failed, so it must be the one
+		// that says so. Pre-closing here defeated every downstream failure handler.
+		failClientTransportQuietly(webSocket, readError);
 		throw readError;
+	}
+	// A watchdog cancels the reader, so a read() can resolve done=true rather than reject and leave
+	// readError null. "We sent a request and the remote returned nothing" is a failure, not a completion —
+	// reporting it as success is what makes a client sit on a dead connection instead of re-dialling.
+	if (!客户端已关闭 && 请求已发送值 && !hasData) {
+		const 原因 = pipeMeta?.wrapper?.closeHint === 'first_byte_timeout'
+			? new Error('remote first-byte timeout')
+			: pipeMeta?.wrapper?.closeHint === 'idle_timeout'
+				? new Error('remote idle timeout')
+				: new Error('remote closed before returning a response');
+		failClientTransportQuietly(webSocket, 原因);
+		throw 原因;
 	}
 	closeSocketQuietly(webSocket);
 }

@@ -5092,8 +5092,13 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				重置空闲计时器();
 			}
 		}
-		await 下行发送器.flush();
 	} catch (err) { readError = err }
+	// Flush OUTSIDE the try. This used to be the last statement inside it, so a read error jumped straight
+	// to the catch and the grain sender's buffered bytes were discarded: a remote could deliver a small
+	// response fragment and then reset, and the client received nothing at all rather than the partial
+	// body plus an error. Bytes already accepted from the remote belong to the client either way.
+	try { await 下行发送器.flush(); }
+	catch (flushErr) { if (!readError) readError = flushErr; }
 	finally {
 		管道已结束 = true;
 		// Record WHY the downlink ended so the close event is specific (remote_eof / …_no_data) instead of a
@@ -5133,14 +5138,31 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			await retryFunc();
 			return;
 		} catch (retryError) {
-			closeSocketQuietly(webSocket);
+			// A failed fallback is a FAILURE. Closing gracefully here marked the transport closed, so the
+			// fail() call downstream in pipeRemoteToClient became a no-op and the client saw a clean EOF for
+			// a connection that never reached its destination.
+			failClientTransportQuietly(webSocket, retryError);
 			throw retryError;
 		}
 	}
 	if (!hasData) { closeRemoteSocketQuietly(remoteSocket); }
 	if (readError) {
-		closeSocketQuietly(webSocket);
+		// Same ownership rule: this is the layer that KNOWS the remote read failed, so it must be the one
+		// that says so. Pre-closing here defeated every downstream failure handler.
+		failClientTransportQuietly(webSocket, readError);
 		throw readError;
+	}
+	// A watchdog cancels the reader, so a read() can resolve done=true rather than reject and leave
+	// readError null. "We sent a request and the remote returned nothing" is a failure, not a completion —
+	// reporting it as success is what makes a client sit on a dead connection instead of re-dialling.
+	if (!客户端已关闭 && 请求已发送值 && !hasData) {
+		const 原因 = pipeMeta?.wrapper?.closeHint === 'first_byte_timeout'
+			? new Error('remote first-byte timeout')
+			: pipeMeta?.wrapper?.closeHint === 'idle_timeout'
+				? new Error('remote idle timeout')
+				: new Error('remote closed before returning a response');
+		failClientTransportQuietly(webSocket, 原因);
+		throw 原因;
 	}
 	closeSocketQuietly(webSocket);
 }

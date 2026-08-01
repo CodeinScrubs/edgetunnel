@@ -1346,7 +1346,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// "a request was sent", so the first-byte-timeout cancellation can't masquerade as a failed route.)
 	await connectStreams(remoteSocket, webSocket, null, async () => {
 		events.push('retry');
-	}, 0, { wrapper: { 请求已发送: true } });
+	}, 0, { wrapper: { 请求已发送: true } }).catch(() => { });
 
 	assert.deepEqual(events, ['retry'], 'an upstream error AFTER a request was sent should retry before closing the client socket');
 }
@@ -1376,7 +1376,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// blackhole and must fall over. (A no-request preconnect would NOT retry — covered by a separate test.)
 	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, async () => {
 		events.push('retry-start');
-	}, 10, { wrapper: { 请求已发送: true } }), 250, 'first-byte fallback closes stale remote socket');
+	}, 10, { wrapper: { 请求已发送: true } }).catch(() => { }), 250, 'first-byte fallback closes stale remote socket');
 
 	assert.equal(events.includes('remote-close'), true, 'first-byte fallback should close the stale direct socket');
 	assert.equal(events.includes('retry-start'), true, 'first-byte fallback should still run the retry callback');
@@ -1398,7 +1398,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 			},
 		}),
 	};
-	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, null, 0, { wrapper }), 250, 'downlink-delivered flag');
+	await withTestTimeout(connectStreams(remoteSocket, webSocket, null, null, 0, { wrapper }).catch(() => { }), 250, 'downlink-delivered flag');
 	assert.equal(wrapper.已向客户端下发数据, true, 'delivering a downlink byte to the client sets the wrapper flag that blocks unsafe upload retries');
 }
 
@@ -1419,13 +1419,20 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 			cancel() { cancelled = true; events.push('remote-cancel'); },
 		}),
 	};
+	// connectStreams now REJECTS on a terminal failure instead of completing quietly: "we sent a request
+	// and the remote returned nothing" is a failure, and reporting it as success is what left a client
+	// sitting on a dead connection rather than re-dialling. pipeRemoteToClient owns the catch in
+	// production; here it is called directly, so the rejection is expected and asserted.
+	let 拒绝原因 = null;
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, null, 30, { wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, null, 30, { wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }).catch((e) => { 拒绝原因 = e; }),
 		250, 'proxy-path first-byte timeout closes a blackholed relay',
 	);
 	assert.equal(cancelled, true, 'first-byte timeout cancels the read even without a retryFunc (proxy path)');
 	assert.equal(events.includes('no-data'), true, 'blackholed proxy relay fires onNoData for endpoint health scoring');
 	assert.equal(events.includes('client-close'), true, 'blackholed proxy relay closes the client so it re-dials');
+	assert.match(拒绝原因?.message || '', /first-byte timeout|closed before returning a response/,
+		'a blackholed relay must terminate as a named failure, not a clean completion');
 }
 
 {
@@ -1438,7 +1445,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }), close() { events.push('remote-close'); } };
 	const wrapper = {}; // 请求已发送 is falsy -> a no-request preconnect
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0, { wrapper, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0, { wrapper, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'no-request preconnect closes without poisoning the route',
 	);
 	assert.equal(events.includes('no-data'), false, 'a no-request preconnect must NOT fire onNoData (no direct-route cache poison)');
@@ -1484,7 +1491,9 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	await new Promise(r => setTimeout(r, 90));
 	assert.equal(cancelled, false, 'first-byte timer does NOT fire while uplink activity is signaled (upload survives silent downlink)');
 	stop = true; await beat;
-	await withTestTimeout(p, 250, 'first-byte timer fires once uplink activity stops');
+	// Terminal failure now rejects (see the blackholed-relay case above); the assertion is the timer, so
+	// swallow the expected rejection rather than letting it fail the harness.
+	await withTestTimeout(p.catch(() => { }), 250, 'first-byte timer fires once uplink activity stops');
 	assert.equal(cancelled, true, 'first-byte timer still fires after uplink activity stops (blackhole recovery preserved)');
 }
 
@@ -1496,10 +1505,15 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	let cancelled = false;
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { events.push('client-close'); this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ cancel() { cancelled = true; } }) };
+	// Close-only means "do not replay", not "pretend it succeeded": the terminal outcome is still a
+	// failure and now rejects. The assertions below are about cancellation, onNoData and no-replay.
+	let 关闭原因 = null;
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }).catch((e) => { 关闭原因 = e; }),
 		250, 'close-only first-byte timeout for a data-carrying first packet',
 	);
+	assert.match(关闭原因?.message || '', /first-byte timeout|closed before returning a response/,
+		'close-only first-byte timeout must still surface as a named failure');
 	assert.equal(cancelled, true, 'first-byte timeout cancels the blackholed read');
 	assert.equal(events.includes('no-data'), true, 'onNoData fires so the direct route is recorded as failed');
 	assert.equal(events.includes('retry'), false, 'close-only mode does NOT replay the first packet on a timeout');
@@ -1512,7 +1526,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
-		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }),
+		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 30, { wrapper: { 请求已发送: true }, 首字节超时仅关闭: true, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'close-only mode still falls back on a socket close',
 	);
 	assert.equal(events.includes('retry'), true, 'a socket close (not a timeout) still falls back to ProxyIP even in close-only mode');
@@ -1590,7 +1604,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: { 客户端已关闭: true }, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 客户端已关闭: true }, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'client-close pipe settles',
 	);
 	assert.equal(events.includes('no-data'), false, 'a client-initiated close must not record a direct-route failure');
@@ -1605,7 +1619,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 请求已发送: true }, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'no-data pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a genuine remote no-data close records the direct-route failure');
@@ -1619,9 +1633,12 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const events = [];
 	const webSocket = { readyState: WebSocket.OPEN, send() { }, close() { this.readyState = WebSocket.CLOSED; } };
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
+	// A blackhole after later uplink bytes is a terminal FAILURE and now rejects; the assertions here are
+	// about onNoData firing and the replay-retry being refused.
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: { 已向远端发送数据: true, 请求已发送: true }, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 已向远端发送数据: true, 请求已发送: true }, onNoData: () => events.push('no-data') }).catch(() => { })
+			.catch(() => { }),
 		250, 'later-uplink pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a blackhole after a later uplink write still records the direct-route failure');
@@ -1647,7 +1664,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const remoteSocket = { readable: new ReadableStream({ start(c) { c.close(); } }) };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper: { 请求已发送: true }, 可重放首包: false, onNoData: () => events.push('no-data') }),
+			{ wrapper: { 请求已发送: true }, 可重放首包: false, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'non-replayable pipe settles',
 	);
 	assert.equal(events.includes('no-data'), true, 'a non-replayable first packet still records the direct-route failure');
@@ -1664,7 +1681,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const wrapper = { socket: { /* a different, newer socket */ } };
 	await withTestTimeout(
 		connectStreams(remoteSocket, webSocket, null, async () => { events.push('retry'); }, 0,
-			{ wrapper, onNoData: () => events.push('no-data') }),
+			{ wrapper, onNoData: () => events.push('no-data') }).catch(() => { }),
 		250, 'stale pipe settles',
 	);
 	assert.equal(events.length, 0, 'a stale pipe must not fire onNoData or retry');
@@ -1778,7 +1795,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 		}),
 	};
 
-	await connectStreams(remoteSocket, webSocket, null, null);
+	await connectStreams(remoteSocket, webSocket, null, null).catch(() => { });
 
 	assert.deepEqual(events, ['send', 'close'], 'normal upstream EOF after data should close the client bridge');
 }
@@ -1798,7 +1815,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 			},
 		}),
 	};
-	await connectStreams(remoteSocket, webSocket, null, null, 0, { env: { DOWNLINK_GRAIN_PACKET_BYTES: '4096' } });
+	await connectStreams(remoteSocket, webSocket, null, null, 0, { env: { DOWNLINK_GRAIN_PACKET_BYTES: '4096' } }).catch(() => { });
 	assert.deepEqual(sentLengths, [4096, 1], 'connectStreams should use env-tuned downlink grain size on the WS/TCP path');
 }
 
