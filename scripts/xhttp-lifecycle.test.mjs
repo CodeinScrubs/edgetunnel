@@ -80,17 +80,34 @@ for (const file of BUILDS) {
 	assert.match(src, /closeRemoteSocketQuietly\(remoteSocket\);\s*\n\s*failClientTransportQuietly\(webSocket, readError\);/,
 		`${file}: a mid-stream read failure must close the remote socket, not leak it`);
 
-	// A watchdog cancels the reader, so read() can resolve done=true and leave readError null. "We sent a
-	// request and got nothing back" is a failure; reporting it as a clean close is what leaves a client
-	// sitting on a dead connection instead of re-dialling.
-	assert.match(src, /remote closed before returning a response/,
-		`${file}: request-sent-but-no-response must terminate as a failure`);
-	assert.match(src, /new Error\('remote first-byte timeout'\)/, `${file}: first-byte timeout must be named`);
-	assert.match(src, /new Error\('remote idle timeout'\)/, `${file}: idle timeout must be named`);
+	// A watchdog cancels the reader, so read() can resolve done=true and leave readError null. The cause must
+	// therefore be recorded by whoever CAUSED it, not reconstructed afterwards from hasData/closeHint.
+	// The reconstruction was wrong in both directions and both are regression-guarded here:
+	//   - it required !hasData, but the idle watchdog only arms AFTER the first byte, so its branch was dead
+	//     and an IDLE_TIMEOUT_MS-killed mid-stream stall ended as a clean successful EOF;
+	//   - it turned EVERY no-data EOF into an error, which breaks TCP relay transparency for a peer that
+	//     legitimately accepts a request and closes without replying.
+	assert.match(src, /设置终止错误\(new Error\('remote first-byte timeout'\)\);\s+cancelReaderQuietly/,
+		`${file}: the first-byte watchdog must record its own cause before cancelling the reader`);
+	assert.match(src, /设置终止错误\(new Error\('remote idle timeout'\)\);\s+cancelReaderQuietly/,
+		`${file}: the idle watchdog must record its own cause — its old branch was unreachable`);
+	assert.match(src, /if \(!客户端已关闭 && 终止错误\) \{[\s\S]{0,300}?failClientTransportQuietly\(webSocket, 终止错误\);\s+throw 终止错误;/,
+		`${file}: a DETECTED failure must error the client`);
+	assert.doesNotMatch(src, /remote closed before returning a response/,
+		`${file}: a bare remote FIN must stay a FIN, not be synthesised into an error`);
+
+	// Protocol/parser defects found alongside the lifecycle work.
+	assert.match(src, /if \(data\[0\] !== 0\) return \{ 状态: 'invalid', 原因: `unsupported 魏烈思 version \$\{data\[0\]\}` \};/,
+		`${file}: 魏烈思 version must be 0; 1 and 255 authenticated fine before this`);
+	assert.doesNotMatch(src, /\(\(payload\[0\] << 8\) \| payload\[1\]\) !== payload\.byteLength - 2/,
+		`${file}: a 木马 DNS datagram's first 2 bytes are its transaction ID, never a TCP length prefix`);
+	assert.match(src, /let WS内层认证完成 = false;/, `${file}: protocol selection is not authentication`);
+	assert.match(src, /if \(WS内层认证完成 \|\| isDnsQuery\) return; \/\/ already authenticated/,
+		`${file}: the pre-auth deadline must key on real authentication, not on '?enc=' selecting ss`);
 
 	// Buffered downlink bytes must survive a read error. flush() used to be the last statement INSIDE the
 	// read try, so an error skipped it and a small response fragment was silently discarded.
-	assert.match(src, /\} catch \(err\) \{ readError = err \}[\s\S]{0,500}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
+	assert.match(src, /\} catch \(err\) \{ readError = err \}[\s\S]{0,1400}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
 		`${file}: the final flush must run outside the read try, so accepted bytes are not lost on error`);
 
 	// The SAME bug existed on the gRPC path, which is the default transport here — so it was the widest-reaching
@@ -104,10 +121,13 @@ for (const file of BUILDS) {
 		`${file}: the swallowed gRPC error must reach the finally, and cancellation must stay a clean close`);
 	assert.match(src, /关闭连接\(关闭原因\);/, `${file}: the gRPC finally must pass the failure through`);
 	assert.match(src, /new Error\(String\(error \|\| 'gRPC forwarding failed'\)\)/, `${file}: the gRPC bridge needs fail()`);
-	// fail() must drain complete frames before erroring — each queued item is a whole frame, so dropping them
-	// would discard body bytes the remote had already returned.
-	assert.match(src, /fail\(error\) \{[\s\S]{0,600}?刷新发送队列\(true\);/,
-		`${file}: gRPC fail() must flush complete frames before erroring`);
+	// fail() drains before erroring so the ordering is right for whatever the runtime has already pulled.
+	// It is NOT a delivery guarantee: controller.error() resets the queue, so an undelivered tail is lost
+	// either way. The comment in the source says so explicitly — this only pins the ordering.
+	assert.match(src, /fail\(error\) \{[\s\S]{0,1400}?刷新发送队列\(true\);/,
+		`${file}: gRPC fail() must drain before erroring`);
+	assert.match(src, /Do not add work here on the belief that it preserves data\./,
+		`${file}: the source must not re-acquire the false belief that flushing rescues the queued tail`);
 
 	// 'grpc-status' in the INITIAL header block is a Trailers-Only response: the RPC is already complete with
 	// that status and has no body. Announcing status 0 up front told a conforming client the call had already

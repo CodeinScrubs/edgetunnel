@@ -1272,6 +1272,11 @@ const 预认证解码器 = new TextDecoder();
 
 function 解析魏烈思首包三态(data, token) {
 	const length = data.byteLength;
+	if (length < 1) return { 状态: 'need_more' };
+	// data[0] is the 魏烈思 protocol version and 0 is the only one defined. It was read but never checked, so
+	// version 1 or 255 authenticated as readily as version 0 and the value was echoed back in the response
+	// header. Rejecting it costs one comparison and fails an unparseable peer at byte 1 instead of byte 18.
+	if (data[0] !== 0) return { 状态: 'invalid', 原因: `unsupported 魏烈思 version ${data[0]}` };
 	if (length < 18) return { 状态: 'need_more' };
 	if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
 
@@ -1707,10 +1712,14 @@ async function 处理gRPC请求(request, yourUUID) {
 				// default transport here, so this was the widest-reaching instance of that bug.
 				fail(error) {
 					if (this.readyState === WebSocket.CLOSED) return;
-					// Flush FIRST. Every queued item is a complete frame from encodeGrpcDataFrame, never a partial
-					// one, so draining them delivers the body the remote already returned and only then reports the
-					// failure — same rule as the downlink flush in connectStreams: bytes already accepted from the
-					// remote belong to the client whether or not the connection ends badly.
+					// This flush does NOT rescue the queued tail, and an earlier comment here claiming it did was
+					// wrong. Per the Streams spec controller.error() runs ResetQueue first, so anything enqueued and
+					// not yet pulled is discarded — verified: enqueue()+error() in the same turn delivers nothing.
+					// It is kept only because chunks already pulled by the runtime are unaffected, and because
+					// ordering the drain before the error costs nothing. Erroring is still the right call: a clean
+					// close would tell the client the response is COMPLETE, and a truncated body accepted as
+					// complete is what renders as a half-loaded page. Losing an undelivered tail is preferable to
+					// presenting a torn body as whole. Do not add work here on the belief that it preserves data.
 					刷新发送队列(true);
 					已关闭 = true;
 					释放下行背压();
@@ -1790,8 +1799,9 @@ async function 处理gRPC请求(request, yourUUID) {
 				当前写入Socket = null;
 				try { reader.releaseLock() } catch (e) { }
 				关闭连接全部Socket(remoteConnWrapper);
-				// The flush above already drained any complete frames, so an error here still delivers the body
-				// the remote returned before reporting the failure.
+				// The flush above is what delivers the tail on the NORMAL path. On the error path it does not:
+				// controller.error() resets the queue, so an undelivered tail is lost either way. That is the
+				// accepted trade — see fail() for why erroring still beats a close that claims completeness.
 				if (错误) { try { controller.error(错误 instanceof Error ? 错误 : new Error(String(错误 || 'gRPC forwarding failed'))) } catch (e) { } }
 				else { try { controller.close() } catch (e) { } }
 			};
@@ -2084,6 +2094,13 @@ async function 处理WS请求(request, yourUUID, url) {
 	let WS强制关闭定时器 = null;
 	let WS显式队列字节 = 0, WS显式队列条目 = 0;
 	let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
+	// Selecting a protocol is NOT authenticating. The pre-auth deadline used to exit on 判断协议类型 !== null,
+	// but '?enc=' in the URL sets that to 'ss' on the first chunk before a single byte has been verified — so
+	// any peer could disarm the deadline with a query parameter and then hold the connection, its parser state
+	// and its queue open indefinitely by sending nothing. This flag is set only where credentials actually
+	// verify: the 魏烈思/木马 accumulator returning ok, and SS completing AEAD decrypt plus a valid
+	// destination header.
+	let WS内层认证完成 = false;
 	// Shared incremental inner-header accumulator + its ABSOLUTE deadline, armed at accept() and never
 	// restarted per message. Released the moment authentication completes.
 	let WS预认证 = null, WS预认证定时器 = null;
@@ -2134,7 +2151,7 @@ async function 处理WS请求(request, yourUUID, url) {
 	// path clears it via 清除WS预认证定时器. 1008 = policy violation.
 	WS预认证定时器 = setTimeout(() => {
 		WS预认证定时器 = null;
-		if (判断协议类型 !== null || isDnsQuery) return; // already authenticated
+		if (WS内层认证完成 || isDnsQuery) return; // already authenticated
 		log(`[WS forwarding] pre-authentication timed out after ${预认证超时毫秒}ms; closing`);
 		try { 上行写入队列.清空() } catch (e) { }
 		关闭连接全部Socket(remoteConnWrapper);
@@ -2391,6 +2408,10 @@ async function 处理WS请求(request, yourUUID, url) {
 			const rawClientData = 明文数据.subarray(cursor);
 			if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
 			上下文.首包已建立 = true;
+			// AEAD decrypt succeeded AND a full destination header parsed — this, not the presence of
+			// '?enc=', is the point SS is authenticated.
+			WS内层认证完成 = true;
+			清除WS预认证定时器();
 			上下文.目标主机 = hostname;
 			上下文.目标端口 = port;
 			await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request);
@@ -2436,6 +2457,7 @@ async function 处理WS请求(request, yourUUID, url) {
 			判断协议类型 = 结果.协议 === 'trojan' ? 'trojan' : 'vless';
 			判断是否是木马 = 判断协议类型 === 'trojan';
 			WS预认证 = null;                                              // release the pre-auth buffer
+			WS内层认证完成 = true;
 			清除WS预认证定时器();
 			log(`[WS forwarding] Protocol: ${判断协议类型} | From: ${url.host} | UA: ${request.headers.get('user-agent') || 'Unknown'}`);
 			const 首包 = 结果.结果;
@@ -3270,13 +3292,15 @@ async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
 		if (port !== 53) throw new Error('UDP is not supported');
 		if (!payload.byteLength) continue;
 
-		let tcpDNS查询 = payload;
-		if (payload.byteLength < 2 || ((payload[0] << 8) | payload[1]) !== payload.byteLength - 2) {
-			tcpDNS查询 = new Uint8Array(payload.byteLength + 2);
-			tcpDNS查询[0] = (payload.byteLength >>> 8) & 0xff;
-			tcpDNS查询[1] = payload.byteLength & 0xff;
-			tcpDNS查询.set(payload, 2);
-		}
+		// ALWAYS frame it. A 木马 UDP payload is a raw DNS datagram whose first two bytes are the TRANSACTION
+		// ID, not a length. The old heuristic skipped the length prefix whenever those two bytes happened to
+		// equal payload.byteLength - 2, so roughly 1 query in 65536 was forwarded to the DNS server unframed
+		// and failed — a rare, unreproducible DNS hiccup with no pattern to it. The 木马 frame carries its
+		// own length, so a payload here is never already length-prefixed and the check protected nothing.
+		const tcpDNS查询 = new Uint8Array(payload.byteLength + 2);
+		tcpDNS查询[0] = (payload.byteLength >>> 8) & 0xff;
+		tcpDNS查询[1] = payload.byteLength & 0xff;
+		tcpDNS查询.set(payload, 2);
 
 		const dns响应上下文 = { 缓存: new Uint8Array(0) };
 		await forwardataudp(tcpDNS查询, webSocket, null, request, (dnsRespChunk) => {
@@ -5135,6 +5159,11 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	// connection instead of hanging. Armed whenever firstByteTimeoutMs > 0 — the caller decides the value
 	// (the direct path forces it to 0 on a data-carrying first packet to avoid a replay-triggering retry).
 	let 管道已结束 = false;
+	// The one place a terminal failure is recorded, set by whichever layer actually detects it. First writer
+	// wins, so the original cause survives any teardown that follows it. A null here means nothing failed —
+	// the connection simply ended, and it must be reported to the client as exactly that.
+	let 终止错误 = null;
+	const 设置终止错误 = (err) => { if (!终止错误) 终止错误 = err instanceof Error ? err : new Error(String(err || 'tunnel failed')); };
 	// When the caller sends a data-carrying first packet on the direct path, replaying it is unsafe — so a
 	// first-byte TIMEOUT must close-only (no retry) while a socket close/EOF may still fall back to ProxyIP.
 	// This flag records that the read ended via the timeout, so the retry gate below skips replay in that case.
@@ -5155,6 +5184,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		if (上传进行中()) { 安排首字节计时器(); return; }
 		if (首字节超时仅关闭) 首字节超时触发关闭 = true;
 		if (pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = 'first_byte_timeout';
+		// Record the cause HERE. Cancelling the reader makes read() resolve done=true rather than reject, so
+		// downstream there is no evidence left that this was a timeout and not an ordinary end-of-stream.
+		设置终止错误(new Error('remote first-byte timeout'));
 		cancelReaderQuietly(reader, 'first byte timeout');
 	};
 	// Arm the first-byte watchdog ONLY after a request has been sent. A browser preconnect (tunnel open + target
@@ -5178,6 +5210,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	const 空闲超时回调 = () => {
 		if (上传进行中()) { 空闲计时器 = setTimeout(空闲超时回调, 空闲超时毫秒); return; }
 		if (pipeMeta?.wrapper && !pipeMeta.wrapper.closeHint) pipeMeta.wrapper.closeHint = 'idle_timeout';
+		// This watchdog fires only AFTER the first byte, so the old !hasData-gated classification could never
+		// see it and a killed mid-stream stall was reported to the client as a clean, successful EOF.
+		设置终止错误(new Error('remote idle timeout'));
 		cancelReaderQuietly(reader, 'idle timeout');
 	};
 	const 重置空闲计时器 = () => {
@@ -5246,10 +5281,13 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 			}
 		}
 	} catch (err) { readError = err }
-	// Flush OUTSIDE the try. This used to be the last statement inside it, so a read error jumped straight
-	// to the catch and the grain sender's buffered bytes were discarded: a remote could deliver a small
-	// response fragment and then reset, and the client received nothing at all rather than the partial
-	// body plus an error. Bytes already accepted from the remote belong to the client either way.
+	// Flush OUTSIDE the try. This used to be the last statement inside it, so a read error jumped straight to
+	// the catch and the grain sender's buffered bytes were never even handed to the transport.
+	// On WS this genuinely rescues them: send() puts bytes on the wire immediately. On the XHTTP/gRPC bridges
+	// it only hands them to the response stream, and a controller.error() that follows in the same turn resets
+	// the queue and drops whatever the runtime has not pulled yet — so treat this as best-effort, never as a
+	// delivery guarantee. It is still correct to flush here: awaiting it yields, which gives the runtime a
+	// chance to pull, and on every clean-EOF path the tail is delivered in full.
 	try { await 下行发送器.flush(); }
 	catch (flushErr) { if (!readError) readError = flushErr; }
 	finally {
@@ -5311,17 +5349,26 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 		failClientTransportQuietly(webSocket, readError);
 		throw readError;
 	}
-	// A watchdog cancels the reader, so a read() can resolve done=true rather than reject and leave
-	// readError null. "We sent a request and the remote returned nothing" is a failure, not a completion —
-	// reporting it as success is what makes a client sit on a dead connection instead of re-dialling.
-	if (!客户端已关闭 && 请求已发送值 && !hasData) {
-		const 原因 = pipeMeta?.wrapper?.closeHint === 'first_byte_timeout'
-			? new Error('remote first-byte timeout')
-			: pipeMeta?.wrapper?.closeHint === 'idle_timeout'
-				? new Error('remote idle timeout')
-				: new Error('remote closed before returning a response');
-		failClientTransportQuietly(webSocket, 原因);
-		throw 原因;
+	// A watchdog cancels the reader, so a read() can resolve done=true rather than reject and leave readError
+	// null. The failure must therefore be recorded by whoever CAUSED it, not reconstructed here from hasData
+	// and closeHint. The previous shape guessed, and guessed wrong in both directions:
+	//
+	//   - It required !hasData, but the idle watchdog only ever arms AFTER the first byte. Its branch was
+	//     therefore unreachable, and a mid-stream stall killed by IDLE_TIMEOUT_MS ended as a clean EOF — the
+	//     exact "reported success for a dead tunnel" bug this code exists to prevent, in the one path whose
+	//     whole purpose is detecting a dead tunnel.
+	//   - It treated EVERY no-data EOF as a failure. That is right for a TLS ClientHello with no ServerHello,
+	//     but wrong for a TCP relay in general: a peer may legitimately accept a request and close without
+	//     replying. Converting a real FIN into a transport error breaks relay transparency and can push a
+	//     client into retrying a non-idempotent request.
+	//
+	// So: an explicitly DETECTED failure (watchdog fired, read threw, retry failed) errors the client; a bare
+	// FIN stays a FIN. Route health is still scored via onNoData above, which is where a no-response EOF
+	// belongs — it downgrades the route without lying to the client about what the remote did.
+	if (!客户端已关闭 && 终止错误) {
+		closeRemoteSocketQuietly(remoteSocket);
+		failClientTransportQuietly(webSocket, 终止错误);
+		throw 终止错误;
 	}
 	closeSocketQuietly(webSocket);
 }
