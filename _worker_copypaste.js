@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:4041329c5cf1
+// Build: 2026-08-01 src:d30d1afa1751
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:4041329c5cf1';
+const Version = '2026-08-01 src:d30d1afa1751';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1091,6 +1091,23 @@ async function 处理XHTTP请求(request, yourUUID) {
 						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
 					} catch (e) { }
 					try { controller.close() } catch (e) { }
+				},
+				// A graceful close is a CLAIM OF SUCCESS: controller.close() ends the 200 response with a
+				// clean EOF, so the client cannot tell "the tunnel finished" from "the dial failed after you
+				// authenticated". It sees a successful, often empty, response and does not retry — which
+				// presents to the user as the connection dropping or a page silently failing to load.
+				// Post-authentication failures must ERROR the stream instead.
+				fail(error) {
+					if (已关闭) return;
+					已关闭 = true;
+					释放下行背压();
+					this.readyState = WebSocket.CLOSED;
+					XHTTP上行写入队列?.清空();
+					try {
+						const cancelPromise = reader.cancel();
+						if (cancelPromise && typeof cancelPromise.catch === 'function') cancelPromise.catch(() => { });
+					} catch (e) { }
+					try { controller.error(error instanceof Error ? error : new Error(String(error || 'XHTTP forwarding failed'))) } catch (e) { }
 				}
 			};
 
@@ -1154,12 +1171,27 @@ async function 处理XHTTP请求(request, yourUUID) {
 								() => 关闭连接全部Socket(remoteConnWrapper));
 						} catch (e) { 关闭连接全部Socket(remoteConnWrapper); }
 					}
+				} else {
+					// UDP/DNS has no remote read pipe to end the downstream, so nothing closed the response
+					// after the finite request body reached EOF: the DNS answer was delivered and then the
+					// stream stayed open until the client gave up. Close it once every complete frame has
+					// been answered, and refuse a partial trailing frame rather than ending as if it were
+					// fine.
+					const 未完帧 = (首包.协议 === 'trojan' ? 木马UDP上下文 : 魏烈思UDP上下文)?.缓存;
+					if (未完帧?.byteLength) throw new Error(`XHTTP ended with an incomplete UDP frame (${未完帧.byteLength}B)`);
+					closeSocketQuietly(xhttpBridge);
 				}
 			} catch (err) {
 				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[XHTTP forwarding] Failed to process: ${err?.message || err}`);
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
 				关闭连接全部Socket(remoteConnWrapper); // close the upstream too (WS/gRPC already do)
-				closeSocketQuietly(xhttpBridge);
+				// The credential was already accepted by this point, so this is a POST-authentication
+				// failure: error the stream instead of closing it cleanly. A clean close told the client the
+				// request had succeeded, so it neither retried nor surfaced an error — the tunnel simply
+				// appeared to drop. Camouflage remains correct only for pre-auth rejection, which returns
+				// long before this handler.
+				if (是流取消错误(err) || remoteConnWrapper.客户端已关闭) closeSocketQuietly(xhttpBridge);
+				else xhttpBridge.fail(err);
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
