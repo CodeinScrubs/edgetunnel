@@ -133,20 +133,49 @@ for (const [label, spec] of BUILDS) {
 
 globalThis.fetch = realFetch;
 
-// A tunnel URL carries operator configuration: socks5=user:password@host, the http=/https= forms with the
-// same shape, proxyip=, tokens. Those were logged verbatim. log() is DEBUG-gated, but DEBUG is precisely
-// what gets switched on to troubleshoot, and `wrangler tail` is the last place a proxy password belongs.
+// A tunnel URL carries operator configuration in BOTH the query and the path: socks5=user:password@host,
+// the http=/https= forms, proxyip=, and the reversible /video/<encoded chain> blob. Redacting a fixed key
+// list was not enough twice over -- a value could carry a newline and forge a second log field, and a
+// sensitive value could hide under a key not on the list. So log key NAMES only, and redact the path too.
 {
 	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
-	const r = H.脱敏查询串;
-	const 秘密 = r('?socks5=user:pass@host:1080');
-	assert.ok(!秘密.includes('pass'), 'a proxy password must never reach a log line');
-	assert.ok(秘密.includes('socks5'), 'the parameter NAME should survive so a log still shows what was set');
-	assert.ok(!r('?http=u:p@h:8080').includes('p@h'), 'the http= form carries credentials too');
-	assert.ok(!r('?proxyip=1.2.3.4').includes('1.2.3.4'), 'the configured relay is operator configuration');
-	assert.equal(r(''), '', 'no query means no output');
-	assert.equal(r('?'), '', 'an empty query means no output');
-	assert.ok(r('?foo=bar').includes('foo=bar'), 'ordinary parameters stay readable — over-redacting makes logs useless');
+	const r = H.脱敏查询串, rp = H.脱敏隧道路径;
+	assert.equal(r('?socks5=user:pass@host:1080'), '?params=socks5', 'only the key name may be logged');
+	assert.equal(r('?foo=%0Afake%3Dsecret'), '?params=foo', 'a decoded newline must not forge a second log field');
+	assert.equal(r('?sub=https://x.test/p?token=secret'), '?params=sub', 'a secret under an unlisted key must not leak');
+	assert.equal(r('?ed=2560&x=1'), '?params=ed,x', 'the set of parameters stays visible for diagnostics');
+	assert.equal(r(''), '');
+	assert.equal(r('?'), '');
+	assert.equal(rp('/video/BLOBBLOB'), '/video/<redacted>', 'the encoded chain blob is reversible configuration');
+	assert.equal(rp('/socks5/user:pass@h:1080'), '/proxy/<redacted>', 'path-form proxy credentials must not be logged');
+	assert.equal(rp('/gs5=user:pass@h'), '/proxy=<redacted>', 'the =form carries credentials too');
+	assert.equal(rp('/plain/path'), '/plain/path', 'ordinary paths stay readable');
+	const 注入 = rp('/x' + String.fromCharCode(10) + 'INJECT');
+	assert.equal(注入.includes(String.fromCharCode(10)), false, 'no control character may reach a log line');
+	assert.equal(注入.includes(String.fromCharCode(13)), false, 'no carriage return either');
+}
+
+// The chunk cap rejected the value it advertises as allowed: the read that reports EOF was charged against
+// the budget, so exactly 最大分片数 chunks failed. Empty chunks were charged too. And only the SIZE branch
+// cancelled -- the count and deadline branches left the request body attached to an invocation that had
+// stopped reading it.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const closed = (n) => new Request('https://x/', { method: 'POST', body: new ReadableStream({
+		start(c) { for (let i = 0; i < n; i++) c.enqueue(new Uint8Array([65])); c.close(); },
+	}), duplex: 'half' });
+	assert.equal((await H.读取有限请求体(closed(8), 65536, 15000, 8)).byteLength, 8, 'exactly the cap must be accepted');
+	assert.equal((await H.读取有限请求体(closed(4), 65536, 15000, 8)).byteLength, 4, 'below the cap must be accepted');
+	await assert.rejects(() => H.读取有限请求体(closed(9), 65536, 15000, 8), /Too many request body chunks/,
+		'one over the cap must be rejected');
+
+	let cancels = 0;
+	const open = new Request('https://x/', { method: 'POST', body: new ReadableStream({
+		start(c) { for (let i = 0; i < 20; i++) c.enqueue(new Uint8Array([65])); },   // never closes
+		cancel() { cancels++; },
+	}), duplex: 'half' });
+	await assert.rejects(() => H.读取有限请求体(open, 65536, 15000, 5), /Too many request body chunks/);
+	assert.equal(cancels, 1, 'a rejected body must be cancelled, not just have its lock released');
 }
 
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port

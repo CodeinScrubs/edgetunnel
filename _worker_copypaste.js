@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:a56a272dbb14 copypaste:f19ab850
+// Build: 2026-08-01 src:9be64ff0a5d7 copypaste:5a0fafd8
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:a56a272dbb14 copypaste:f19ab850';
+const Version = '2026-08-01 src:9be64ff0a5d7 copypaste:5a0fafd8';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -466,7 +466,7 @@ export default {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
 			const 代理配置错误 = await 代理配置被拒(workerRequestContext.tunnel);
 			if (代理配置错误) return 代理配置错误;
-			log(`[WebSocket] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
+			log(`[WebSocket] Matched request: ${脱敏隧道路径(url.pathname)}${脱敏查询串(url.search)}`);
 			return await 处理WS请求(request, userID, url);
 		} else if (隧道凭据可用 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST' && 隧道路径匹配) {
 			await 反代参数获取(url, userID, workerRequestContext.tunnel);
@@ -475,10 +475,10 @@ export default {
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding');
 			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
-				log(`[gRPC] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
+				log(`[gRPC] Matched request: ${脱敏隧道路径(url.pathname)}${脱敏查询串(url.search)}`);
 				return await 处理gRPC请求(request, userID);
 			}
-			log(`[XHTTP] Matched request: ${url.pathname}${脱敏查询串(url.search)}`);
+			log(`[XHTTP] Matched request: ${脱敏隧道路径(url.pathname)}${脱敏查询串(url.search)}`);
 			return await 处理XHTTP请求(request, userID);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
@@ -1087,7 +1087,12 @@ async function 处理XHTTP请求(request, yourUUID) {
 						// whose bytes are discarded. Own the teardown here, exactly as close()/fail() do.
 						XHTTP上行写入队列?.清空();
 						关闭连接全部Socket(remoteConnWrapper);
-						return;
+						// ...and THROW. Returning normally told the caller — the grain sender, and through it
+						// connectStreams — that the bytes had been accepted. On the final downstream chunk that
+						// meant the pipe completed successfully for a response the client never received. The
+						// teardown above was necessary but not sufficient: whoever handed us the bytes has to
+						// learn they did not land.
+						throw e instanceof Error ? e : new Error(String(e || 'XHTTP response stream rejected the chunk'));
 					}
 					return 等待下行可写();
 				},
@@ -1644,9 +1649,25 @@ async function 处理gRPC请求(request, yourUUID) {
 			let 队列字节数 = 0;
 			let 刷新定时器 = null;
 			let 刷新Microtask已排队 = false;
+			// ONE terminal downlink error for the gRPC bridge. Every enqueue site funnels here so a failure is
+			// recorded once, the upstream is released once, and every later send() refuses rather than
+			// pretending the bytes went out.
+			let gRPC下行错误 = null;
+			const 记录gRPC下行错误 = (error) => {
+				if (!gRPC下行错误) {
+					gRPC下行错误 = error instanceof Error ? error : new Error(String(error || 'gRPC response stream rejected the chunk'));
+					已关闭 = true;
+					grpcBridge.readyState = WebSocket.CLOSED;
+					释放下行背压();
+					GRPC上行写入队列?.清空();
+					关闭连接全部Socket(remoteConnWrapper);
+				}
+				return gRPC下行错误;
+			};
 			const grpcBridge = {
 				readyState: WebSocket.OPEN,
 				send(data) {
+					if (gRPC下行错误) throw gRPC下行错误;
 					if (已关闭) return;
 					const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
 					// Zero-copy fast path for sizeable payloads: enqueue the frame prefix + the payload VIEW
@@ -1663,13 +1684,8 @@ async function 处理gRPC请求(request, yourUUID) {
 								controller.enqueue(encodeGrpcFramePrefix(chunk.byteLength));
 								controller.enqueue(chunk);
 							} catch (e) {
-								已关闭 = true;
-								grpcBridge.readyState = WebSocket.CLOSED;
-								释放下行背压();
-								// Same ownership rule as the XHTTP bridge: a dead response stream must tear the
-								// upstream down rather than leave it draining into nothing.
-								GRPC上行写入队列?.清空();
-								关闭连接全部Socket(remoteConnWrapper);
+								// Same ownership rule as the XHTTP bridge, and the caller must be told too.
+								throw 记录gRPC下行错误(e);
 							}
 						}
 						return 等待下行可写();
@@ -1747,12 +1763,12 @@ async function 处理gRPC请求(request, yourUUID) {
 				try {
 					controller.enqueue(out);
 				} catch (e) {
-					已关闭 = true;
-					grpcBridge.readyState = WebSocket.CLOSED;
-					释放下行背压();
-					// Same ownership rule: the batched-frame path can fail the response stream too.
-					GRPC上行写入队列?.清空();
-					关闭连接全部Socket(remoteConnWrapper);
+					// This path can run from a microtask or timer, so there may be no caller to reject — the same
+					// structural condition that let the grain sender's scheduled flush report success. Record it
+					// and cancel the request reader so the tunnel task wakes up and terminates instead of waiting
+					// on a stream nobody is going to feed.
+					记录gRPC下行错误(e);
+					try { const c = reader.cancel(); if (c?.catch) c.catch(() => { }); } catch (e2) { }
 				}
 			};
 
@@ -2121,9 +2137,15 @@ async function 处理WS请求(request, yourUUID, url) {
 			return 远端写入器;
 		},
 		释放写入器: 释放远端写入器,
-		关闭连接: () => {
+		// The queue hands its write error here and this callback used to DISCARD it, closing the client with a
+		// normal 1000 — so an authenticated upload that failed mid-stream reached the client as an orderly
+		// finish. XHTTP's identical callback was fixed earlier; WS was not, which is the same "fixed one of N
+		// call sites" mistake as the version guard and the chain-proxy port. Cancellation and our own teardown
+		// stay a clean close, because those are not failures.
+		关闭连接: (错误) => {
 			关闭连接全部Socket(remoteConnWrapper);
-			closeSocketQuietly(serverSock);
+			if (错误 && !是流取消错误(错误) && !remoteConnWrapper.客户端已关闭) failClientTransportQuietly(serverSock, 错误);
+			else closeSocketQuietly(serverSock);
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
@@ -3011,15 +3033,20 @@ async function 读取有限请求体(request, 最大字节, 超时毫秒 = 15000
 	let 容量 = Number.isInteger(declared) && declared > 0 && declared <= 最大字节 ? declared : Math.min(1024, 最大字节);
 	let output = new Uint8Array(容量);
 	let total = 0;
+	let 正常完成 = false;
 	try {
 		for (; ;) {
 			const 剩余毫秒 = 截止时刻 - Date.now();
 			if (剩余毫秒 <= 0) throw new Error('Request body timed out');
 			const { done, value } = await readWithOperationTimeout(reader, 剩余毫秒, 'Request body timed out');
-			if (++分片数 > 最大分片数) throw new Error('Too many request body chunks');
+			// Count DATA chunks only, and only AFTER the EOF and empty-chunk filters. Counting before them
+			// charged the final read that reports EOF against the budget, so a body of exactly 最大分片数 chunks
+			// was rejected on the read that would have ended it — the limit rejected the value it advertises as
+			// allowed. (读取有限响应体 already had this ordering; the request-side copy did not.)
 			if (done) break;
 			const chunk = 数据转Uint8Array(value);
 			if (!chunk.byteLength) continue;
+			if (++分片数 > 最大分片数) throw new Error('Too many request body chunks');
 			const 需要 = total + chunk.byteLength;
 			if (需要 > 最大字节) { try { await reader.cancel('request body too large') } catch (e) { } throw 过大(); }
 			if (需要 > output.byteLength) {
@@ -3029,7 +3056,14 @@ async function 读取有限请求体(request, 最大字节, 超时毫秒 = 15000
 			}
 			output.set(chunk, total); total = 需要;
 		}
-	} finally { try { reader.releaseLock() } catch (e) { } }
+		正常完成 = true;
+	} finally {
+		// Cancel on ANY abnormal exit. Only the size branch cancelled explicitly, so the chunk-count and
+		// deadline branches merely released the lock and left the request body attached to an invocation that
+		// had stopped consuming it -- the peer keeps a half-alive upload against a stream nobody reads.
+		if (!正常完成) cancelReaderQuietly(reader, 'request body rejected');
+		try { reader.releaseLock() } catch (e) { }
+	}
 	if (!total) return new Uint8Array(0);
 	return total === output.byteLength ? output : output.slice(0, total);
 }
@@ -9870,7 +9904,14 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	let config_JSON;
 	try {
 		let configJSON = await env.KV.get('config.json');
-		if (!configJSON || 重置配置 == true) {
+		// A READ must not write. This used to persist defaults whenever the key was missing, so simply opening
+		// the panel or fetching a subscription mutated storage. Worse under KV's eventual consistency: a read
+		// shortly after the write can still see nothing, so a burst of reads writes repeatedly — against a Free
+		// plan allowance of 1000 writes/day. Defaults are returned in memory; only an explicit authenticated
+		// reset (or the save path) persists them.
+		if (!configJSON) {
+			config_JSON = 默认配置JSON;
+		} else if (重置配置 == true) {
 			await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
 			config_JSON = 默认配置JSON;
 		} else {
@@ -9994,8 +10035,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	config_JSON.TG = { 启用: config_JSON.TG.启用 ? config_JSON.TG.启用 : false, ...初始化TG_JSON };
 	try {
 		const TG_TXT = await env.KV.get('tg.json');
+		// Same rule: a missing record yields in-memory defaults (already assigned above), never a write.
 		if (!TG_TXT) {
-			await env.KV.put('tg.json', JSON.stringify(初始化TG_JSON, null, 2));
+			// nothing to do — config_JSON.TG already holds 初始化TG_JSON
 		} else {
 			const TG_JSON = JSON.parse(TG_TXT);
 			config_JSON.TG.ChatID = TG_JSON.ChatID ? TG_JSON.ChatID : null;
@@ -10009,8 +10051,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	config_JSON.CF = { ...初始化CF_JSON, Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 } };
 	try {
 		const CF_TXT = await env.KV.get('cf.json');
+		// Same rule: a missing record yields in-memory defaults, never a write.
 		if (!CF_TXT) {
-			await env.KV.put('cf.json', JSON.stringify(初始化CF_JSON, null, 2));
+			// nothing to do — config_JSON.CF already holds 初始化CF_JSON
 		} else {
 			const CF_JSON = JSON.parse(CF_TXT);
 			if (CF_JSON.UsageAPI) {
@@ -10376,20 +10419,31 @@ async function 代理配置被拒(tunnelContext) {
 	return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
 }
 
-// Log the path, never the raw query. A tunnel URL can carry socks5=user:password@host, http=/https= with
-// the same shape, proxyip=, and other operator configuration; log() is DEBUG-gated, but DEBUG is exactly what
-// gets switched on to troubleshoot, and `wrangler tail` output is the last place a proxy password should
-// appear. Keys are kept so a log still shows WHICH parameters were present.
+// Log WHICH parameters were present, never their values, and never anything a caller controls verbatim.
+// Redacting a fixed key list was not enough, twice over: a value could carry a newline
+// (?foo=%0Afake%3Dsecret decoded straight into the log and forged a second field), and a sensitive value
+// could hide under a key not on the list (?sub=https://host/p?token=... logged the token in full). Since
+// the only diagnostic need is "which parameters were set", emit just the key names, each stripped to a safe
+// character set. There is no value to leak and nothing to inject.
 function 脱敏查询串(search) {
 	if (!search || search.length < 2) return '';
-	const 敏感 = /^(socks5|http|https|turn|sstp|proxyip|pyip|ip|ed|uuid|token|pw|password|key)$/i;
-	const 各项 = [];
-	for (const [名, 值] of new URLSearchParams(search)) {
-		各项.push(敏感.test(名) || 值.includes('@') ? `${名}=<redacted>` : `${名}=${值}`);
+	const 键集 = new Set();
+	for (const 名 of new URLSearchParams(search).keys()) {
+		const 安全名 = String(名).replace(/[^\w.-]/g, '_').slice(0, 32);
+		if (安全名) 键集.add(安全名);
 	}
-	return 各项.length ? '?' + 各项.join('&') : '';
+	return 键集.size ? `?params=${[...键集].join(',')}` : '';
 }
 
+// The path carries proxy configuration too — /socks5/user:password@host, /http=..., and the reversible
+// /video/<encoded chain> blob — so redacting only the query left credentials in the log by another route.
+function 脱敏隧道路径(pathname) {
+	return String(pathname || '')
+		.replace(/\/video\/[^/?#]+/ig, '/video/<redacted>')
+		.replace(/\/(?:g?s5|socks5|g?http|g?https|g?turn|g?sstp)=[^/?#\s]+/ig, '/proxy=<redacted>')
+		.replace(/\/(?:socks5?|http|https|turn|sstp):?\/?\/?[^/?#\s]+/ig, '/proxy/<redacted>')
+		.replace(/[\r\n]/g, '');
+}
 async function 反代参数获取(url, uuid, tunnelContext = emptyTunnelContext()) {
 	return applyProxyParamsToTunnelContext(url, uuid, tunnelContext);
 }
@@ -11402,6 +11456,8 @@ export const __testPerformanceHelpers = {
 	解析SS目标三态,
 	创建下行Grain发送器,
 	脱敏查询串,
+	脱敏隧道路径,
+	读取有限请求体,
 	SS首包最大字节,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,
 	// Exported so tests pin their fixtures to the LIVE version rather than a literal. A hardcoded
