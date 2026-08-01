@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:899b5e4962e0
+// Build: 2026-08-01 src:9c444113653f
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:899b5e4962e0';
+const Version = '2026-08-01 src:9c444113653f';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -5262,6 +5262,12 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	if (readError) {
 		// Same ownership rule: this is the layer that KNOWS the remote read failed, so it must be the one
 		// that says so. Pre-closing here defeated every downstream failure handler.
+		// Close the remote too. Once data had flowed the close above is skipped, so a mid-stream failure left
+		// the remote socket open and relied on the client's teardown handler firing to reclaim it — which it
+		// cannot when the close is the one WE just initiated. That orphans one of the free plan's 6 concurrent
+		// connection slots. Safe unconditionally here: we are failing the client transport, so the tunnel is
+		// over in both directions, and half-close only applies to a clean EOF (below), never to an error.
+		closeRemoteSocketQuietly(remoteSocket);
 		failClientTransportQuietly(webSocket, readError);
 		throw readError;
 	}

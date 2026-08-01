@@ -73,6 +73,13 @@ for (const file of BUILDS) {
 	assert.match(src, /failClientTransportQuietly\(webSocket, readError\);\s*\n\s*throw readError;/,
 		`${file}: a remote-read failure must fail the transport`);
 
+	// The remote socket must be reclaimed on a mid-stream failure too. `if (!hasData) closeRemoteSocketQuietly`
+	// skips it once bytes have flowed, which left the remote open and relied on the CLIENT's teardown handler
+	// firing to clean up — impossible when the close is the one we just initiated ourselves. On the free plan
+	// that orphans one of 6 concurrent connection slots per occurrence.
+	assert.match(src, /closeRemoteSocketQuietly\(remoteSocket\);\s*\n\s*failClientTransportQuietly\(webSocket, readError\);/,
+		`${file}: a mid-stream read failure must close the remote socket, not leak it`);
+
 	// A watchdog cancels the reader, so read() can resolve done=true and leave readError null. "We sent a
 	// request and got nothing back" is a failure; reporting it as a clean close is what leaves a client
 	// sitting on a dead connection instead of re-dialling.

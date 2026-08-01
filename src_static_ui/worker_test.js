@@ -5260,6 +5260,12 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 	if (readError) {
 		// Same ownership rule: this is the layer that KNOWS the remote read failed, so it must be the one
 		// that says so. Pre-closing here defeated every downstream failure handler.
+		// Close the remote too. Once data had flowed the close above is skipped, so a mid-stream failure left
+		// the remote socket open and relied on the client's teardown handler firing to reclaim it — which it
+		// cannot when the close is the one WE just initiated. That orphans one of the free plan's 6 concurrent
+		// connection slots. Safe unconditionally here: we are failing the client transport, so the tunnel is
+		// over in both directions, and half-close only applies to a clean EOF (below), never to an error.
+		closeRemoteSocketQuietly(remoteSocket);
 		failClientTransportQuietly(webSocket, readError);
 		throw readError;
 	}
