@@ -1273,9 +1273,22 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	});
 
 	const [a, b] = await Promise.all([first, second]);
-	assert.equal(liveCalls, 1, 'simultaneous cold proxy resolution should share one live lookup');
+	// This used to assert liveCalls === 1: concurrent cold misses shared one live lookup via a module-global
+	// promise map. That optimization was only ever reachable ACROSS requests, and that is precisely what makes
+	// it illegal — a module global outlives its request, so a second invocation awaiting the first's promise
+	// is consuming another request's I/O and the runtime rejects it ("Cannot perform I/O on behalf of a
+	// different request"). The dial then fails for a reason nothing in that request can explain. The whole
+	// value of the dedup was the unsafe part, so it is gone; each cold miss now resolves independently.
+	assert.equal(liveCalls, 2, 'concurrent cold misses must resolve independently, not share a live promise');
 	assert.deepEqual(a.record.endpoints, [['198.51.100.10', 443]]);
-	assert.deepEqual(b.record.endpoints, [['198.51.100.10', 443]]);
+	assert.deepEqual(b.record.endpoints, [['198.51.100.11', 443]]);
+	// Completed, serializable records are still shared — that is the safe half of the cache.
+	const third = await getProxyResolutionRecord(env, null, 'coalesce.example.com', 'target.example.com', '00000000-0000-4000-8000-000000000000', async () => {
+		liveCalls++;
+		return [['198.51.100.12', 443]];
+	});
+	assert.equal(liveCalls, 2, 'a warm L1 hit must not perform another live lookup');
+	assert.ok(third.record.endpoints.length > 0, 'the completed record must still come from cache');
 }
 
 {

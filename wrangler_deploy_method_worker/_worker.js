@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:16c4c82d58d7
+// Build: 2026-08-01 src:1c03ce253a74
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:16c4c82d58d7';
+const Version = '2026-08-01 src:1c03ce253a74';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -209,7 +209,6 @@ const DIAL_STAGGER_MS = ENGINE_DEFAULTS.DIAL_STAGGER_MS;
 const DEFAULT_DOH_LOOKUP_URL = ENGINE_DEFAULTS.DEFAULT_DOH_LOOKUP_URL;
 const DEFAULT_DNS_TCP_SERVER = ENGINE_DEFAULTS.DEFAULT_DNS_TCP_SERVER;
 const PROXY_RESOLUTION_L1_CACHE = new Map();
-const PROXY_RESOLUTION_IN_FLIGHT = new Map();
 const DNS_RESULT_CACHE = new Map();
 // Wire-format cache for tunneled client DNS queries (forwardataudp -> DoH). Keyed on the whole query
 // EXCEPT the 2-byte transaction ID, so only byte-identical questions share an entry (no wrong-answer
@@ -1408,6 +1407,11 @@ async function 读取XHTTP首包(reader, token) {
 
 	const 尝试解析魏烈思首包 = (data) => {
 		const length = data.byteLength;
+		if (length < 1) return { 状态: 'need_more' };
+		// XHTTP keeps its own copy of this parser, so the version guard added to the shared accumulator did
+		// NOT reach it and this transport still accepted version 1 and 255. Any protocol fix has to be applied
+		// to all three parsers until the duplication is removed; the suite now asserts that for every build.
+		if (data[0] !== 0) return { 状态: 'invalid' };
 		if (length < 18) return { 状态: 'need_more' };
 		if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
 
@@ -2862,6 +2866,8 @@ function 解析魏烈思请求(chunk, token) {
 	const length = data.byteLength;
 	if (length < 24) return { hasError: true, message: 'Invalid data' };
 	const version = data[0];
+	// Read but never validated: this parser accepted any version and echoed it back in the response header.
+	if (version !== 0) return { hasError: true, message: `Unsupported version: ${version}` };
 	if (!UUID字节匹配(data, 1, token)) return { hasError: true, message: 'Invalid uuid' };
 
 	const optLen = data[17];
@@ -11154,18 +11160,16 @@ async function refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标�
 	return record;
 }
 
-function proxyResolutionInFlightKey(cacheKey, 目标域名, UUID) {
-	return `${cacheKey}:${stableHashText(目标域名)}:${stableHashText(UUID)}`;
-}
-
+// No cross-request in-flight map here. This used to deduplicate concurrent resolutions by stashing the
+// live refresh PROMISE in a module-global Map, but a module global outlives the request that created it:
+// request A registers its refresh under its own ctx.waitUntil, request B then pulled A's promise out of
+// the map and awaited it. That is consuming I/O created by another request, which the runtime rejects with
+// "Cannot perform I/O on behalf of a different request" — so B's dial failed for a reason nothing in B
+// could explain, intermittently and only under concurrency. Only COMPLETED, serializable records may live
+// in a module-scope cache (PROXY_RESOLUTION_L1_CACHE already holds those); live promises may not. The cost
+// is that two concurrent cold misses resolve independently, which is strictly better than one failing.
 function startProxyResolutionRefresh(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord = null, liveResolver = resolveProxyEndpointsLive) {
-	const inFlightKey = proxyResolutionInFlightKey(cacheKey, 目标域名, UUID);
-	const existing = PROXY_RESOLUTION_IN_FLIGHT.get(inFlightKey);
-	if (existing) return existing;
-	const refreshPromise = refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord, liveResolver)
-		.finally(() => PROXY_RESOLUTION_IN_FLIGHT.delete(inFlightKey));
-	PROXY_RESOLUTION_IN_FLIGHT.set(inFlightKey, refreshPromise);
-	return refreshPromise;
+	return refreshProxyResolutionCache(env, ctx, cacheKey, proxyIP, 目标域名, UUID, priorRecord, liveResolver);
 }
 
 async function getProxyResolutionRecord(env, ctx, proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000', liveResolver = resolveProxyEndpointsLive) {

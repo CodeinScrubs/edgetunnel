@@ -97,8 +97,21 @@ for (const file of BUILDS) {
 		`${file}: a bare remote FIN must stay a FIN, not be synthesised into an error`);
 
 	// Protocol/parser defects found alongside the lifecycle work.
+	// THREE parsers exist for this header: the shared accumulator, XHTTP's private copy, and the complete
+	// parser. The first fix landed only in the shared one, so XHTTP -- the transport with the reported
+	// problems -- still accepted version 1 and 255. Assert all three until the duplication is removed.
 	assert.match(src, /if \(data\[0\] !== 0\) return \{ 状态: 'invalid', 原因: `unsupported 魏烈思 version \$\{data\[0\]\}` \};/,
-		`${file}: 魏烈思 version must be 0; 1 and 255 authenticated fine before this`);
+		`${file}: shared accumulator must reject a nonzero version`);
+	assert.match(src, /const 尝试解析魏烈思首包 = \(data\) => \{[\s\S]{0,500}?if \(data\[0\] !== 0\) return \{ 状态: 'invalid' \};/,
+		`${file}: XHTTP's private parser must reject a nonzero version too`);
+	assert.match(src, /if \(version !== 0\) return \{ hasError: true, message: `Unsupported version: \$\{version\}` \};/,
+		`${file}: the complete parser must reject a nonzero version too`);
+
+	// A module global outlives the request that created it, so a live promise parked in one and awaited by a
+	// LATER request is cross-request I/O -- the runtime rejects it and that request's dial fails for a reason
+	// nothing in it can explain. Only completed, serializable records may be cached at module scope.
+	assert.doesNotMatch(src, /PROXY_RESOLUTION_IN_FLIGHT/,
+		`${file}: no module-global map may hold a live resolution promise across requests`);
 	assert.doesNotMatch(src, /\(\(payload\[0\] << 8\) \| payload\[1\]\) !== payload\.byteLength - 2/,
 		`${file}: a 木马 DNS datagram's first 2 bytes are its transaction ID, never a TCP length prefix`);
 	assert.match(src, /let WS内层认证完成 = false;/, `${file}: protocol selection is not authentication`);
