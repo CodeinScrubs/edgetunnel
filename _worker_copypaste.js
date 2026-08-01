@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:5d4129b3fd8a
+// Build: 2026-08-01 src:2c6c125c3121
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -113,7 +113,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:5d4129b3fd8a';
+const Version = '2026-08-01 src:2c6c125c3121';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1582,9 +1582,17 @@ async function 处理gRPC请求(request, yourUUID) {
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
 
+	// No 'grpc-status' here. In gRPC that header belongs in the TRAILERS; when it appears in the INITIAL
+	// header block the response is a "Trailers-Only" reply, which means the RPC is already COMPLETE with that
+	// status and carries no body. Sending 'grpc-status: 0' up front therefore announced "this call finished
+	// successfully" before a single tunnel byte existed — it told a conforming client to stop reading, and it
+	// gave any client licence to ignore the mid-stream failure the layer below now reports via controller.error().
+	// It was inert for this deployment only because xray's "gun" transport reads the body regardless; a strict
+	// grpc-go client would have completed the RPC instantly and the tunnel would never have worked at all.
+	// Removing it is correct for both. Workers cannot emit HTTP/2 trailers, so no trailing status replaces it;
+	// stream end / stream error is the signal, which is exactly what a gun client already keys on.
 	const grpcHeaders = new Headers({
 		'Content-Type': 'application/grpc',
-		'grpc-status': '0',
 		'X-Accel-Buffering': 'no',
 		'Cache-Control': 'no-store'
 	});

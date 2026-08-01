@@ -1469,9 +1469,17 @@ async function 处理gRPC请求(request, yourUUID) {
 	let 远端写入器 = null;
 	let GRPC上行写入队列 = null;
 
+	// No 'grpc-status' here. In gRPC that header belongs in the TRAILERS; when it appears in the INITIAL
+	// header block the response is a "Trailers-Only" reply, which means the RPC is already COMPLETE with that
+	// status and carries no body. Sending 'grpc-status: 0' up front therefore announced "this call finished
+	// successfully" before a single tunnel byte existed — it told a conforming client to stop reading, and it
+	// gave any client licence to ignore the mid-stream failure the layer below now reports via controller.error().
+	// It was inert for this deployment only because xray's "gun" transport reads the body regardless; a strict
+	// grpc-go client would have completed the RPC instantly and the tunnel would never have worked at all.
+	// Removing it is correct for both. Workers cannot emit HTTP/2 trailers, so no trailing status replaces it;
+	// stream end / stream error is the signal, which is exactly what a gun client already keys on.
 	const grpcHeaders = new Headers({
 		'Content-Type': 'application/grpc',
-		'grpc-status': '0',
 		'X-Accel-Buffering': 'no',
 		'Cache-Control': 'no-store'
 	});

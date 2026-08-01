@@ -109,6 +109,14 @@ for (const file of BUILDS) {
 	assert.match(src, /fail\(error\) \{[\s\S]{0,600}?刷新发送队列\(true\);/,
 		`${file}: gRPC fail() must flush complete frames before erroring`);
 
+	// 'grpc-status' in the INITIAL header block is a Trailers-Only response: the RPC is already complete with
+	// that status and has no body. Announcing status 0 up front told a conforming client the call had already
+	// succeeded, which both contradicts a tunnel that has sent nothing yet and licences a client to disregard
+	// the controller.error() the layers above now rely on.
+	// Matches the header-property form ('grpc-status':) so the prose explaining its removal doesn't trip it.
+	assert.doesNotMatch(src, /'grpc-status':/, `${file}: grpc-status must not be sent in the initial headers`);
+	assert.match(src, /'Content-Type': 'application\/grpc'/, `${file}: the gRPC content type must remain`);
+
 	// Regression guard: the old shape must not come back.
 	assert.doesNotMatch(src, /if \(!是流取消错误\(error\) && !\(pipeMeta\?\.wrapper\?\.客户端已关闭\)\) log\(`\[Stream pipe\][^\n]*\n\s*closeSocketQuietly\(webSocket\);/,
 		`${file}: the remote-read catch is swallowing failures again`);
