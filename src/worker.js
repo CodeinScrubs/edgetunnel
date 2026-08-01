@@ -1005,9 +1005,13 @@ async function 处理XHTTP请求(request, yourUUID) {
 					if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
 					await remoteConnWrapper.retryConnect();
 				},
-				关闭连接: () => {
+				// The queue passes its failure through. Closing gracefully here marked the bridge closed
+				// BEFORE the rethrown error reached the outer catch, so fail() there became a no-op and a
+				// steady-state upload write failure still reached the client as a clean, successful EOF.
+				关闭连接: (错误) => {
 					关闭连接全部Socket(remoteConnWrapper);
-					closeSocketQuietly(xhttpBridge);
+					if (错误 && !是流取消错误(错误) && !remoteConnWrapper.客户端已关闭) failClientTransportQuietly(xhttpBridge, 错误);
+					else closeSocketQuietly(xhttpBridge);
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
@@ -3523,7 +3527,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 					// If the first-packet WRITE was attempted (socket opened, then 写入首包 rejected), delivery is
 					// uncertain — replaying a non-replay-safe packet to the next candidate or the direct fallback
 					// could re-send non-idempotent data. Abort. A pre-write dial failure is safe to keep rotating.
-					if (已尝试写入首包 && !可重放首包) { closeSocketQuietly(ws); throw err; }
+					if (已尝试写入首包 && !可重放首包) { failClientTransportQuietly(ws, err); throw err; }
 					log(`[ProxyIP connection] This connection batch failed: ${err.message || err}`);
 				}
 			}
@@ -3531,7 +3535,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 
 		if (启用反代失败兜底) return connectDirect(address, port, data, false);
 		else {
-			closeSocketQuietly(ws);
+			// Failure, not completion: a graceful close here pre-empted the outer catch, so the client saw
+			// a clean EOF for a connection that never reached its destination.
+			failClientTransportQuietly(ws, new Error('ProxyIP attempts failed and fallback is disabled'));
 			throw new Error('[ProxyIP connection] All ProxyIP connection attempts failed and fallback is disabled; connection terminated.');
 		}
 	}
@@ -3697,7 +3703,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			log(`[TCP forwarding] Direct connection to ${host}:${portNum} failed: ${err.message}`);
 			追踪拨号失败(remoteConnWrapper.追踪, 'direct', 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null, err);
 			if (err instanceof Error && err.name === 'Preload resolution empty') {
-				closeSocketQuietly(ws);
+				failClientTransportQuietly(ws, err);
 				throw err;
 			}
 			// The client left while we were dialling. Don't score the route (a dial we abandoned says nothing
@@ -3710,7 +3716,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// already (partially) delivered rawData. Replaying a non-replay-safe first packet to ProxyIP could
 			// re-send non-idempotent data, so only fall back when the first packet is empty or a standalone
 			// ClientHello; otherwise close and let the client re-dial. (Unchanged for the common ClientHello case.)
-			if (!可重放首包) { closeSocketQuietly(ws); throw err; }
+			if (!可重放首包) { failClientTransportQuietly(ws, err); throw err; }
 			追踪回退(remoteConnWrapper.追踪, 'direct', proxyType || 'proxyip'); // direct dial/first-write failed → ProxyIP
 			await connecttoPry();
 		}
@@ -4453,6 +4459,29 @@ function 是可回送WS关闭码(code) {
 // Returns TRUE when the socket is closed or already was. The caller must not cancel a force-close deadline
 // on a false return: a rejected close code used to be swallowed with no fallback, which left the socket
 // stuck in CLOSING — the exact lifecycle failure the half-open teardown exists to prevent.
+// Terminate a client transport as a FAILURE rather than a normal completion.
+//
+// Adding fail() to the XHTTP bridge was not enough on its own: several lower layers close the transport
+// gracefully and only then rethrow, so by the time the outer catch called fail() the bridge had already
+// set 已关闭 and fail() was a no-op. A dial failure, a steady-state write failure and a remote read error
+// therefore all still reached the client as HTTP 200 with a clean empty EOF — indistinguishable from
+// success, so the client neither retried nor reported anything. Every layer that ends a connection
+// because something FAILED must say so here.
+//
+// WS has no fail(); 1011 is the RFC 6455 code for an unexpected condition that prevented completion,
+// which is exactly this case and is far more honest than the 1000 the generic closer defaults to.
+function failClientTransportQuietly(transport, error) {
+	if (!transport) return false;
+	const 错误 = error instanceof Error ? error : new Error(String(error || 'transport failed'));
+	try {
+		if (typeof (/** @type {any} */ (transport).fail) === 'function') {
+			(/** @type {any} */ (transport)).fail(错误);
+			return true;
+		}
+	} catch (e) { }
+	return closeSocketQuietly(transport, 1011);
+}
+
 function closeSocketQuietly(socket, code) {
 	if (!socket) return true;
 	let 状态;
@@ -4922,8 +4951,14 @@ function pipeRemoteToClient(remoteSocket, webSocket, headerData, retryFunc, firs
 	return connectStreams(remoteSocket, webSocket, headerData, retryFunc, firstByteTimeoutMs, pipeMeta).catch(error => {
 		// A stream cancellation (client cancel / our own cleanup) is normal teardown, not a pipe failure — don't
 		// emit it as noise (the prior build logged 30 such lines for one browsing session).
-		if (!是流取消错误(error) && !(pipeMeta?.wrapper?.客户端已关闭)) log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
-		closeSocketQuietly(webSocket);
+		const 是正常收尾 = 是流取消错误(error) || pipeMeta?.wrapper?.客户端已关闭;
+		if (!是正常收尾) log(`[Stream pipe] Remote-to-client pipe failed: ${error?.message || error}`);
+		// A remote READ error is a failure, and this catch was the only thing that saw it: it closed the
+		// client transport gracefully and then swallowed the rejection, so the transport handler never
+		// learned anything went wrong and the client received a clean EOF. Client cancellation and our own
+		// teardown are genuinely normal and still close quietly.
+		if (是正常收尾) closeSocketQuietly(webSocket);
+		else failClientTransportQuietly(webSocket, error);
 	});
 }
 
