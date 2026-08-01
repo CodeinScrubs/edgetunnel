@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-01 src:c2c54bee62aa wrangler
+// Build: 2026-08-01 src:981af16793c3 wrangler
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-01 src:c2c54bee62aa wrangler';
+const Version = '2026-08-01 src:981af16793c3 wrangler';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -949,7 +949,9 @@ export default {
 				const 是否有长度头 = 反代响应.headers.has('content-length');
 				const 内容长度 = Number(反代响应.headers.get('content-length') || 0);
 				if (!是否有长度头 || !Number.isFinite(内容长度) || 内容长度 < 0 || 内容长度 > 2 * 1024 * 1024) return decoyResponse(反代响应, 反代URL.origin, url.origin);
-				const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
+				// The last directly-buffered external body. Content-Length is a CLAIM: a decoy host can understate
+				// it and send more, so the declared size is no bound at all.
+				const 响应内容 = (await 读取有限响应文本(反代响应, 2 * 1024 * 1024, 10000, 'camouflage response')).replaceAll(反代URL.host, url.host);
 				const responseHeaders = sanitizeDecoyHeaders(反代响应.headers, 反代URL.origin, url.origin);
 				responseHeaders.delete('content-length');
 				responseHeaders.delete('content-encoding');
@@ -2284,9 +2286,11 @@ async function 处理WS请求(request, yourUUID, url) {
 					return 出站加密器;
 				};
 				let SS发送队列 = Promise.resolve();
+				let SS发送错误 = null;
 				const SS入队发送 = (chunk) => {
 					SS发送队列 = SS发送队列.then(async () => {
-						if (serverSock.readyState !== WebSocket.OPEN) return;
+						if (SS发送错误) throw SS发送错误;
+						if (serverSock.readyState !== WebSocket.OPEN) throw new Error('SS client transport is closed');
 						const 已初始化出站加密器 = await 获取出站加密器();
 						await 已初始化出站加密器.加密并发送(chunk, async (encryptedChunk) => {
 							if (encryptedChunk.byteLength > 0 && serverSock.readyState === WebSocket.OPEN) {
@@ -2295,7 +2299,16 @@ async function 处理WS请求(request, yourUUID, url) {
 						});
 					}).catch((error) => {
 						log(`[SS send] Encryption failed: ${error?.message || error}`);
-						closeSocketQuietly(serverSock);
+						// This catch used to RESOLVE, so every caller awaiting the queue saw a success for bytes
+						// that were never encrypted or never reached the client — the downlink pipe then carried
+						// on as though delivery had happened. Remember the failure, tear the upstream down, fail
+						// the client transport, and rethrow so the awaiting caller learns about it too. The
+						// stored error also poisons later sends: the queue is serial, so once encryption breaks
+						// every subsequent chunk is undeliverable and pretending otherwise just hides it.
+						if (!SS发送错误) SS发送错误 = error instanceof Error ? error : new Error(String(error || 'SS send failed'));
+						关闭连接全部Socket(remoteConnWrapper);
+						failClientTransportQuietly(serverSock, SS发送错误);
+						throw SS发送错误;
 					});
 					return SS发送队列;
 				};
@@ -3572,6 +3585,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	const proxyGlobalEnabled = tunnelContext.globalProxyEnabled;
 	const socksWhitelist = Array.isArray(tunnelContext.socksWhitelist) ? tunnelContext.socksWhitelist : DEFAULT_SOCKS5_WHITELIST;
 	const forceProxyHosts = Array.isArray(tunnelContext.forceProxyHosts) ? tunnelContext.forceProxyHosts : [];
+	// An explicitly requested proxy that could not be parsed must not silently become a direct dial.
+	if (tunnelContext.proxyConfigError) throw new Error(`proxy configuration rejected: ${tunnelContext.proxyConfigError}`);
 	const forceProxyForHost = forceProxyHosts.some(pattern => matchesHostPattern(host, pattern));
 	const dialConcurrency = Math.max(1, tunnelContext.tcpDialConcurrency | 0);
 	// Proxy-path concurrency is tracked separately (PROXY_CONCURRENT_DIAL); it defaults to the TCP value, so
@@ -3665,14 +3680,21 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			DoH查询(address, 'A', dohLookupUrl),
 			DoH查询(address, 'AAAA', dohLookupUrl)
 		]);
-		const ipv4List = [...new Set(aRecords.flatMap(r => {
+		let ipv4List = [...new Set(aRecords.flatMap(r => {
 			const data = r.data;
 			return r.type === 1 && typeof data === 'string' && isIPv4(data) ? [data] : [];
 		}))];
-		const ipv6List = [...new Set(aaaaRecords.flatMap(r => {
+		let ipv6List = [...new Set(aaaaRecords.flatMap(r => {
 			const data = r.data;
 			return r.type === 28 && typeof data === 'string' && isIPHostname(data) ? [data] : [];
 		}))];
+		// The HOSTNAME was validated, but these addresses come from a DoH answer and were dialled unchecked —
+		// isIPv4/isIPHostname only confirm the SHAPE of the text. A resolver that returns loopback, private or
+		// otherwise special-use space would have had it dialled directly. Apply the same policy as any other
+		// target; anything rejected simply drops out of the race, and an empty list falls back to the hostname.
+		const 可用目标 = (地址) => { try { validateTunnelTarget(地址, port); return true; } catch (e) { return false; } };
+		ipv4List = ipv4List.filter(可用目标);
+		ipv6List = ipv6List.filter(可用目标);
 		const 拨号上限 = dialConcurrency;
 		const ipList = ipv4List.length >= 拨号上限
 			? ipv4List.slice(0, 拨号上限)
@@ -4842,8 +4864,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连�
 	let bundleBuffer = null;
 	let idleResolvers = [];
 	let activeCompletions = null;
-	// True once any chunk has been successfully written to the remote. It gates coalescing/replay decisions
-	// the same way the download path's `!hasData` gate does (see pipeRemoteToClient).
 	//
 	// The queue used to also accept a reconnect callback, and every transport passed one -- but nothing ever
 	// called it. A dormant recovery hook reads as if recovery exists, so the next person here would
@@ -4852,7 +4872,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连�
 	// because once it is called delivery is indeterminate and replaying the first packet on a reconnect can
 	// duplicate a non-idempotent request. Reinstating it needs that pre-write boundary enforced explicitly
 	// and tested, not a call bolted into the drain loop.
-	let 已交付远端字节 = false;
 
 	const settleCompletions = (completions, err = null) => {
 		if (!completions) return;
@@ -4982,7 +5001,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连�
 						// + the ClientHello classifier), never here.
 						throw err;
 					}
-					已交付远端字节 = true;
 					// Count AFTER the write resolves. Counting before it meant a rejected write still incremented
 					// the uplink byte total, so a connection that uploaded nothing could report bytes sent — the
 					// opposite of what you want when reading a capture to answer "did the upload work". Bytes
@@ -5485,7 +5503,7 @@ function isValidIPv6Literal(host) {
 function isPrivateOrLocalIPv4(host) {
 	const m = String(host || '').match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
 	if (!m) return false;
-	const a = Number(m[1]), b = Number(m[2]), c = Number(m[3]);
+	const a = Number(m[1]), b = Number(m[2]), c = Number(m[3]), d = Number(m[4]);
 	return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
 		|| (a === 100 && b >= 64 && b <= 127) // CGNAT 100.64.0.0/10
 		|| (a === 198 && (b === 18 || b === 19)) // benchmarking 198.18.0.0/15
@@ -5493,6 +5511,9 @@ function isPrivateOrLocalIPv4(host) {
 		// 255.255.255.255 broadcast address). None of it is a reachable unicast destination, so dialling it
 		// only burns a connection attempt and its timeout before failing.
 		|| a >= 224
+		// 192.0.0.0/24 is IETF protocol assignment space and not globally reachable, with two carve-outs:
+		// 192.0.0.9 (PCP anycast) and 192.0.0.10 (NAT64/DNS64 discovery) ARE reachable and must stay dialable.
+		|| (a === 192 && b === 0 && c === 0 && d !== 9 && d !== 10)
 		|| (a === 192 && b === 0 && c === 2)    // TEST-NET-1 192.0.2.0/24
 		|| (a === 198 && b === 51 && c === 100) // TEST-NET-2 198.51.100.0/24
 		|| (a === 203 && b === 0 && c === 113)  // TEST-NET-3 203.0.113.0/24
@@ -5526,12 +5547,27 @@ function isPrivateOrLocalIPv6(host) {
 	if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return true;     // fe80::/10 link-local
 	if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0d && bytes[3] === 0xb8) return true; // 2001:db8::/32 docs
 	if (bytes[0] === 0x01 && bytes[1] === 0x00 && bytes.subarray(2, 8).every(v => v === 0)) return true; // 100::/64 discard
+	// Remaining IANA special-purpose prefixes that are NOT globally reachable. Each one is space a tunnel can
+	// never usefully reach, so a request for it only spends a dial and its timeout before failing.
+	if (bytes[0] === 0x01 && bytes[1] === 0x00 && bytes[2] === 0x00 && bytes[3] === 0x00
+		&& bytes[4] === 0x00 && bytes[5] === 0x00 && bytes[6] === 0x00 && bytes[7] === 0x01) return true; // 100:0:0:1::/64 dummy
+	if (bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b
+		&& bytes[4] === 0x00 && bytes[5] === 0x01) return true;                                            // 64:ff9b:1::/48 local-use
+	if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x02
+		&& bytes[4] === 0x00 && bytes[5] === 0x00) return true;                                            // 2001:2::/48 benchmarking
+	if (bytes[0] === 0x3f && (bytes[1] & 0xf0) === 0xf0) return true;                                      // 3fff::/20 documentation
+	if (bytes[0] === 0x5f && bytes[1] === 0x00) return true;                                               // 5f00::/16 SRv6 SIDs
 	// IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96, which also covers :: and ::1) and NAT64
 	// (64:ff9b::/96) all carry an IPv4 address in the last four bytes. Judge them by that address so a
 	// private or otherwise unusable v4 target cannot be smuggled through in v6 clothing.
 	const v4映射 = bytes[10] === 0xff && bytes[11] === 0xff && bytes.subarray(0, 10).every(v => v === 0);
 	const v4兼容 = bytes.subarray(0, 12).every(v => v === 0);
-	const nat64 = bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b;
+	// The well-known translation prefix is 64:ff9b::/96, not /32. Matching only the first four bytes also
+	// swallowed 64:ff9b:1::/48 (RFC 8215 local-use translation space), whose embedded IPv4 was then judged
+	// as if it were a normal NAT64 target — so 64:ff9b:1::8.8.8.8 was allowed. /96 means the first twelve
+	// bytes are fixed, and the local-use prefix is rejected outright just above.
+	const nat64 = bytes[0] === 0x00 && bytes[1] === 0x64 && bytes[2] === 0xff && bytes[3] === 0x9b
+		&& bytes.subarray(4, 12).every(v => v === 0);
 	if (v4映射 || v4兼容 || nat64) return isPrivateOrLocalIPv4(`${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`);
 	return false;
 }
@@ -10358,7 +10394,9 @@ function 获取SOCKS5账号(address, 默认端口 = 80) {
 		}
 	}
 
-	if (isNaN(port)) throw new Error('Invalid proxy address format: the port must be a number');
+	// isNaN() alone is not a range check: -1, 1.5, 65536 and Infinity are all numbers, so every one of them
+	// was accepted as a proxy port and carried into a connect that could not succeed.
+	if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid proxy address format: the port must be an integer between 1 and 65535');
 	if (hostname.includes(":") && !IPv6方括号正则.test(hostname)) throw new Error('Invalid proxy address format: IPv6 addresses must be wrapped in brackets, for example [2001:db8::1]');
 	// An empty or bracket-only host was accepted and then dialled as "". Reject it here: a proxy address
 	// with no host is a configuration error, and failing at parse time names it instead of surfacing later
@@ -10656,6 +10694,14 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 		else tunnelContext.proxyType = tunnelContext.proxyType || 'socks5';
 	} catch (err) {
 		debugError('Failed to parse SOCKS5 address:', err.message);
+		// Clearing proxyType alone turned an explicitly requested proxy into ordinary DIRECT dialling: the
+		// route condition needs proxyType to pick the proxy branch, so a malformed ?socks5= / ?http= silently
+		// fell through and the connection went straight out. That is the opposite of what was asked for, and
+		// it is invisible -- the tunnel appears to work while sending traffic by a route the operator
+		// explicitly did not choose. Record the failure so the tunnel refuses instead of quietly deciding
+		// for itself. A configuration with no proxy at all is unaffected: this is set only when one was
+		// requested AND could not be parsed.
+		tunnelContext.proxyConfigError = err?.message || 'invalid proxy configuration';
 		tunnelContext.proxyType = null;
 		tunnelContext.parsedProxyAddress = {};
 	}

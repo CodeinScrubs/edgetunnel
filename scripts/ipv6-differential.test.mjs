@@ -142,6 +142,13 @@ for (const file of BUILDS) {
 		['100.64.0.1', 'CGNAT'],
 		['999.1.1.1', 'non-numeric-TLD guard'],
 		['01.2.3.4', 'leading-zero octet reads as octal to some resolvers'],
+		['192.0.0.1', 'IETF protocol assignments 192.0.0.0/24'],
+		['192.0.0.171', 'NAT64 discovery, still not a destination'],
+		['64:ff9b:1::8.8.8.8', 'RFC 8215 local-use translation prefix, NOT the well-known one'],
+		['100:0:0:1::1', 'dummy address 100:0:0:1::/64'],
+		['2001:2::1', 'benchmarking 2001:2::/48'],
+		['3fff::1', 'documentation 3fff::/20'],
+		['5f00::1', 'SRv6 SIDs 5f00::/16'],
 	];
 	const ALLOW = [
 		['1.1.1.1', 'public resolver'],
@@ -152,6 +159,17 @@ for (const file of BUILDS) {
 		['2a03:2880:f10c::', 'public IPv6'],
 		['example.com', 'domain'],
 		['www.youtube.com', 'domain'],
+		// IANA carve-outs INSIDE blocked space. These are the cases a broad prefix rule silently breaks,
+		// which is why the allow half of this table exists at all.
+		['192.0.0.9', 'PCP anycast -- globally reachable inside 192.0.0.0/24'],
+		['192.0.0.10', 'NAT64/DNS64 discovery -- globally reachable inside 192.0.0.0/24'],
+		['192.0.1.1', 'adjacent /24 is ordinary public space'],
+		['192.31.196.1', 'AS112-v4, globally reachable'],
+		['192.175.48.1', 'direct-delegation AS112, globally reachable'],
+		['64:ff9b::8.8.8.8', 'the WELL-KNOWN NAT64 prefix must keep working'],
+		['2001:1::1', 'port control protocol anycast'],
+		['2001:4:112::1', 'AS112-v6'],
+		['2620:4f:8000::1', 'direct-delegation AS112-v6'],
 	];
 	// Only the two builds Node can actually load: the wrangler variant imports cloudflare:sockets, which is
 	// unresolvable outside the Workers runtime. It is generated from the same source and the connect layer is
