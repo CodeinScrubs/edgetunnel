@@ -301,8 +301,14 @@ export default {
 		// Compute the derived identity ONLY when it is actually going to be used. The double-MD5 is pure-JS
 		// hashing that ran on every request against a 10 ms CPU budget, including when an explicit UUID had
 		// already decided identity and the digest was thrown away.
-		let userID;
-		if (显式UUID.status === 'valid') {
+		// Skip derivation entirely when nothing is configured: 隧道凭据可用 false means every tunnel route is
+		// already closed, so the digest could only ever be discarded — yet a pure-JS double MD5 ran on every
+		// scanner and decoy request against a 10 ms CPU budget. Guard the one consumer that compares against
+		// userID (below) so a null cannot match a missing parameter.
+		let userID = null;
+		if (!隧道凭据可用) {
+			// nothing to derive from; tunnel routes are closed and the decoy path needs no identity
+		} else if (显式UUID.status === 'valid') {
 			userID = 显式UUID.value;
 		} else {
 			const 摘要 = await MD5MD5(身份种子 + 加密秘钥);
@@ -333,7 +339,9 @@ export default {
 		const 期望隧道路径核心 = String(env.PATH || '').trim().toLowerCase().replace(/^\/+/, '').replace(/\/+$/, '');
 		const 请求路径核心 = url.pathname.toLowerCase().replace(/\/{2,}/g, '/').replace(/^\/+/, '');
 		const 隧道路径匹配 = !期望隧道路径核心 || 请求路径核心 === 期望隧道路径核心 || 请求路径核心.startsWith(期望隧道路径核心 + '/');
-		if (访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
+		// 隧道凭据可用 first: with no credential userID is null, and a request that simply omits ?uuid also
+		// yields null — `null === null` would have answered /version to anyone.
+		if (隧道凭据可用 && 访问路径 === 'version' && url.searchParams.get('uuid') === userID) {
 			// Version is a build stamp ("YYYY-MM-DD src:<hash>"), not a bare date, so the numeric field has to
 			// be parsed structurally rather than by scraping digits.
 			//
@@ -744,7 +752,9 @@ export default {
 										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
-										debugWarn(`[Subscription] Chain proxy directive parse failed and was ignored: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
+										// 链式代理匹配[0] is the raw directive, i.e. $socks5://username:password@host:port.
+										// Never echo it: DEBUG is exactly what gets enabled while troubleshooting this.
+										debugWarn(`[Subscription] Chain proxy directive was invalid and ignored: ${error && error.message ? error.message : error}`);
 									}
 								} else if (反代IP池.length > 0) {
 									const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));
@@ -769,7 +779,9 @@ export default {
 						} else {
 							const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&scv=${config_JSON.跳过证书验证}`;
 							try {
-								const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' } });
+								// The bounded body reader's deadline only starts once headers arrive, so a host that
+								// accepts the connection and never responds was outside every limit we had.
+								const response = await fetchWithTimeout(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/cmliu/edge' + 'tunnel)' } }, 15000);
 								if (response.ok) {
 									订阅内容 = await 读取有限响应文本(response, 2 * 1024 * 1024, 15000, 'subscription converter');
 									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
@@ -829,7 +841,14 @@ export default {
 			新请求头.set('Referer', 反代URL.origin);
 			新请求头.set('Origin', 反代URL.origin);
 			if (!新请求头.has('User-Agent') && UA && UA !== 'null') 新请求头.set('User-Agent', UA);
-			const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body });
+			// Send the decoy NOTHING from the tunnel URL. Redacting the logs stopped credentials reaching
+			// `wrangler tail` but they were still being forwarded verbatim to a third-party host on every
+			// unmatched request — a strictly worse disclosure, since that host keeps its own logs. The query is
+			// dropped entirely and a proxy-shaped path collapses to '/', so the decoy sees an ordinary request.
+			// redirect: 'manual' stops the runtime replaying the sanitised headers to whatever origin a
+			// redirect names.
+			const 伪装路径 = 脱敏隧道路径(url.pathname) === url.pathname ? url.pathname : '/';
+			const 反代响应 = await fetchWithTimeout(反代URL.origin + 伪装路径, { method: request.method, headers: 新请求头, body: request.body, redirect: 'manual' }, 10000);
 			const 内容类型 = 反代响应.headers.get('content-type') || '';
 
 			if (/text|javascript|json|xml/.test(内容类型)) {
@@ -1566,6 +1585,11 @@ async function 处理gRPC请求(request, yourUUID) {
 					// mutates it after we hand it off.
 					if (chunk.byteLength >= GRPC_ZERO_COPY_MIN_BYTES) {
 						刷新发送队列(true); // ordering: drain anything already batched before emitting the view
+						// That forced flush can fail on an EARLIER queued frame. Its catch records the terminal
+						// error and marks the bridge closed, after which the guard below simply skipped the
+						// enqueue and this call returned normally — so the send that triggered the failing flush
+						// still reported success to the pipe owner. Later sends threw; this one did not.
+						if (gRPC下行错误) throw gRPC下行错误;
 						if (!已关闭) {
 							try {
 								controller.enqueue(encodeGrpcFramePrefix(chunk.byteLength));
@@ -9796,10 +9820,14 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		// shortly after the write can still see nothing, so a burst of reads writes repeatedly — against a Free
 		// plan allowance of 1000 writes/day. Defaults are returned in memory; only an explicit authenticated
 		// reset (or the save path) persists them.
-		if (!configJSON) {
-			config_JSON = 默认配置JSON;
-		} else if (重置配置 == true) {
+		// Reset is checked FIRST. Ordering the missing-key branch ahead of it meant an explicit
+		// /admin reset against an empty namespace took the read-only path and wrote nothing, while the panel
+		// still reported success — a regression introduced by the read-only change itself. "Do not write on a
+		// READ" and "always write on an explicit RESET" are independent rules, and only this order satisfies both.
+		if (重置配置 == true) {
 			await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
+			config_JSON = 默认配置JSON;
+		} else if (!configJSON) {
 			config_JSON = 默认配置JSON;
 		} else {
 			config_JSON = JSON.parse(configJSON);
@@ -9945,7 +9973,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			const CF_JSON = JSON.parse(CF_TXT);
 			if (CF_JSON.UsageAPI) {
 				try {
-					const response = await fetch(CF_JSON.UsageAPI);
+					const response = await fetchWithTimeout(CF_JSON.UsageAPI, {}, 10000);
 					const Usage = await 读取有限响应JSON(response, 256 * 1024, 10000, 'usage API');
 					config_JSON.CF.Usage = Usage;
 				} catch (err) {
@@ -10419,7 +10447,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 		if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
 
 		if (!AccountID) {
-			const r = await fetch(`${API}/accounts`, {
+			const r = await fetchWithTimeout(`${API}/accounts`, {
 				method: "GET",
 				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
 			});
@@ -10434,7 +10462,7 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 		now.setUTCHours(0, 0, 0, 0);
 		const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
 
-		const res = await fetch(`${API}/graphql`, {
+		const res = await fetchWithTimeout(`${API}/graphql`, {
 			method: "POST",
 			headers: hdr,
 			body: JSON.stringify({
@@ -11344,6 +11372,7 @@ export const __testPerformanceHelpers = {
 	创建下行Grain发送器,
 	脱敏查询串,
 	脱敏隧道路径,
+	读取config_JSON,
 	读取有限请求体,
 	SS首包最大字节,
 	PROXY_RESOLUTION_CACHE_MAX_ENDPOINTS,

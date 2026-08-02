@@ -178,6 +178,59 @@ globalThis.fetch = realFetch;
 	assert.equal(cancels, 1, 'a rejected body must be cancelled, not just have its lock released');
 }
 
+
+// "Do not write on a READ" and "always write on an explicit RESET" are INDEPENDENT rules. The read-only
+// change satisfied the first and broke the second: ordering the missing-key branch ahead of the reset
+// branch meant an /admin reset against an empty namespace wrote nothing while the panel reported success.
+// Both directions are pinned here so neither fix can silently undo the other.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const mk = () => {
+		const store = new Map(); const ops = [];
+		return { ops, KV: {
+			get: async (k) => { ops.push(['get', k]); return store.has(k) ? store.get(k) : null; },
+			put: async (k, v) => { ops.push(['put', k]); store.set(k, v); },
+			list: async () => ({ keys: [], list_complete: true }), delete: async () => { },
+		} };
+	};
+	const 写入次数 = (ops) => ops.filter(([op, k]) => op === 'put' && k === 'config.json').length;
+
+	const 只读 = mk();
+	try { await H.读取config_JSON({ KV: 只读.KV, ADMIN: 'pw', KEY: 'k' }, 'h', 'u', 'UA', false); } catch (e) { }
+	assert.equal(写入次数(只读.ops), 0, 'an ordinary read of a missing config must not write — KV Free allows 1000 writes/day');
+
+	const 重置 = mk();
+	try { await H.读取config_JSON({ KV: 重置.KV, ADMIN: 'pw', KEY: 'k' }, 'h', 'u', 'UA', true); } catch (e) { }
+	assert.equal(写入次数(重置.ops), 1, 'an explicit reset must persist defaults even when the key is absent');
+}
+
+// With no credential configured every tunnel route is closed, so userID is null — and a request that simply
+// omits ?uuid also yields null. Without the 隧道凭据可用 guard, `null === null` answered /version to anyone.
+{
+	const worker = (await import('../_worker_copypaste.js')).default;
+	const ctx2 = { waitUntil: () => { }, passThroughOnException: () => { } };
+	const res = await worker.fetch(new Request('https://t.example/version'), { URL: 'nginx' }, ctx2);
+	const body = await res.text();
+	assert.ok(!body.includes('"Build"'), '/version must not answer when no credential is configured');
+}
+
+// Redacting the logs stopped credentials reaching wrangler tail, but the camouflage subrequest still
+// forwarded the raw tunnel path and query to a third-party host — a strictly worse disclosure, since that
+// host keeps its own logs.
+{
+	const worker = (await import('../_worker_copypaste.js')).default;
+	const ctx2 = { waitUntil: () => { }, passThroughOnException: () => { } };
+	let forwarded = null;
+	const prev = globalThis.fetch;
+	globalThis.fetch = async (u) => { forwarded = String(u); return new Response('<html>d</html>', { status: 200, headers: { 'Content-Type': 'text/html' } }); };
+	const env2 = { ADMIN: 'pw', KEY: 'k', URL: 'https://decoy.example', DEBUG: '0', OFF_LOG: '1' };
+	await worker.fetch(new Request('https://t.example/socks5/user:pass@proxy.example:1080?token=secret'), env2, ctx2).catch(() => { });
+	globalThis.fetch = prev;
+	assert.ok(forwarded, 'the decoy should have been fetched');
+	assert.ok(!/pass|secret/.test(forwarded), `the decoy must not receive tunnel credentials, got ${forwarded}`);
+	assert.ok(!forwarded.includes('?'), `the decoy must receive no query at all, got ${forwarded}`);
+}
+
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port
 // bound added there did not cover it: -1, 1.5, 65536 and Infinity all passed isNaN() and were dialled.
 // Its catch also fell through to ordinary query parsing, so a malformed chain became a DIRECT dial.
