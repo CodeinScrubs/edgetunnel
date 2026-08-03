@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-02 src:6f9c08da0481 panel:2d3f297c';
+const Version = '2026-08-03 src:dbdba09841ba panel:4a03be78';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -399,7 +399,15 @@ export default {
 		// The TUNNEL must not be gated on the admin password — a UUID-only deployment (no ADMIN) is valid and must
 		// still serve WS/gRPC/XHTTP. Gate tunnel routes on "any credential is configured" and keep 管理员密码 for
 		// /login + /admin only. A worker with NO credential at all falls through to the decoy (fails closed).
-		const 隧道凭据可用 = Boolean(身份种子);
+		// An explicitly configured but INVALID UUID used to be ignored in favour of the derived identity, so
+		// the worker kept serving under a credential the operator never chose while their configured one failed
+		// — the deployment looks broken rather than misconfigured. Fail closed instead. This costs no access:
+		// /login and /admin sit in the else branch below and are gated on ADMIN, not on this flag, so the
+		// panel stays reachable to fix the value. An ABSENT UUID still derives as before; only an invalid one
+		// is refused. ALLOW_INVALID_UUID_DERIVATION=1 restores the old behaviour for an existing deployment
+		// that is unknowingly relying on it.
+		const 允许无效UUID回退 = isEnabledEnvFlag(env.ALLOW_INVALID_UUID_DERIVATION);
+		const 隧道凭据可用 = Boolean(身份种子) && (允许无效UUID回退 || 解析显式UUID(env.UUID || env.uuid).status !== 'invalid');
 		const 加密秘钥 = env.KEY || 'default-key-change-with-KEY-env-if-needed';
 		// 解析显式UUID is the single authority (see its definition); the panel's UUID_SOURCE row calls the
 		// same function, so the two can no longer disagree about what counts as usable.
@@ -950,7 +958,7 @@ export default {
 				} else if (访问路径 === 'locations') {
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie && authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
+					if (authCookie && authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetchWithTimeout(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }), {}, 10000);
 				} else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
 			}
 			// A KV-less deploy with a derived (non-explicit) UUID still works as a tunnel, so a bare
@@ -8432,11 +8440,16 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 		const cf = request.cf || {};
 		// Don't persist the subscription token (a long-lived, UUID-equivalent credential) verbatim into KV /
 		// the admin operation log. Mask it so the log still shows a token was present without leaking it.
+		// Masking only the top-level `token` was not enough. This record is PERSISTED to KV and can be pushed
+		// to Telegram, so it outlives the request and leaves the account -- a stricter bar than a debug line.
+		// It still carried nested secrets (?sub=https://host/p?token=...), path-embedded proxy credentials
+		// (/socks5/user:password@host) and the reversible /video/ blob. Reuse the same two sanitizers the debug
+		// path uses, so there is ONE definition of what is safe to record rather than two that drift.
 		let 记录URL = request.url;
 		try {
 			const u = new URL(request.url);
-			if (u.searchParams.has('token')) { u.searchParams.set('token', '***'); 记录URL = u.toString(); }
-		} catch (e) { }
+			记录URL = `${u.origin}${脱敏隧道路径(u.pathname)}${脱敏查询串(u.search)}`;
+		} catch (e) { 记录URL = '<unparseable url>'; }
 		const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${cf.asn || '0'} ${cf.asOrganization || 'Unknown'}`, CC: `${cf.country || 'N/A'} ${cf.city || 'N/A'}`, URL: 记录URL, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
 		if (config_JSON?.TG?.启用) {
 			try {
@@ -8445,17 +8458,22 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 				if (TG_JSON?.BotToken && TG_JSON?.ChatID) {
 					const 请求时间 = new Date(日志内容.TIME).toLocaleString('en-US', { timeZone: 'UTC' });
 					const 请求URL = new URL(日志内容.URL);
-					const msg = `<b>#${config_JSON.优选订阅生成.SUBNAME} log notification</b>\n\n` +
-						`📌 <b>Type:</b> #${日志内容.TYPE}\n` +
-						`🌐 <b>IP:</b> <code>${日志内容.IP}</code>\n` +
-						`📍 <b>Location:</b> ${日志内容.CC}\n` +
-						`🏢 <b>ASN:</b> ${日志内容.ASN}\n` +
-						`🔗 <b>Domain:</b> <code>${请求URL.host}</code>\n` +
-						`🔍 <b>Path:</b> <code>${请求URL.pathname + 请求URL.search}</code>\n` +
-						`🤖 <b>UA:</b> <code>${日志内容.UA}</code>\n` +
+					// parse_mode=HTML means every interpolated value is PARSED AS MARKUP. UA, ASN and city are
+					// caller- or edge-supplied, so an unescaped '<' either breaks the message or injects tags into
+					// a chat the operator trusts. Escape every interpolated field.
+					const HTML转义 = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+					const msg = `<b>#${HTML转义(config_JSON.优选订阅生成.SUBNAME)} log notification</b>\n\n` +
+						`📌 <b>Type:</b> #${HTML转义(日志内容.TYPE)}\n` +
+						`🌐 <b>IP:</b> <code>${HTML转义(日志内容.IP)}</code>\n` +
+						`📍 <b>Location:</b> ${HTML转义(日志内容.CC)}\n` +
+						`🏢 <b>ASN:</b> ${HTML转义(日志内容.ASN)}\n` +
+						`🔗 <b>Domain:</b> <code>${HTML转义(请求URL.host)}</code>\n` +
+						`🔍 <b>Path:</b> <code>${HTML转义(请求URL.pathname + 请求URL.search)}</code>\n` +
+						`🤖 <b>UA:</b> <code>${HTML转义(日志内容.UA)}</code>\n` +
 						`📅 <b>Time:</b> ${请求时间} UTC\n` +
 						`${config_JSON.CF.Usage.success ? `📊 <b>Request usage:</b> ${config_JSON.CF.Usage.total}/${config_JSON.CF.Usage.max} <b>${((config_JSON.CF.Usage.total / config_JSON.CF.Usage.max) * 100).toFixed(2)}%</b>\n` : ''}`;
-					await fetch(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
+					// A notification must never be able to hold an invocation open waiting for headers.
+					await fetchWithTimeout(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
 						method: 'GET',
 						headers: {
 							'Accept': 'text/html,application/xhtml+xml,application/xml;',
@@ -9495,8 +9513,11 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
 		try {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), 超时时间);
-			const response = await fetch(urlWithoutHash, { signal: controller.signal });
-			clearTimeout(timeoutId);
+			// clearTimeout ran only on the success path, so a rejected fetch left the timer pending. Clear it in
+			// a finally instead — the same rule fetchWithTimeout already follows.
+			let response;
+			try { response = await fetch(urlWithoutHash, { signal: controller.signal }); }
+			finally { clearTimeout(timeoutId); }
 			let text = '';
 			try {
 				const buffer = await 读取有限响应体(response, 2 * 1024 * 1024, 10000, 'preferred-source', 4096);
@@ -9663,7 +9684,18 @@ function 脱敏查询串(search) {
 // The path carries proxy configuration too — /socks5/user:password@host, /http=..., and the reversible
 // /video/<encoded chain> blob — so redacting only the query left credentials in the log by another route.
 function 脱敏隧道路径(pathname) {
-	return String(pathname || '')
+	// DECODE first, bounded. The patterns below match a literal '/', so /video%2Fabc walked straight through
+	// them while decoding to exactly the path they exist to hide — and %252F hid it one layer deeper. Decode
+	// until it stops changing (capped, so a hostile input cannot spin here), then match. An ordinary path
+	// decodes to itself and is unaffected.
+	let 规范 = String(pathname || '');
+	for (let i = 0; i < 3; i++) {
+		let 下一步;
+		try { 下一步 = decodeURIComponent(规范); } catch (e) { break; }
+		if (下一步 === 规范) break;
+		规范 = 下一步;
+	}
+	return 规范
 		.replace(/\/video\/[^/?#]+/ig, '/video/<redacted>')
 		.replace(/\/(?:g?s5|socks5|g?http|g?https|g?turn|g?sstp)=[^/?#\s]+/ig, '/proxy=<redacted>')
 		.replace(/\/(?:socks5?|http|https|turn|sstp):?\/?\/?[^/?#\s]+/ig, '/proxy/<redacted>')
@@ -11465,7 +11497,7 @@ var ENV_SETTINGS=[
  {g:'Logging'},
  {k:'DEBUG',d:'0',h:'Verbose logging visible in wrangler tail. Keep 0 in production.'},
  {k:'DEBUG_LEGACY_TEXT',d:'1',h:'Only meaningful while DEBUG=1. Set 0 to emit the structured JSON telemetry without the human-readable text lines, which is what you want when capturing a tail for analysis rather than reading it live. No effect when DEBUG=0.'},
- {k:'ENABLE_KV_PROXY_CACHE',d:'on',h:'Persist resolved ProxyIP endpoint health to KV so it survives an isolate restart. Set 0 on the free plan if you would rather spend the 1000/day KV write quota on nothing at all — the in-memory cache still works per isolate, it just restarts cold.'},
+ {k:'ENABLE_KV_PROXY_CACHE',d:'off',h:'OFF by default. Persists resolved ProxyIP endpoint health to KV so it survives an isolate restart. Left off because the write throttle is per ISOLATE, not account-wide, so several isolates or colos each keep their own clock and the free plan\\'s 1000 writes/day cannot be guaranteed. Set 1 to opt in; the bounded in-memory cache works either way, it just restarts cold.'},
  {k:'ENABLE_KV_LOG',d:'off',h:'Record request logs to KV (shown on the Logs tab). Consumes free-plan KV write quota.'}
 ];
 (function(){

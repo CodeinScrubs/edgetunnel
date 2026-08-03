@@ -231,6 +231,52 @@ globalThis.fetch = realFetch;
 	assert.ok(!forwarded.includes('?'), `the decoy must receive no query at all, got ${forwarded}`);
 }
 
+
+// Percent-encoding walked straight past the path redactor: its patterns match a literal '/', so
+// /video%2Fabc was logged verbatim while decoding to exactly the path the rule exists to hide, and %252F
+// hid it one layer deeper. Decode before matching.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const rp = H.脱敏隧道路径;
+	for (const p2 of ['/video%2Fabc', '/VIDEO%2fabc', '/video%252Fabc', '/socks5%2Fuser:pass@h']) {
+		const out = rp(p2);
+		assert.ok(!/abc|pass/.test(out), `${p2} must not survive redaction, got ${out}`);
+	}
+	assert.equal(rp('/plain/path'), '/plain/path', 'an ordinary path must be untouched');
+	assert.equal(rp('/about'), '/about', 'decoding must not mangle ordinary paths');
+}
+
+// An explicitly configured but INVALID UUID used to be ignored in favour of the derived identity, so the
+// worker kept serving under a credential the operator never chose. Fail closed -- but the panel must stay
+// reachable to fix it, which is the objection that made this look unsafe until admin gating was checked.
+{
+	const worker = (await import('../_worker_copypaste.js')).default;
+	const ctx2 = { waitUntil: () => { }, passThroughOnException: () => { } };
+	const prev = globalThis.fetch;
+	globalThis.fetch = async () => new Response('<html>d</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+	const kv = { get: async () => null, put: async () => { }, list: async () => ({ keys: [] }), delete: async () => { } };
+	const base = { ADMIN: 'pw', KEY: 'k', URL: 'nginx', DEBUG: '0', OFF_LOG: '1', KV: kv };
+
+	const bad = { ...base, UUID: 'not-a-uuid' };
+	const v = await worker.fetch(new Request('https://t.example/version'), bad, ctx2);
+	assert.ok(!(await v.text()).includes('"Build"'), 'an invalid UUID must disable tunnel identity, not swap in another');
+	const a = await worker.fetch(new Request('https://t.example/admin'), bad, ctx2);
+	assert.equal(a.status, 302, 'admin must stay reachable so the operator can fix the value');
+
+	const good = { ...base, UUID: '8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04' };
+	const v2 = await worker.fetch(new Request('https://t.example/version?uuid=8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04'), good, ctx2);
+	assert.ok((await v2.text()).includes('"Build"'), 'a valid UUID must be unaffected');
+
+	const absent = { ...base };
+	const v3 = await worker.fetch(new Request('https://t.example/robots.txt'), absent, ctx2);
+	assert.ok((await v3.text()).includes('User-agent'), 'an ABSENT UUID must still derive as before');
+
+	const escape = { ...bad, ALLOW_INVALID_UUID_DERIVATION: '1' };
+	const v4 = await worker.fetch(new Request('https://t.example/robots.txt'), escape, ctx2);
+	assert.equal(v4.status, 200, 'the compatibility flag must restore the old behaviour');
+	globalThis.fetch = prev;
+}
+
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port
 // bound added there did not cover it: -1, 1.5, 65536 and Infinity all passed isNaN() and were dialled.
 // Its catch also fell through to ordinary query parsing, so a malformed chain became a DIRECT dial.
