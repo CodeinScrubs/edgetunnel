@@ -95,7 +95,9 @@ for (const file of BUILDS) {
 	const src = readFileSync(file, 'utf8');
 	const merge = src.indexOf('env = applyUserConfigDefaults(env);');
 	const debugInit = src.indexOf('调试日志打印 = [', merge);
-	const identityLog = src.indexOf('[Identity] The configured UUID was IGNORED', merge);
+	// Anchor on the stable prefix, not the full sentence: the wording changed when an invalid UUID began
+	// failing closed, and pinning prose made this fail for a reason that had nothing to do with ordering.
+	const identityLog = src.indexOf('[Identity] The configured UUID is invalid', merge);
 	assert.ok(merge >= 0 && debugInit > merge, `${file}: debug flags must initialise after the env merge`);
 	assert.ok(identityLog > debugInit, `${file}: the identity warning must come AFTER logging is armed`);
 	assert.ok(debugInit - merge < 600, `${file}: debug flags initialise ${debugInit - merge} chars after the env merge; keep them adjacent so nothing logs into a disarmed logger`);

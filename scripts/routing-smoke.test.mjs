@@ -277,6 +277,44 @@ globalThis.fetch = realFetch;
 	globalThis.fetch = prev;
 }
 
+
+// The invalid-UUID fail-closed change set userID to null -- and /sub derives its ONLY protection from
+// userID, so the token silently became MD5MD5(host + "null"): a value with no secret in it that anyone
+// knowing the hostname can compute. Disabling the tunnel had made the subscription public. A route whose
+// authentication derives from an identity must refuse to run without one.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const worker = (await import('../_worker_copypaste.js')).default;
+	const ctx2 = { waitUntil: () => { }, passThroughOnException: () => { } };
+	const prev = globalThis.fetch;
+	globalThis.fetch = async () => new Response('<html>d</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+	const kv = { get: async () => null, put: async () => { }, list: async () => ({ keys: [] }), delete: async () => { } };
+	const base = { ADMIN: 'admin-secret', HOST: 'example.com', KEY: 'k', URL: 'nginx', DEBUG: '0', OFF_LOG: '1', KV: kv };
+
+	const guess = await H.MD5MD5('example.com' + null);
+	const bad = await worker.fetch(new Request(`https://example.com/sub?token=${guess}`), { ...base, UUID: 'not-a-uuid' }, ctx2);
+	const badBody = await bad.text();
+	assert.ok(!/vless|trojan|:\/\//i.test(badBody) || badBody.includes('Welcome to nginx'),
+		'a token computed from a null identity must not unlock /sub');
+
+	const UUID2 = '8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04';
+	const tok = await H.MD5MD5('example.com' + UUID2);
+	const ok = await worker.fetch(new Request(`https://example.com/sub?token=${tok}`), { ...base, UUID: UUID2 }, ctx2);
+	assert.ok(!(await ok.text()).includes('Welcome to nginx'), 'a valid identity must still serve /sub');
+	globalThis.fetch = prev;
+}
+
+// Deep percent-encoding can always add another layer, so decoding alone is a race the caller wins. Proxy
+// shapes are matched in raw or encoded form, and any other percent-encoded path is reported as unprintable.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const rp = H.脱敏隧道路径;
+	for (const p2 of ['/video%2FBLOB', '/video%252FBLOB', '/video%25252FBLOB', '/video%2525252FBLOB']) {
+		assert.ok(!rp(p2).includes('BLOB'), `${p2} must not survive redaction, got ${rp(p2)}`);
+	}
+	assert.equal(rp('/plain/path'), '/plain/path', 'an ordinary path stays readable');
+}
+
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port
 // bound added there did not cover it: -1, 1.5, 65536 and Infinity all passed isNaN() and were dialled.
 // Its catch also fell through to ordinary query parsing, so a malformed chain became a DIRECT dial.

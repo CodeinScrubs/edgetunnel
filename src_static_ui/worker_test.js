@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-03 src:dbdba09841ba panel:4a03be78';
+const Version = '2026-08-03 src:35d18471741b panel:5d9c0911';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -412,7 +412,12 @@ export default {
 		// 解析显式UUID is the single authority (see its definition); the panel's UUID_SOURCE row calls the
 		// same function, so the two can no longer disagree about what counts as usable.
 		const 显式UUID = 解析显式UUID(env.UUID || env.uuid);
-		if (显式UUID.status === 'invalid') log(`[Identity] The configured UUID was IGNORED (${显式UUID.reason}); serving on the derived identity instead, so clients using that UUID will fail to authenticate. The panel reports this as UUID_SOURCE.`);
+		// Say what actually happens now. The old message described the pre-fail-closed behaviour, so it told
+		// the operator the opposite of the truth in the case that matters most.
+		if (显式UUID.status === 'invalid') {
+			if (允许无效UUID回退) log(`[Identity] The configured UUID is invalid (${显式UUID.reason}); ALLOW_INVALID_UUID_DERIVATION is set, so the legacy derived identity is being served instead. Clients using the configured UUID will fail to authenticate.`);
+			else log(`[Identity] The configured UUID is invalid (${显式UUID.reason}); tunnel routes and /sub are DISABLED. /login and /admin remain available so the value can be corrected. Set ALLOW_INVALID_UUID_DERIVATION=1 to restore the old derived-identity behaviour.`);
+		}
 		// Compute the derived identity ONLY when it is actually going to be used. The double-MD5 is pure-JS
 		// hashing that ran on every request against a 10 ms CPU budget, including when an explicit UUID had
 		// already decided identity and the digest was thrown away.
@@ -513,7 +518,8 @@ export default {
 			if (!管理员密码) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 			if (env.KV && typeof env.KV.get === 'function') {
 				const 区分大小写访问路径 = url.pathname.slice(1);
-				if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== 'default-key-change-with-KEY-env-if-needed') {
+				// Same rule for the secret-path shortcut: it mints the same token, so it needs the same identity.
+				if (userID && 区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== 'default-key-change-with-KEY-env-if-needed') {
 					const params = new URLSearchParams(url.search);
 					params.set('token', await MD5MD5(host + userID));
 					return new Response('Redirecting...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
@@ -780,6 +786,12 @@ export default {
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;
 				} else if (访问路径 === 'sub') {
+					// The subscription token is the ONLY thing protecting this endpoint, and it is derived from
+					// userID. Failing closed on an invalid UUID set userID to null, which turned the token into
+					// MD5MD5(host + "null") -- a value with no secret in it that anyone who knows the hostname can
+					// compute. So the change that disabled the tunnel simultaneously made the subscription public.
+					// A route whose authentication derives from an identity must refuse to run without one.
+					if (!隧道凭据可用 || !userID) return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
 					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/cmliu/edge');
 					const 请求TOKEN = url.searchParams.get('token');
 					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
@@ -2598,7 +2610,16 @@ async function 处理WS请求(request, yourUUID, url) {
 		上行写入队列.清空();
 		释放远端写入器();
 		关闭连接全部Socket(remoteConnWrapper); // close the upstream directly, not only via the serverSock close cascade
-		closeSocketQuietly(serverSock);
+		// Classify the close. This handler receives far more than pre-auth rejections -- authenticated dial
+		// failures, ProxyIP fallback failures, UDP forwarding failures and post-auth parser errors all land
+		// here (WS内层认证完成 is set BEFORE forwardataTCP is awaited, so a failed dial arrives authenticated).
+		// Ending all of them with a bare closeSocketQuietly requests 1000, i.e. "finished normally", which is
+		// the failure-as-success shape fixed in every other transport.
+		const 客户端终止 = remoteConnWrapper.客户端已关闭 || 是流取消错误(err);
+		const 已认证 = WS内层认证完成 || isDnsQuery || Boolean(remoteConnWrapper.socket);
+		if (客户端终止) closeSocketQuietly(serverSock);                        // the client left; not our failure
+		else if (已认证) failClientTransportQuietly(serverSock, err);          // 1011 unexpected condition
+		else closeSocketQuietly(serverSock, 1008);                            // 1008 pre-auth policy violation
 	};
 
 	const 追加WS显式传输任务 = (任务) => {
@@ -8458,6 +8479,13 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 				if (TG_JSON?.BotToken && TG_JSON?.ChatID) {
 					const 请求时间 = new Date(日志内容.TIME).toLocaleString('en-US', { timeZone: 'UTC' });
 					const 请求URL = new URL(日志内容.URL);
+					// CF.Usage comes from an operator-supplied UsageAPI, i.e. arbitrary remote JSON, so its fields
+					// are as untrusted as any header. Escaping is the wrong tool here -- these are NUMBERS, so
+					// validate them as numbers and emit nothing when they are not. That removes the injection
+					// surface instead of encoding around it.
+					const 用量总数 = Number(config_JSON?.CF?.Usage?.total);
+					const 用量上限 = Number(config_JSON?.CF?.Usage?.max);
+					const 用量可用 = Boolean(config_JSON?.CF?.Usage?.success) && Number.isFinite(用量总数) && Number.isFinite(用量上限) && 用量上限 > 0;
 					// parse_mode=HTML means every interpolated value is PARSED AS MARKUP. UA, ASN and city are
 					// caller- or edge-supplied, so an unescaped '<' either breaks the message or injects tags into
 					// a chat the operator trusts. Escape every interpolated field.
@@ -8471,9 +8499,13 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 						`🔍 <b>Path:</b> <code>${HTML转义(请求URL.pathname + 请求URL.search)}</code>\n` +
 						`🤖 <b>UA:</b> <code>${HTML转义(日志内容.UA)}</code>\n` +
 						`📅 <b>Time:</b> ${请求时间} UTC\n` +
-						`${config_JSON.CF.Usage.success ? `📊 <b>Request usage:</b> ${config_JSON.CF.Usage.total}/${config_JSON.CF.Usage.max} <b>${((config_JSON.CF.Usage.total / config_JSON.CF.Usage.max) * 100).toFixed(2)}%</b>\n` : ''}`;
+						`${用量可用 ? `📊 <b>Request usage:</b> ${用量总数}/${用量上限} <b>${((用量总数 / 用量上限) * 100).toFixed(2)}%</b>
+` : ''}`;
 					// A notification must never be able to hold an invocation open waiting for headers.
-					await fetchWithTimeout(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
+					// The third argument is NOT optional in practice: fetchWithTimeout defaults to the DoH lookup
+					// budget (850ms), which is right for one DNS query and far too tight for Telegram's API, so
+					// adding the deadline without a value would have silently dropped most notifications.
+					const TG响应 = await fetchWithTimeout(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
 						method: 'GET',
 						headers: {
 							'Accept': 'text/html,application/xhtml+xml,application/xml;',
@@ -8481,6 +8513,10 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 							'User-Agent': 日志内容.UA || 'Unknown',
 						}
 					});
+					// Nothing reads this body. Cancel it so the response does not retain buffers for the rest of
+					// the invocation.
+					try { await TG响应?.body?.cancel(); } catch (e) { }
+					if (TG响应 && !TG响应.ok) debugWarn(`[Telegram] notification rejected: ${TG响应.status}`);
 				}
 			} catch (error) { debugError(`Failed to read tg.json: ${error.message}`) }
 		}
@@ -9688,7 +9724,15 @@ function 脱敏隧道路径(pathname) {
 	// them while decoding to exactly the path they exist to hide — and %252F hid it one layer deeper. Decode
 	// until it stops changing (capped, so a hostile input cannot spin here), then match. An ordinary path
 	// decodes to itself and is unaffected.
-	let 规范 = String(pathname || '');
+	const 原始 = String(pathname || '').replace(/[\r\n]/g, '');
+	// Decoding is a race the caller can always win by adding another layer, so do not rely on it alone.
+	// Match proxy shapes against the RAW text in either literal or encoded form first (%2f, %252f, %25252f
+	// ... all reduce to the same (?:%25)*2f pattern), and treat any remaining percent-encoded path as
+	// unprintable rather than guessing. A four-layer input previously survived a three-round decode loop.
+	if (/video/i.test(原始) && /(?:\/|%(?:25)*2f)/i.test(原始)) return '/video/<redacted>';
+	if (/(?:socks5?|https?|turn|sstp)/i.test(原始) && (原始.includes('@') || /(?:\/|=|%(?:25)*2f)/i.test(原始))) return '/proxy/<redacted>';
+	if (原始.includes('%')) return '/<encoded-path>';
+	let 规范 = 原始;
 	for (let i = 0; i < 3; i++) {
 		let 下一步;
 		try { 下一步 = decodeURIComponent(规范); } catch (e) { break; }
