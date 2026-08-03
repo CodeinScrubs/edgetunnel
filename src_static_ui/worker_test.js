@@ -128,7 +128,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-03 src:35d18471741b panel:5d9c0911';
+const Version = '2026-08-03 src:0ebe9108a8fc panel:5b004064';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -2449,13 +2449,14 @@ async function 处理WS请求(request, yourUUID, url) {
 				// substrings below, so classify by name too — otherwise it falls through to the generic
 				// WS-forwarding handler and is logged as an opaque failure instead of a decrypt failure.
 				if (err?.name === 'OperationError' || msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
-				log(`[SS inbound] Decryption failed; connection closed: ${msg}`);
-				// A decrypt failure is a FAILURE. closeSocketQuietly ends the socket with a normal 1000, which
-				// tells the client the session finished cleanly and gives it no reason to re-dial with correct
-				// credentials or a fresh session — the same "reported success for a dead tunnel" shape fixed
-				// across the other transports.
-				failClientTransportQuietly(serverSock, err);
-				return;
+				log(`[SS inbound] Decryption failed: ${msg}`);
+				// Hand this to the central WS failure owner rather than closing here and returning. Failing the
+				// socket locally resolved the serialized task successfully, left the upstream to be cleaned up
+				// by a later close event, and duplicated classification logic that now lives in one place: the
+				// WS handler decides 1008 for a pre-auth rejection and 1011 for an authenticated failure, which
+				// is exactly the distinction a bad password versus mid-stream AEAD corruption needs.
+				关闭连接全部Socket(remoteConnWrapper);
+				throw err;
 			}
 			throw err;
 		}
@@ -8512,7 +8513,7 @@ async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SU
 							'Accept-Encoding': 'gzip, deflate, br',
 							'User-Agent': 日志内容.UA || 'Unknown',
 						}
-					});
+					}, 10000);
 					// Nothing reads this body. Cancel it so the response does not retain buffers for the rest of
 					// the invocation.
 					try { await TG响应?.body?.cancel(); } catch (e) { }
@@ -9725,25 +9726,23 @@ function 脱敏隧道路径(pathname) {
 	// until it stops changing (capped, so a hostile input cannot spin here), then match. An ordinary path
 	// decodes to itself and is unaffected.
 	const 原始 = String(pathname || '').replace(/[\r\n]/g, '');
-	// Decoding is a race the caller can always win by adding another layer, so do not rely on it alone.
-	// Match proxy shapes against the RAW text in either literal or encoded form first (%2f, %252f, %25252f
-	// ... all reduce to the same (?:%25)*2f pattern), and treat any remaining percent-encoded path as
-	// unprintable rather than guessing. A four-layer input previously survived a three-round decode loop.
-	if (/video/i.test(原始) && /(?:\/|%(?:25)*2f)/i.test(原始)) return '/video/<redacted>';
-	if (/(?:socks5?|https?|turn|sstp)/i.test(原始) && (原始.includes('@') || /(?:\/|=|%(?:25)*2f)/i.test(原始))) return '/proxy/<redacted>';
-	if (原始.includes('%')) return '/<encoded-path>';
-	let 规范 = 原始;
-	for (let i = 0; i < 3; i++) {
-		let 下一步;
-		try { 下一步 = decodeURIComponent(规范); } catch (e) { break; }
-		if (下一步 === 规范) break;
-		规范 = 下一步;
-	}
-	return 规范
-		.replace(/\/video\/[^/?#]+/ig, '/video/<redacted>')
-		.replace(/\/(?:g?s5|socks5|g?http|g?https|g?turn|g?sstp)=[^/?#\s]+/ig, '/proxy=<redacted>')
-		.replace(/\/(?:socks5?|http|https|turn|sstp):?\/?\/?[^/?#\s]+/ig, '/proxy/<redacted>')
-		.replace(/[\r\n]/g, '');
+	// Match a path COMPONENT, not a substring. The previous version tested /video/i and /turn/i anywhere in
+	// the path, so "/videos/cat" and "/return/home" were treated as proxy directives — and because the decoy
+	// router uses this same function to decide what to forward, every ordinary camouflage path collapsed to
+	// '/'. A redactor that over-matches is not "safely conservative" when something else routes on its answer.
+	//
+	// A component boundary is the start of the path, a slash, or an ENCODED slash at any nesting depth
+	// ((?:%25)*2f covers %2f, %252f, %25252f ...). The directive must then be followed by its own delimiter,
+	// which is what distinguishes "socks5:" from "socks5x" and "turn/" from "turning".
+	const 边界 = '(?:^|/|%(?:25)*2f)';
+	const 斜杠 = '(?:/|%(?:25)*2f)';
+	// These mirror the forms 反代参数获取 actually parses; anything it cannot read is not a directive.
+	if (new RegExp(`${边界}video${斜杠}`, 'i').test(原始)) return '/video/<redacted>';
+	if (new RegExp(`${边界}(?:socks5?|https?|turn|sstp)(?::|%3a)`, 'i').test(原始)) return '/proxy/<redacted>';
+	if (new RegExp(`${边界}(?:socks5?|https?|turn|sstp)${斜杠}`, 'i').test(原始)) return '/proxy/<redacted>';
+	if (new RegExp(`${边界}(?:g?s5|socks5|g?https?|g?turn|g?sstp)(?:=|%3d)`, 'i').test(原始)) return '/proxy/<redacted>';
+	if (new RegExp(`${边界}(?:proxyip(?:[.=]|%2[ed])|pyip(?:=|%3d)|ip(?:=|%3d))`, 'i').test(原始)) return '/proxy/<redacted>';
+	return 原始;
 }
 async function 反代参数获取(url, uuid, tunnelContext = emptyTunnelContext()) {
 	return applyProxyParamsToTunnelContext(url, uuid, tunnelContext);
@@ -11074,12 +11073,20 @@ function 构建生效设置视图(env) {
 		// value is ignored silently and the worker quietly uses the derived identity instead.
 		// Calls the SAME resolver the tunnel authenticates with. Re-implementing the check here is how this
 		// row once reported "accepted" for a nil UUID that the runtime was rejecting.
+		// Reported alongside UUID_SOURCE so the two always agree about which policy is in force.
+		ALLOW_INVALID_UUID_DERIVATION: { effective: isEnabledEnvFlag(e?.ALLOW_INVALID_UUID_DERIVATION) ? 'on (legacy derived-identity fallback)' : 'off (an invalid UUID fails closed)', env: raw('ALLOW_INVALID_UUID_DERIVATION') },
 		UUID_SOURCE: (() => {
 			const 结果 = 解析显式UUID(e?.UUID || e?.uuid);
+			// The REJECTED branch must describe what the runtime now does. It used to say the worker keeps
+			// serving on the derived identity; since an invalid UUID began failing closed that is only true
+			// with the compatibility flag set, so the panel was reporting the opposite of reality in the one
+			// case an operator consults it for.
+			const 回退 = isEnabledEnvFlag(e?.ALLOW_INVALID_UUID_DERIVATION);
 			return {
 				effective: 结果.status === 'valid' ? 'explicit UUID accepted'
 					: 结果.status === 'absent' ? 'derived from ADMIN/KEY'
-						: `explicit UUID REJECTED (${结果.reason}) - clients using it will fail to authenticate`,
+						: 回退 ? `explicit UUID REJECTED (${结果.reason}) - ALLOW_INVALID_UUID_DERIVATION is set, so the derived identity is served instead and clients using your UUID will fail to authenticate`
+							: `explicit UUID REJECTED (${结果.reason}) - tunnel routes and /sub are DISABLED; /login and /admin still work so you can correct it`,
 				env: (e?.UUID || e?.uuid) ? '(set)' : null
 			};
 		})(),
@@ -11497,7 +11504,8 @@ function loadLogs(){say($('m-lg'),'Loading...',true);fetch('/admin/log.json?limi
 
 var ENV_SETTINGS=[
  {g:'Identity'},
- {k:'UUID_SOURCE',ro:1,d:'read-only',h:'Whether the tunnel identity came from an explicit UUID you set, was derived from ADMIN/KEY because no UUID is set, or whether a UUID you DID set was rejected for not being a canonical 8-4-4-4-12 value. A rejected UUID is not an error you can see anywhere else: the worker keeps serving on the derived identity, so clients configured with your UUID simply fail to authenticate. The credential itself is never shown here.'},
+ {k:'ALLOW_INVALID_UUID_DERIVATION',d:'off',h:'Legacy escape hatch. When an explicitly configured UUID is not a canonical 8-4-4-4-12 value the worker fails closed: tunnel routes and /sub are disabled so it never serves under an identity you did not choose. Set 1 to restore the old behaviour of falling back to the ADMIN/KEY-derived identity. Leave off unless an existing deployment depends on it.'},
+ {k:'UUID_SOURCE',ro:1,d:'read-only',h:'Whether the tunnel identity came from an explicit UUID you set, was derived from ADMIN/KEY because no UUID is set, or whether a UUID you DID set was rejected for not being a canonical 8-4-4-4-12 value. A rejected UUID is not an error you can see anywhere else. It now FAILS CLOSED: tunnel routes and /sub are disabled, while /login and /admin stay reachable so you can fix the value. Set ALLOW_INVALID_UUID_DERIVATION=1 to restore the old behaviour of quietly serving the derived identity instead. The credential itself is never shown here.'},
  {g:'Performance & stability'},
  {k:'DIRECT_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Drop a direct connection that opens but never sends a byte (a silent blackhole) after this many ms, so the client re-dials. OFF by default: a fixed deadline can cut a server that legitimately takes several seconds for its first byte (AI inference, a slow API), so enable it only if your workload has no slow-first-byte servers. Setting 0 also = off; a positive value is honored (clamped 1-15s).'},
  {k:'PROXY_FIRST_BYTE_TIMEOUT_MS',d:'0 (off)',h:'Same idea for the relay path. OFF by default for the same reason. Setting 0 = off; a positive value is honored (clamped 1-15s).'},

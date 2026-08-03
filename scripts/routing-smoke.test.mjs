@@ -148,7 +148,19 @@ globalThis.fetch = realFetch;
 	assert.equal(r('?'), '');
 	assert.equal(rp('/video/BLOBBLOB'), '/video/<redacted>', 'the encoded chain blob is reversible configuration');
 	assert.equal(rp('/socks5/user:pass@h:1080'), '/proxy/<redacted>', 'path-form proxy credentials must not be logged');
-	assert.equal(rp('/gs5=user:pass@h'), '/proxy=<redacted>', 'the =form carries credentials too');
+	assert.equal(rp('/gs5=user:pass@h'), '/proxy/<redacted>', 'the =form carries credentials too');
+	// The redactor matched SUBSTRINGS, so "/return/home" (contains "turn") and "/videos/cat" were treated as
+	// proxy directives. That is not harmlessly conservative: the decoy router uses this same answer to decide
+	// what to forward, so every ordinary camouflage path collapsed to '/'. Match path COMPONENTS instead.
+	for (const ok of ['/videos/cat', '/docs/video-guide', '/return/home', '/turning/page', '/https-guide', '/plain%20path', '/about', '/skip=1', '/description/turnip']) {
+		assert.equal(rp(ok), ok, `${ok} is an ordinary path and must pass through untouched`);
+	}
+	// ...while every real directive form still redacts, including behind a configured PATH prefix, which an
+	// anchored-to-start-of-path rule would have missed.
+	for (const bad of ['/video/BLOB', '/video%2FBLOB', '/video%252FBLOB', '/video%2525252FBLOB', '/mypath/video/BLOB',
+		'/socks5://u:p@h', '/socks5/u:p@h', '/proxyip=1.2.3.4', '/pyip=1.2.3.4', '/mypath%2Fsocks5%3A%2F%2Fh']) {
+		assert.ok(!/BLOB|u:p|1\.2\.3\.4/.test(rp(bad)), `${bad} must be redacted, got ${rp(bad)}`);
+	}
 	assert.equal(rp('/plain/path'), '/plain/path', 'ordinary paths stay readable');
 	const 注入 = rp('/x' + String.fromCharCode(10) + 'INJECT');
 	assert.equal(注入.includes(String.fromCharCode(10)), false, 'no control character may reach a log line');
