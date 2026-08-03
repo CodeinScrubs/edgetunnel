@@ -147,7 +147,12 @@ globalThis.fetch = realFetch;
 	assert.equal(r(''), '');
 	assert.equal(r('?'), '');
 	assert.equal(rp('/video/BLOBBLOB'), '/video/<redacted>', 'the encoded chain blob is reversible configuration');
-	assert.equal(rp('/socks5/user:pass@h:1080'), '/proxy/<redacted>', 'path-form proxy credentials must not be logged');
+	// NOTE: '/socks5/user:pass@h' is deliberately NOT redacted. The parser's scheme form requires a COLON
+	// ('socks5://...'), so a slash there is not a directive it accepts -- nothing is configured from it and
+	// no live credential exists. The classifier mirrors the parser exactly; adding a looks-like-credentials
+	// heuristic on top is what produced the '/return/home' false positive and the routing regression.
+	assert.equal(rp('/socks5://user:pass@h:1080'), '/proxy/<redacted>', 'the scheme form the parser accepts must be redacted');
+	assert.equal(rp('/socks5/user:pass@h:1080'), '/socks5/user:pass@h:1080', 'a form the parser ignores is an ordinary path');
 	assert.equal(rp('/gs5=user:pass@h'), '/proxy/<redacted>', 'the =form carries credentials too');
 	// The redactor matched SUBSTRINGS, so "/return/home" (contains "turn") and "/videos/cat" were treated as
 	// proxy directives. That is not harmlessly conservative: the decoy router uses this same answer to decide
@@ -157,9 +162,16 @@ globalThis.fetch = realFetch;
 	}
 	// ...while every real directive form still redacts, including behind a configured PATH prefix, which an
 	// anchored-to-start-of-path rule would have missed.
-	for (const bad of ['/video/BLOB', '/video%2FBLOB', '/video%252FBLOB', '/video%2525252FBLOB', '/mypath/video/BLOB',
-		'/socks5://u:p@h', '/socks5/u:p@h', '/proxyip=1.2.3.4', '/pyip=1.2.3.4', '/mypath%2Fsocks5%3A%2F%2Fh']) {
+	// One decode, because that is exactly what the parser does. /video%2FBLOB decodes to /video/BLOB and IS a
+	// directive; /video%252FBLOB decodes to /video%2FBLOB, which the parser also rejects, so it configures
+	// nothing and is an ordinary path. Matching the parser in both directions is the invariant -- redacting
+	// more than the parser accepts is what broke camouflage routing, and less is what leaked credentials.
+	for (const bad of ['/video/BLOB', '/video%2FBLOB', '/mypath/video/BLOB',
+		'/socks5://u:p@h', '/proxyip=1.2.3.4', '/pyip=1.2.3.4', '/mypath%2Fsocks5%3A%2F%2Fh']) {
 		assert.ok(!/BLOB|u:p|1\.2\.3\.4/.test(rp(bad)), `${bad} must be redacted, got ${rp(bad)}`);
+	}
+	for (const ok of ['/video%252FBLOB', '/video%2525252FBLOB']) {
+		assert.equal(rp(ok), ok, `${ok} survives one decode as a non-directive; the parser ignores it too`);
 	}
 	assert.equal(rp('/plain/path'), '/plain/path', 'ordinary paths stay readable');
 	const 注入 = rp('/x' + String.fromCharCode(10) + 'INJECT');
@@ -239,8 +251,12 @@ globalThis.fetch = realFetch;
 	await worker.fetch(new Request('https://t.example/socks5/user:pass@proxy.example:1080?token=secret'), env2, ctx2).catch(() => { });
 	globalThis.fetch = prev;
 	assert.ok(forwarded, 'the decoy should have been fetched');
+	// The decoy receives '/' and nothing else -- no path, no query. Any classifier deciding what leaves the
+	// worker to a third party can be wrong in the unsafe direction, and a path the parser IGNORES can still
+	// carry real credentials (an operator typing /socks5/user:pass@h instead of /socks5://...).
 	assert.ok(!/pass|secret/.test(forwarded), `the decoy must not receive tunnel credentials, got ${forwarded}`);
 	assert.ok(!forwarded.includes('?'), `the decoy must receive no query at all, got ${forwarded}`);
+	assert.ok(/^https:\/\/decoy\.example\/?$/.test(forwarded), `the decoy must receive only the root path, got ${forwarded}`);
 }
 
 
@@ -250,9 +266,14 @@ globalThis.fetch = realFetch;
 {
 	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
 	const rp = H.脱敏隧道路径;
-	for (const p2 of ['/video%2Fabc', '/VIDEO%2fabc', '/video%252Fabc', '/socks5%2Fuser:pass@h']) {
-		const out = rp(p2);
-		assert.ok(!/abc|pass/.test(out), `${p2} must not survive redaction, got ${out}`);
+	// One decode, matching what the parser does. These decode to real directives and must be redacted.
+	for (const p2 of ['/video%2Fabc', '/VIDEO%2fabc']) {
+		assert.ok(!/abc/.test(rp(p2)), `${p2} decodes to a directive and must be redacted, got ${rp(p2)}`);
+	}
+	// These decode to /video%2Fabc, which the parser rejects too -- they configure nothing, so they are
+	// ordinary paths. Redacting more than the parser accepts is what broke camouflage routing earlier.
+	for (const p2 of ['/video%252Fabc', '/video%25252Fabc']) {
+		assert.equal(rp(p2), p2, `${p2} is not a directive after one decode`);
 	}
 	assert.equal(rp('/plain/path'), '/plain/path', 'an ordinary path must be untouched');
 	assert.equal(rp('/about'), '/about', 'decoding must not mangle ordinary paths');
@@ -316,15 +337,57 @@ globalThis.fetch = realFetch;
 	globalThis.fetch = prev;
 }
 
-// Deep percent-encoding can always add another layer, so decoding alone is a race the caller wins. Proxy
-// shapes are matched in raw or encoded form, and any other percent-encoded path is reported as unprintable.
+// Encoding depth is judged the same way the PARSER judges it: one decode. Guessing at deeper nesting was
+// an attempt to out-guess an attacker with a matcher the parser does not share, and it redacted paths the
+// parser ignores -- which then collapsed real camouflage routing. Parity with the parser is the invariant.
 {
 	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
 	const rp = H.脱敏隧道路径;
-	for (const p2 of ['/video%2FBLOB', '/video%252FBLOB', '/video%25252FBLOB', '/video%2525252FBLOB']) {
-		assert.ok(!rp(p2).includes('BLOB'), `${p2} must not survive redaction, got ${rp(p2)}`);
+	assert.ok(!rp('/video%2FBLOB').includes('BLOB'), 'one encoded slash decodes to a directive and must be redacted');
+	for (const p2 of ['/video%252FBLOB', '/video%25252FBLOB', '/video%2525252FBLOB']) {
+		assert.equal(rp(p2), p2, `${p2} is not a directive after one decode, so the parser ignores it too`);
 	}
 	assert.equal(rp('/plain/path'), '/plain/path', 'an ordinary path stays readable');
+}
+
+
+// The parser decodes the pathname before matching; the redactor matched the RAW text. So
+// /mypath/%73ocks5%3A%2F%2Fu:p@h was ACCEPTED as a socks5 directive and simultaneously judged an ordinary
+// path -- the credentials went to the KV log, to Telegram and to the third-party decoy. Two independent
+// matchers cannot be kept in sync by hand, which is the whole reason they are now one classifier built on
+// the parser's own constants and its own canonicalization.
+//
+// GENERATE the cases rather than listing them: encode each character of each directive form in turn and
+// require the classifier to agree with the parser for every encoding that decodes back to a directive.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const cls = H.分类敏感隧道路径;
+	const FORMS = ['/mypath/socks5://u:p@h', '/mypath/https://u:p@h', '/mypath/video/SECRETBLOB',
+		'/gs5=u:p@h', '/proxyip=relay.example:443', '/pyip=1.2.3.4'];
+	let 变体数 = 0;
+	for (const form of FORMS) {
+		for (let i = 0; i < form.length; i++) {
+			const c = form[i];
+			if (!/[A-Za-z0-9:/=.]/.test(c)) continue;
+			const enc = form.slice(0, i) + '%' + c.charCodeAt(0).toString(16).padStart(2, '0') + form.slice(i + 1);
+			let dec;
+			try { dec = decodeURIComponent(enc); } catch (e) { continue; }
+			if (dec !== form) continue;   // only encodings that still decode to the directive
+			变体数++;
+			assert.equal(cls(enc).敏感, true, `${enc} decodes to a directive the parser accepts, so it must be classified sensitive`);
+		}
+	}
+	assert.ok(变体数 > 80, `the generator should cover many encodings, covered ${变体数}`);
+
+	// And the other direction: ordinary paths must stay ordinary, because the decoy router acts on this.
+	for (const ok of ['/videos/cat', '/return/home', '/turning/page', '/https-guide', '/proxyip-news',
+		'/about', '/robots.txt', '/plain%20path', '/docs/video-guide']) {
+		assert.equal(cls(ok).敏感, false, `${ok} is an ordinary path and must not be classified sensitive`);
+	}
+
+	// A path whose encoding cannot be decoded is sensitive: the parser would throw on it, and guessing is
+	// the wrong side to err on when the answer decides what leaves the worker.
+	assert.equal(cls('/%zz').敏感, true, 'undecodable encoding must fail safe');
 }
 
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port

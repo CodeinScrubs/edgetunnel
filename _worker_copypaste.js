@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-03 src:0ebe9108a8fc copypaste:55aed736
+// Build: 2026-08-03 src:d9a979a60422 copypaste:82bf8092
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -16,6 +16,7 @@ const USER_CONFIG = {
 	ENABLE_KV_LOG: undefined,
 	OFF_LOG: undefined,
 	ENABLE_KV_PROXY_CACHE: undefined,
+	ALLOW_INVALID_UUID_DERIVATION: undefined,
 	PRELOAD_RACE_DIAL: undefined,
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
@@ -113,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-03 src:0ebe9108a8fc copypaste:55aed736';
+const Version = '2026-08-03 src:d9a979a60422 copypaste:82bf8092';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -980,7 +981,14 @@ export default {
 			// dropped entirely and a proxy-shaped path collapses to '/', so the decoy sees an ordinary request.
 			// redirect: 'manual' stops the runtime replaying the sanitised headers to whatever origin a
 			// redirect names.
-			const 伪装路径 = 脱敏隧道路径(url.pathname) === url.pathname ? url.pathname : '/';
+			// The decoy gets '/' and nothing else. Forwarding the incoming path made a classifier decide what
+			// leaves this worker to a THIRD PARTY, and any classifier can be wrong in the unsafe direction: a
+			// path the parser ignores (an operator typing /socks5/user:pass@h instead of /socks5://...) still
+			// carries real credentials, and that host keeps its own logs. The decoy has no operational need
+			// for the request path -- serving its root page is equally convincing camouflage -- so there is
+			// nothing to trade away by never sending one. This also stops a cosmetic change to redaction text
+			// from silently changing routing, which is what the previous 'compare sanitizer output' shape did.
+			const 伪装路径 = '/';
 			const 反代响应 = await fetchWithTimeout(反代URL.origin + 伪装路径, { method: request.method, headers: 新请求头, body: request.body, redirect: 'manual' }, 10000);
 			const 内容类型 = 反代响应.headers.get('content-type') || '';
 
@@ -10521,31 +10529,38 @@ function 脱敏查询串(search) {
 	return 键集.size ? `?params=${[...键集].join(',')}` : '';
 }
 
-// The path carries proxy configuration too — /socks5/user:password@host, /http=..., and the reversible
-// /video/<encoded chain> blob — so redacting only the query left credentials in the log by another route.
-function 脱敏隧道路径(pathname) {
-	// DECODE first, bounded. The patterns below match a literal '/', so /video%2Fabc walked straight through
-	// them while decoding to exactly the path they exist to hide — and %252F hid it one layer deeper. Decode
-	// until it stops changing (capped, so a hostile input cannot spin here), then match. An ordinary path
-	// decodes to itself and is unaffected.
+// ONE definition of what a proxy directive looks like in a path. These constants are used BOTH by the
+// parser that acts on them and by the classifier that decides whether a path is safe to log, persist or
+// forward. Keeping two independent matchers is what produced the bypass this replaces: the parser decodes
+// the pathname before matching, the redactor matched the raw text, so /mypath/%73ocks5%3A%2F%2Fu:p@h was
+// ACCEPTED as a socks5 directive and simultaneously judged an ordinary path -- sending the credentials to
+// the KV log, to Telegram and to the third-party decoy origin. Any fix that leaves two matchers in place
+// only postpones the next divergence.
+const 链式代理路径正则 = /\/video\/(.+)$/i;
+const 协议代理路径正则 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i;
+const 赋值代理路径正则 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i;
+const 反代IP路径正则 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/;
+
+// Canonicalize exactly as applyProxyParamsToTunnelContext does, then apply exactly its patterns. A path
+// whose encoding cannot be decoded is treated as sensitive: the parser would throw on it, and guessing is
+// the wrong side to err on when the answer decides what leaves this worker.
+function 分类敏感隧道路径(pathname) {
 	const 原始 = String(pathname || '').replace(/[\r\n]/g, '');
-	// Match a path COMPONENT, not a substring. The previous version tested /video/i and /turn/i anywhere in
-	// the path, so "/videos/cat" and "/return/home" were treated as proxy directives — and because the decoy
-	// router uses this same function to decide what to forward, every ordinary camouflage path collapsed to
-	// '/'. A redactor that over-matches is not "safely conservative" when something else routes on its answer.
-	//
-	// A component boundary is the start of the path, a slash, or an ENCODED slash at any nesting depth
-	// ((?:%25)*2f covers %2f, %252f, %25252f ...). The directive must then be followed by its own delimiter,
-	// which is what distinguishes "socks5:" from "socks5x" and "turn/" from "turning".
-	const 边界 = '(?:^|/|%(?:25)*2f)';
-	const 斜杠 = '(?:/|%(?:25)*2f)';
-	// These mirror the forms 反代参数获取 actually parses; anything it cannot read is not a directive.
-	if (new RegExp(`${边界}video${斜杠}`, 'i').test(原始)) return '/video/<redacted>';
-	if (new RegExp(`${边界}(?:socks5?|https?|turn|sstp)(?::|%3a)`, 'i').test(原始)) return '/proxy/<redacted>';
-	if (new RegExp(`${边界}(?:socks5?|https?|turn|sstp)${斜杠}`, 'i').test(原始)) return '/proxy/<redacted>';
-	if (new RegExp(`${边界}(?:g?s5|socks5|g?https?|g?turn|g?sstp)(?:=|%3d)`, 'i').test(原始)) return '/proxy/<redacted>';
-	if (new RegExp(`${边界}(?:proxyip(?:[.=]|%2[ed])|pyip(?:=|%3d)|ip(?:=|%3d))`, 'i').test(原始)) return '/proxy/<redacted>';
-	return 原始;
+	let 解码;
+	try { 解码 = decodeURIComponent(原始); }
+	catch (e) { return { 敏感: true, 类型: 'malformed-encoding' }; }
+	if (链式代理路径正则.test(解码)) return { 敏感: true, 类型: 'chain-proxy' };
+	if (协议代理路径正则.test(解码) || 赋值代理路径正则.test(解码) || 反代IP路径正则.test(解码.toLowerCase())) {
+		return { 敏感: true, 类型: 'proxy' };
+	}
+	return { 敏感: false, 类型: null };
+}
+
+function 脱敏隧道路径(pathname) {
+	const 分类 = 分类敏感隧道路径(pathname);
+	if (分类.类型 === 'chain-proxy') return '/video/<redacted>';
+	if (分类.敏感) return '/proxy/<redacted>';
+	return String(pathname || '').replace(/[\r\n]/g, '');
 }
 async function 反代参数获取(url, uuid, tunnelContext = emptyTunnelContext()) {
 	return applyProxyParamsToTunnelContext(url, uuid, tunnelContext);
@@ -10816,7 +10831,7 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 	tunnelContext.globalProxyEnabled = false;
 	tunnelContext.parsedProxyAddress = {};
 
-	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
+	const 链式代理路径匹配 = pathname.match(链式代理路径正则);
 	if (链式代理路径匹配) {
 		try {
 			const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1], uuid);
@@ -10897,18 +10912,18 @@ async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyT
 	if (查询反代IP !== null) {
 		if (!解析代理URL(查询反代IP)) return 设置反代IP(查询反代IP);
 	} else {
-		let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
+		let 匹配 = 协议代理路径正则.exec(pathname);
 		if (匹配) {
 			const 类型 = 匹配[1].toLowerCase();
 			tunnelContext.proxyType = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
 			tunnelContext.proxyAccount = 匹配[2].split('/')[0];
 			tunnelContext.globalProxyEnabled = true;
-		} else if ((匹配 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i.exec(pathname))) {
+		} else if ((匹配 = 赋值代理路径正则.exec(pathname))) {
 			const 类型 = 匹配[1].toLowerCase();
 			tunnelContext.proxyAccount = 匹配[2].split('/')[0];
 			tunnelContext.proxyType = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
 			if (类型.startsWith('g')) tunnelContext.globalProxyEnabled = true;
-		} else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
+		} else if ((匹配 = 反代IP路径正则.exec(pathLower))) {
 			const 路径反代值 = 提取路径值(匹配[2]);
 			if (!解析代理URL(路径反代值)) return 设置反代IP(路径反代值);
 		}
@@ -11560,6 +11575,7 @@ export const __testPerformanceHelpers = {
 	创建下行Grain发送器,
 	脱敏查询串,
 	脱敏隧道路径,
+	分类敏感隧道路径,
 	读取config_JSON,
 	读取有限请求体,
 	SS首包最大字节,

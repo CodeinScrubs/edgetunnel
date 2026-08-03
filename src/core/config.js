@@ -13,6 +13,7 @@ export const USER_CONFIG = {
 	ENABLE_KV_LOG: undefined,
 	OFF_LOG: undefined,
 	ENABLE_KV_PROXY_CACHE: undefined,
+	ALLOW_INVALID_UUID_DERIVATION: undefined,
 	PRELOAD_RACE_DIAL: undefined,
 	CONNECT_TIMEOUT_MS: undefined,
 	DNS_TIMEOUT_MS: undefined,
