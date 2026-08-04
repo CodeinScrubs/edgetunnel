@@ -129,7 +129,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-04 src:2692a25c8740 panel:917eadd8';
+const Version = '2026-08-04 src:c68e25a7441f panel:179ec79f';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -10842,6 +10842,8 @@ export const __testPerformanceHelpers = {
 	脱敏查询串,
 	脱敏隧道路径,
 	分类敏感隧道路径,
+	创建预认证累积器,
+	sha224,
 	读取config_JSON,
 	读取有限请求体,
 	SS首包最大字节,

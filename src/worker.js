@@ -11515,6 +11515,8 @@ export const __testPerformanceHelpers = {
 	脱敏查询串,
 	脱敏隧道路径,
 	分类敏感隧道路径,
+	创建预认证累积器,
+	sha224,
 	读取config_JSON,
 	读取有限请求体,
 	SS首包最大字节,

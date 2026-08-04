@@ -242,4 +242,47 @@ for (const file of BUILDS) {
 		`${file}: an SS decrypt failure must fail the transport, not close it as a clean success`);
 }
 
+
+// A production capture showed one connection rejected with "Invalid inner header". Since every connection
+// in that capture came from the operator's OWN client, the first question was whether the version guard --
+// which was moved AHEAD of the length check -- could reject a legitimately fragmented header. It cannot,
+// but "cannot" is worth proving rather than reasoning about, because a Trojan header's first byte is a hex
+// character (0x33), i.e. NOT the zero the guard demands, so VLESS reports invalid on byte one. The
+// accumulator only concludes invalid when BOTH parsers do, and Trojan still says need_more -- that
+// interaction is the load-bearing part and it is not obvious from either parser alone.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const UUID = '8c9b1f2e-4a6d-4b31-9f27-1c3d5e7a9b04';
+	const hex = UUID.replace(/-/g, '');
+	const uuidBytes = new Uint8Array(16);
+	for (let i = 0; i < 16; i++) uuidBytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+	const host = new TextEncoder().encode('example.com');
+
+	const v = new Uint8Array(23 + host.length + 3);
+	v[0] = 0; v.set(uuidBytes, 1); v[17] = 0; v[18] = 1; v[19] = 0x01; v[20] = 0xbb;
+	v[21] = 2; v[22] = host.length; v.set(host, 23); v.set([9, 8, 7], 23 + host.length);
+	for (let cut = 1; cut < v.length; cut++) {
+		const acc = H.创建预认证累积器(UUID);
+		const first = acc.推入(v.subarray(0, cut));
+		assert.notEqual(first.状态, 'invalid', `a 魏烈思 header split at byte ${cut} must accumulate, not be rejected`);
+		assert.equal(acc.推入(v.subarray(cut)).状态, 'ok', `a 魏烈思 header split at byte ${cut} must complete`);
+	}
+
+	const pw = new TextEncoder().encode(H.sha224(UUID));
+	const t = new Uint8Array(65 + host.length + 3);
+	t.set(pw.subarray(0, 56), 0); t[56] = 0x0d; t[57] = 0x0a;
+	t[58] = 1; t[59] = 3; t[60] = host.length; t.set(host, 61);
+	t[61 + host.length] = 0x01; t[62 + host.length] = 0xbb; t[63 + host.length] = 0x0d; t[64 + host.length] = 0x0a;
+	assert.notEqual(t[0], 0, 'this test is only meaningful while a 木马 header does not start with 0');
+	for (let cut = 1; cut < t.length; cut++) {
+		const acc = H.创建预认证累积器(UUID);
+		assert.notEqual(acc.推入(t.subarray(0, cut)).状态, 'invalid',
+			`a 木马 header split at byte ${cut} must accumulate: 魏烈思 calls byte one invalid, so only 木马 saying need_more keeps it alive`);
+	}
+
+	// Genuinely non-tunnel data must still be rejected once both parsers can decide.
+	const junk = new Uint8Array(64).fill(0x41);
+	assert.equal(H.创建预认证累积器(UUID).推入(junk).状态, 'invalid', 'data that is neither protocol must be rejected');
+}
+
 console.log('pre-auth fragmentation tests passed');
