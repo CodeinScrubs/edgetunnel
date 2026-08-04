@@ -275,10 +275,23 @@ import { join } from 'node:path';
 	assert.match(source, /offset \+ chunk\.byteLength > XHTTP_FIRST_PACKET_MAX_BYTES/, 'XHTTP cap must be checked before growing the first-packet buffer');
 	assert.match(source, /typeof event\.data === 'string'/, 'WebSocket tunnel must explicitly reject text frames');
 	assert.match(source, /async handshakeTls13[\s\S]*?extractLeafCertificate\(message\.body, 1\)/, 'TLS 1.3 certificate parsing must skip the certificate_request_context byte');
+	// The worker stays quiet by default: ungated console output is log volume on every request and a
+	// fingerprint. EXACTLY ONE exception is allowed -- the uncaught-exception event. log() is DEBUG-gated, so
+	// at the recommended production DEBUG=0 a crash otherwise becomes a camouflage 200 with no signal at all,
+	// which is how a ReferenceError once made /locations and /robots.txt silently unreachable while every gate
+	// stayed green. That single line is the difference between "something throws" and no evidence.
+	const 允许的未捕获事件 = /console\.error\(JSON\.stringify\(\{ ev: 'uncaught',/;
 	const ungatedConsoleWarnings = source
 		.split('\n')
-		.filter(line => /console\.(?:warn|error)\(/.test(line) && !/if \(调试日志打印\) console\.(?:warn|error)\(/.test(line));
+		.filter(line => /console\.(?:warn|error)\(/.test(line)
+			&& !/if \(调试日志打印\) console\.(?:warn|error)\(/.test(line)
+			&& !允许的未捕获事件.test(line));
 	assert.deepEqual(ungatedConsoleWarnings, [], 'worker must not emit ungated console.warn/error output');
+	// ...and the one allowance must stay class-only. It is not DEBUG-gated, so it can never be permitted to
+	// carry a message, URL or header: messages in this file interpolate hostnames, paths and parsed bytes.
+	const 未捕获行 = source.split('\n').filter(line => 允许的未捕获事件.test(line));
+	assert.equal(未捕获行.length, 1, 'there must be exactly one always-on error event');
+	assert.ok(!/\.message|url|headers/i.test(未捕获行[0]), `the always-on error event must carry no request data: ${未捕获行[0].trim()}`);
 }
 
 {

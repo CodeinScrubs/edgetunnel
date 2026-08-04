@@ -900,6 +900,14 @@ export default {
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		} catch (顶层错误) {
 			try { log(`[fetch] Uncaught error: ${顶层错误?.message || 顶层错误}`); } catch (e) { }
+			// ALWAYS-ON, and deliberately minimal. log() is DEBUG-gated, so with the recommended production
+			// DEBUG=0 an unexpected exception became a camouflage 200 with no server-side signal whatsoever.
+			// That is not hypothetical here: a ReferenceError introduced during an earlier refactor took this
+			// exact path, and /locations and /robots.txt silently stopped working while every gate stayed green.
+			// One line on wrangler tail is the difference between "something throws" and no evidence at all.
+			// Error CLASS only -- a message can interpolate a hostname, a path or a parsed byte, and this event
+			// is not DEBUG-gated, so it must never be able to carry request data.
+			try { console.error(JSON.stringify({ ev: 'uncaught', cls: 顶层错误?.name || 'Error', build: String(Version) })); } catch (e) { }
 			try {
 				return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 			} catch (e) {

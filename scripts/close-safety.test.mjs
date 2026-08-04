@@ -71,4 +71,41 @@ for (const file of BUILDS) {
 	}
 }
 
+
+// WHY the grain sender and the BYOB reader allocate a fresh buffer instead of reusing a pool.
+// A recurring "optimization" suggestion is to rotate two buffers and rely on the flush promise to know the
+// previous one is free. That is wrong for the XHTTP and gRPC bridges: their send() calls controller.enqueue()
+// and returns, so the promise proves ENQUEUE completion, not CONSUMPTION -- the stream queue still holds the
+// view. Reusing the buffer then rewrites bytes the client has not read yet.
+//
+// Proven against a real ReadableStream rather than argued: enqueue a view, mutate its buffer, and read back.
+{
+	let ctrl;
+	const rs = new ReadableStream({ start(c) { ctrl = c; } });
+	const buf = new Uint8Array([1, 1, 1, 1]);
+	ctrl.enqueue(buf);
+	buf.set([9, 9, 9, 9]);           // exactly what a two-buffer pool does on the next grain
+	ctrl.enqueue(new Uint8Array([2, 2, 2, 2]));
+	ctrl.close();
+	const reader = rs.getReader();
+	const got = [];
+	for (;;) { const { done, value } = await reader.read(); if (done) break; got.push(Array.from(value)); }
+	assert.deepEqual(got[0], [9, 9, 9, 9],
+		'enqueue retains the VIEW: this asserts the hazard exists, so buffer pooling in the grain sender or the ' +
+		'BYOB path would corrupt already-queued response data. Fresh allocation there is correctness, not waste.');
+}
+
+// The top-level catch turns any unexpected exception into the camouflage page. Its only diagnostic used to be
+// DEBUG-gated log(), so at the recommended production DEBUG=0 a crash produced a clean 200 and no signal --
+// which is how a ReferenceError once made /locations and /robots.txt silently unreachable with every gate green.
+for (const file of BUILDS) {
+	const src = readFileSync(file, 'utf8');
+	assert.match(src, /console\.error\(JSON\.stringify\(\{ ev: 'uncaught', cls: 顶层错误\?\.name \|\| 'Error', build: String\(Version\) \}\)\)/,
+		`${file}: an uncaught exception must emit one always-on event, independent of DEBUG`);
+	// It must stay a CLASS only. This event is not DEBUG-gated, so it can never be allowed to carry a message,
+	// URL or header -- messages here interpolate hostnames, paths and parsed bytes.
+	assert.doesNotMatch(src, /ev: 'uncaught'[^)]*顶层错误\?\.message/,
+		`${file}: the always-on error event must not include the exception message`);
+}
+
 console.log('close-safety tests passed');

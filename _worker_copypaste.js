@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-03 src:d9a979a60422 copypaste:82bf8092
+// Build: 2026-08-04 src:283e1670f431 copypaste:de88c30c
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-03 src:d9a979a60422 copypaste:82bf8092';
+const Version = '2026-08-04 src:283e1670f431 copypaste:de88c30c';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1014,6 +1014,14 @@ export default {
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 		} catch (顶层错误) {
 			try { log(`[fetch] Uncaught error: ${顶层错误?.message || 顶层错误}`); } catch (e) { }
+			// ALWAYS-ON, and deliberately minimal. log() is DEBUG-gated, so with the recommended production
+			// DEBUG=0 an unexpected exception became a camouflage 200 with no server-side signal whatsoever.
+			// That is not hypothetical here: a ReferenceError introduced during an earlier refactor took this
+			// exact path, and /locations and /robots.txt silently stopped working while every gate stayed green.
+			// One line on wrangler tail is the difference between "something throws" and no evidence at all.
+			// Error CLASS only -- a message can interpolate a hostname, a path or a parsed byte, and this event
+			// is not DEBUG-gated, so it must never be able to carry request data.
+			try { console.error(JSON.stringify({ ev: 'uncaught', cls: 顶层错误?.name || 'Error', build: String(Version) })); } catch (e) { }
 			try {
 				return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 			} catch (e) {
