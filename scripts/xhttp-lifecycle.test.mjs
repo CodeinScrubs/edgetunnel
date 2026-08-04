@@ -120,7 +120,7 @@ for (const file of BUILDS) {
 
 	// Buffered downlink bytes must survive a read error. flush() used to be the last statement INSIDE the
 	// read try, so an error skipped it and a small response fragment was silently discarded.
-	assert.match(src, /\} catch \(err\) \{ readError = err \}[\s\S]{0,1400}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
+	assert.match(src, /readError = 终止错误 \|\| err;[\s\S]{0,1600}?try \{ await 下行发送器\.flush\(\); \}[\s\S]{0,120}?catch \(flushErr\) \{ if \(!readError\) readError = flushErr; \}/,
 		`${file}: the final flush must run outside the read try, so accepted bytes are not lost on error`);
 
 	// The SAME bug existed on the gRPC path, which is the default transport here — so it was the widest-reaching
@@ -150,6 +150,13 @@ for (const file of BUILDS) {
 	assert.doesNotMatch(src, /'grpc-status':/, `${file}: grpc-status must not be sent in the initial headers`);
 	assert.match(src, /'Content-Type': 'application\/grpc'/, `${file}: the gRPC content type must remain`);
 
+
+	// FIRST WRITER WINS on the terminal cause. A watchdog records the specific reason and THEN cancels the
+	// reader, so the pending read rejects with the runtime's generic "Stream was cancelled." -- which used to
+	// overwrite it. Production proved the loss: a close carried reason=first_byte_timeout with
+	// err="Stream was cancelled.", i.e. the classification survived and the diagnosis did not.
+	assert.match(src, /readError = 终止错误 \|\| err;/,
+		`${file}: a recorded terminal cause must survive the reader cancellation it triggered`);
 	// Regression guard: the old shape must not come back.
 	assert.doesNotMatch(src, /if \(!是流取消错误\(error\) && !\(pipeMeta\?\.wrapper\?\.客户端已关闭\)\) log\(`\[Stream pipe\][^\n]*\n\s*closeSocketQuietly\(webSocket\);/,
 		`${file}: the remote-read catch is swallowing failures again`);

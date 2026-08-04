@@ -3807,6 +3807,11 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		const 本次首包数据 = 本次发送首包 ? rawData : null;
 
 		const 当前连接任务 = (async () => {
+			// Clock THIS attempt. 拨号开始毫秒 is stamped once at the top of forwardataTCP, so after a direct
+			// failure the relay inherited that elapsed time: production logged a 4ms relay as 854ms because the
+			// direct dial had already spent 850ms. Read from that field, the fastest relays rank worst exactly
+			// when a fallback is needed. Both numbers are kept, under names that mean what they say.
+			const 反代尝试开始毫秒 = remoteConnWrapper?.追踪 ? Date.now() : 0;
 			追踪拨号尝试(remoteConnWrapper.追踪);
 			remoteConnWrapper.反代首字节回调 = null;
 			remoteConnWrapper.反代无数据回调 = null;
@@ -3865,7 +3870,12 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			// Clear any close hint the superseded (direct) pipe left behind — e.g. 'first_byte_timeout' — so a
 			// successful ProxyIP takeover isn't mis-reported with the old route's failure reason.
 			remoteConnWrapper.closeHint = null;
-			追踪记录路由(remoteConnWrapper.追踪, proxyType || 'proxyip', null, 拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
+			// Time THIS attempt, not the whole forwardataTCP call. 拨号开始毫秒 is set once at the top, so after a
+			// direct failure the relay's dial_ms included the failed attempt: production logged a 4ms relay as
+			// 854ms because the direct dial had already burned 850ms. Any endpoint ranking or timeout tuning read
+			// from that field would rate the fastest relays worst, precisely when a fallback was needed.
+			追踪记录路由(remoteConnWrapper.追踪, proxyType || 'proxyip', null, 反代尝试开始毫秒 ? Date.now() - 反代尝试开始毫秒 : null,
+				拨号开始毫秒 ? Date.now() - 拨号开始毫秒 : null);
 			if (旧远端Socket && 旧远端Socket !== newSocket) { closeRemoteSocketQuietly(旧远端Socket); }
 			// Only close the client transport when THIS socket is still the current one. A later reconnect
 			// (e.g. this ProxyIP socket dies on its first uplink write → retryConnect installs a replacement)
@@ -5384,7 +5394,14 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, fi
 				重置空闲计时器();
 			}
 		}
-	} catch (err) { readError = err }
+	} catch (err) {
+		// FIRST WRITER WINS. A watchdog records the authoritative cause (remote first-byte timeout, remote idle
+		// timeout) and THEN cancels the reader; the pending read consequently rejects with the runtime's generic
+		// "Stream was cancelled.", which used to overwrite it. Production proved the loss: a close event carried
+		// reason=first_byte_timeout alongside err="Stream was cancelled." -- the classification survived and the
+		// diagnosis did not, which is the half you need to tell a blackholed relay from a client that vanished.
+		readError = 终止错误 || err;
+	}
 	// Flush OUTSIDE the try. This used to be the last statement inside it, so a read error jumped straight to
 	// the catch and the grain sender's buffered bytes were never even handed to the transport.
 	// On WS this genuinely rescues them: send() puts bytes on the wire immediately. On the XHTTP/gRPC bridges
@@ -7508,7 +7525,12 @@ function 是流取消错误(err) {
 }
 // `expected:true` means a normal lifecycle end, NOT a tunnel fault. first_byte_timeout is deliberately absent
 // (a fired first-byte watchdog = a blackholed route worth surfacing), as are error / queue_overflow.
-const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'remote_eof_no_data', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel', 'idle_timeout']);
+// 'idle_timeout' is NOT here. The idle watchdog records a terminal error and fails the client transport, so
+// it is a detected relay stall, not a lifecycle completion. Listing it as expected would have excluded every
+// future mid-stream stall from failure metrics while the client was still receiving a transport error --
+// the same disagreement between what the client is told and what the operator is shown that first_byte_timeout
+// already avoids by being absent from this set.
+const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'remote_eof_no_data', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel']);
 function 分类关闭原因(wrapper, err) {
 	if (wrapper?.closeHint) return { reason: wrapper.closeHint, expected: 预期关闭原因集.has(wrapper.closeHint) };
 	if (wrapper?.客户端已关闭) return { reason: 'client_cancel', expected: true };
@@ -7610,10 +7632,12 @@ function 更新追踪速率峰值(s, now = Date.now()) {
 	return { upBps, downBps, moved: !!(upD || downD) };
 }
 function 追踪记录目标(s, host, port) { if (s && !s.target) { s.target = host; s.port = Number(port) || null; } }
-function 追踪记录路由(s, route, endpoint, dialMs) {
+// dialMs times THIS attempt; totalSetupMs (optional) times everything since forwardataTCP began, including a
+// failed direct dial. One field cannot mean both -- conflating them is what made a 4ms relay read as 854ms.
+function 追踪记录路由(s, route, endpoint, dialMs, totalSetupMs = null) {
 	if (!s) return;
 	s.route = route; if (endpoint) s.endpoint = endpoint; if (dialMs != null) s.dialMs = dialMs;
-	追踪发射(s, 'route', { route, endpoint: endpoint || s.endpoint || null, dial_ms: dialMs ?? null, target: s.target, port: s.port });
+	追踪发射(s, 'route', { route, endpoint: endpoint || s.endpoint || null, dial_ms: dialMs ?? null, total_setup_ms: totalSetupMs ?? null, target: s.target, port: s.port });
 }
 function 追踪拨号尝试(s) { if (s) s.dialAttempts++; }
 function 追踪拨号失败(s, route, ms, err) {
@@ -7664,6 +7688,11 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 	更新追踪速率峰值(s); // fold in the final partial interval so a sub-heartbeat connection reports a real peak
 	const dur = Math.round(Date.now() - s.t0);
 	const activeMs = s.lastActivityAt && s.firstActivityAt ? Math.max(1, s.lastActivityAt - s.firstActivityAt) : 0;
+	// A single-chunk response has identical first/last activity timestamps, so the Math.max(1, ...) floor turns
+	// it into a 1ms window and the rate becomes bytes*1000. Production showed 1,934,500 bps for a 3.8 KB reply,
+	// on 20 of 277 closes. A number that large is not a slightly-off measurement, it is arithmetic noise that
+	// invites exactly the wrong tuning conclusion, so report nothing rather than something invented.
+	const 有效活跃采样 = activeMs >= 100 && (s.chunksDown | 0) >= 2;
 	let q = null;
 	try { q = s.队列统计 ? s.队列统计() : null; } catch (e) { }
 	追踪发射(s, 'close', {
@@ -7671,7 +7700,7 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 		ttfb_ms: s.ttfbMs, dial_ms: s.dialMs,
 		up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown, init_write_b: s.initialWriteBytes,
 		life_down_bps: dur > 0 ? Math.round(s.bytesDown * 1000 / dur) : 0,
-		active_down_bps: activeMs > 0 ? Math.round(s.bytesDown * 1000 / activeMs) : 0,
+		active_down_bps: 有效活跃采样 ? Math.round(s.bytesDown * 1000 / activeMs) : null,
 		peak_down_bps: s.peakDownBps, peak_up_bps: s.peakUpBps,
 		dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
 		...(errText ? { err: errText } : {}),

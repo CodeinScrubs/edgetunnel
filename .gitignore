@@ -57,3 +57,9 @@ src_static_ui/capture3*.json
 src_static_ui/capture4*.json
 src_static_ui/capture5*.json
 src_static_ui/capture6*.json
+
+# Tail captures contain client IPs, destination hostnames and relay endpoints.
+*.log
+log.txt
+log.jsonl
+src_static_ui/log.txt

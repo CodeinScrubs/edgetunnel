@@ -913,7 +913,11 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	assert.deepEqual(classifyClose({ closeHint: 'remote_eof' }, null), { reason: 'remote_eof', expected: true });
 	assert.deepEqual(classifyClose({ closeHint: 'remote_eof_no_data' }, null), { reason: 'remote_eof_no_data', expected: true });
 	assert.deepEqual(classifyClose({ closeHint: 'client_abort' }, null), { reason: 'client_abort', expected: true });
-	assert.deepEqual(classifyClose({ closeHint: 'idle_timeout' }, null), { reason: 'idle_timeout', expected: true });
+	// idle_timeout is UNexpected, for the same reason first_byte_timeout is. The idle watchdog records a
+	// terminal error and fails the client transport, so the client is told the tunnel failed -- classifying
+	// it as an expected lifecycle end would hide every future mid-stream relay stall from failure metrics
+	// while the client still received an error. What the operator sees must match what the client was told.
+	assert.deepEqual(classifyClose({ closeHint: 'idle_timeout' }, null), { reason: 'idle_timeout', expected: false });
 	assert.deepEqual(classifyClose({ closeHint: 'first_byte_timeout' }, null), { reason: 'first_byte_timeout', expected: false }, 'a first-byte timeout (blackhole) is surfaced as unexpected');
 }
 
