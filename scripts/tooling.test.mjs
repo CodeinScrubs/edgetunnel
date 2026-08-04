@@ -281,6 +281,33 @@ import { join } from 'node:path';
 	// which is how a ReferenceError once made /locations and /robots.txt silently unreachable while every gate
 	// stayed green. That single line is the difference between "something throws" and no evidence.
 	const 允许的未捕获事件 = /console\.error\(JSON\.stringify\(\{ ev: 'uncaught',/;
+
+	// fetchWithTimeout's deadline used to DEFAULT to the DoH budget (850ms), which is right for one DNS query
+	// and wrong for everything else -- and the argument was then forgotten three separate times, silently
+	// giving Telegram and both Cloudflare API calls an 850ms budget. Each was found only after the fact.
+	// The default is gone, so every call site must be explicit and forgetting one is a TypeError.
+	assert.match(source, /async function fetchWithTimeout\(resource, init = \{\}, timeoutMs, fetchImpl = fetch\)/,
+		'fetchWithTimeout must not default its deadline: a default correct for one caller is a trap');
+	assert.match(source, /throw new TypeError\('fetchWithTimeout requires an explicit positive timeoutMs'\)/,
+		'a missing deadline must fail loudly rather than inherit the DNS budget');
+	// And no call site may omit it. Scan forward from each call for the closing `, <deadline>);`.
+	{
+		const 换行 = String.fromCharCode(10);
+		const lines = source.split(换行);
+		const 缺少期限 = [];
+		lines.forEach((l, i) => {
+			if (!l.includes('fetchWithTimeout(') || l.includes('async function')) return;
+			const blk = lines.slice(i, i + 14).join(换行);
+			if (!/\}?,\s*[^;]+\);/.test(blk)) 缺少期限.push(i + 1);
+		});
+		assert.deepEqual(缺少期限, [], `these fetchWithTimeout call sites pass no deadline: ${缺少期限.join(', ')}`);
+	}
+	// A peak rate sampled inside one millisecond is bytes*1000, not a measurement. Suppressing it only in
+	// active_down_bps moved the fabricated number into peak_* instead of removing it.
+	assert.match(source, /const 采样有效 = \(now - s\.lastStatAt\) >= 100;/,
+		'peak rates must ignore sub-100ms sample windows');
+	assert.match(source, /if \(采样有效 && upBps > s\.peakUpBps\)/, 'peak up rate must be gated on a real sample');
+	assert.match(source, /if \(采样有效 && downBps > s\.peakDownBps\)/, 'peak down rate must be gated on a real sample');
 	const ungatedConsoleWarnings = source
 		.split('\n')
 		.filter(line => /console\.(?:warn|error)\(/.test(line)

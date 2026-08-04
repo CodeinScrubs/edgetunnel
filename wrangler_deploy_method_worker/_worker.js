@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-04 src:c0eb734f6ae1 wrangler:12c3b915
+// Build: 2026-08-04 src:2692a25c8740 wrangler:4b07e5ba
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -115,7 +115,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-04 src:c0eb734f6ae1 wrangler:12c3b915';
+const Version = '2026-08-04 src:2692a25c8740 wrangler:4b07e5ba';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -7695,7 +7695,7 @@ function 创建连接追踪器(transport, request = null, env = null) {
 		target: null, port: null, route: 'pending', endpoint: null, dialMs: null, ttfbMs: null,
 		bytesUp: 0, bytesDown: 0, chunksUp: 0, chunksDown: 0, initialWriteBytes: 0,
 		dialAttempts: 0, dialFailures: 0, fallbacks: 0,
-		lastStatUp: 0, lastStatDown: 0, lastStatAt: t0, peakUpBps: 0, peakDownBps: 0,
+		lastStatUp: 0, lastStatDown: 0, lastStatAt: t0, peakUpBps: 0, peakDownBps: 0, totalSetupMs: null,
 		firstActivityAt: 0, lastActivityAt: 0,
 		closeHint: null, closed: false, hb: null, 队列统计: null,
 	};
@@ -7740,12 +7740,17 @@ function 创建连接追踪器(transport, request = null, env = null) {
 // markers. Called from the heartbeat AND once more inside close — so a connection shorter than one heartbeat
 // interval still gets a real peak (the prior tracer reported peak_down_bps=0 for every sub-15s download).
 function 更新追踪速率峰值(s, now = Date.now()) {
+	// Same 1ms-denominator artifact that active_down_bps had: a sample taken in the same millisecond the bytes
+	// arrived divides by the Math.max(1, ...) floor and reports bytes*1000. Suppressing it in one field while
+	// leaving it in peak_* just moved the fabricated number somewhere less obvious. Only samples over a real
+	// interval may set a peak; the running rate is still returned for the stat line.
 	const elapsed = Math.max(1, now - s.lastStatAt);
+	const 采样有效 = (now - s.lastStatAt) >= 100;
 	const upD = s.bytesUp - s.lastStatUp, downD = s.bytesDown - s.lastStatDown;
 	const upBps = Math.round(upD * 1000 / elapsed), downBps = Math.round(downD * 1000 / elapsed);
 	s.lastStatAt = now; s.lastStatUp = s.bytesUp; s.lastStatDown = s.bytesDown;
-	if (upBps > s.peakUpBps) s.peakUpBps = upBps;
-	if (downBps > s.peakDownBps) s.peakDownBps = downBps;
+	if (采样有效 && upBps > s.peakUpBps) s.peakUpBps = upBps;
+	if (采样有效 && downBps > s.peakDownBps) s.peakDownBps = downBps;
 	return { upBps, downBps, moved: !!(upD || downD) };
 }
 function 追踪记录目标(s, host, port) { if (s && !s.target) { s.target = host; s.port = Number(port) || null; } }
@@ -7754,6 +7759,9 @@ function 追踪记录目标(s, host, port) { if (s && !s.target) { s.target = ho
 function 追踪记录路由(s, route, endpoint, dialMs, totalSetupMs = null) {
 	if (!s) return;
 	s.route = route; if (endpoint) s.endpoint = endpoint; if (dialMs != null) s.dialMs = dialMs;
+	// Retained on the tracer, not only emitted: a route event can be lost or sampled away in a busy tail,
+	// and the close line is the one that always arrives.
+	if (totalSetupMs != null) s.totalSetupMs = totalSetupMs;
 	追踪发射(s, 'route', { route, endpoint: endpoint || s.endpoint || null, dial_ms: dialMs ?? null, total_setup_ms: totalSetupMs ?? null, target: s.target, port: s.port });
 }
 function 追踪拨号尝试(s) { if (s) s.dialAttempts++; }
@@ -10693,8 +10701,10 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 			const r = await fetchWithTimeout(`${API}/accounts`, {
 				method: "GET",
 				headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
-			});
-			if (!r.ok) throw new Error(`Failed to fetch account: ${r.status}`);
+			}, 10000);
+			// Cancel a body we will never read: an unconsumed response holds one of the six outgoing-connection
+			// slots for the rest of the invocation.
+			if (!r.ok) { cancelBodyQuietly(r); throw new Error(`Failed to fetch account: ${r.status}`); }
 			const d = await 读取有限响应JSON(r, 256 * 1024, 10000, 'account API');
 			if (!d?.result?.length) throw new Error("Account not found");
 			const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
@@ -10717,9 +10727,8 @@ async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
 				}`,
 				variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
 			})
-		});
-
-		if (!res.ok) throw new Error(`Query failed: ${res.status}`);
+		}, 10000);
+		if (!res.ok) { cancelBodyQuietly(res); throw new Error(`Query failed: ${res.status}`); }
 		const result = await 读取有限响应JSON(res, 512 * 1024, 10000, 'GraphQL API');
 		if (result.errors?.length) throw new Error(result.errors[0].message);
 
@@ -11183,9 +11192,16 @@ async function socketOpenedWithTimeout(socket, timeoutMs, message) {
 	});
 }
 
-async function fetchWithTimeout(resource, init = {}, timeoutMs = DOH_LOOKUP_TIMEOUT_MS, fetchImpl = fetch) {
+// timeoutMs is REQUIRED. It used to default to DOH_LOOKUP_TIMEOUT_MS, which is right for one DNS query and
+// wrong for everything else -- and the argument was then forgotten three separate times, silently giving
+// Telegram and both Cloudflare API calls an 850ms budget. Each was found only after the fact. A default
+// that is correct for exactly one caller is a trap, so there is no default: forgetting it is now a loud
+// TypeError at the call site instead of a deadline nobody intended.
+async function fetchWithTimeout(resource, init = {}, timeoutMs, fetchImpl = fetch) {
+	const 期限 = Number(timeoutMs);
+	if (!Number.isFinite(期限) || 期限 <= 0) throw new TypeError('fetchWithTimeout requires an explicit positive timeoutMs');
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || DOH_LOOKUP_TIMEOUT_MS));
+	const timer = setTimeout(() => controller.abort(), 期限);
 	try {
 		return await fetchImpl(resource, { ...init, signal: controller.signal });
 	} finally {
