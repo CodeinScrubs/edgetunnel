@@ -280,6 +280,20 @@ import { join } from 'node:path';
 	// at the recommended production DEBUG=0 a crash otherwise becomes a camouflage 200 with no signal at all,
 	// which is how a ReferenceError once made /locations and /robots.txt silently unreachable while every gate
 	// stayed green. That single line is the difference between "something throws" and no evidence.
+
+	// A value STORED on the tracer but never emitted is invisible, and that is exactly what happened: the
+	// commit that added totalSetupMs said it was retained "because the close line always arrives" and then
+	// only ever put it on the route event. Assert the emission, not the assignment -- an assignment proves
+	// nothing about what an operator can actually see.
+	for (const kind of ['stat', 'close']) {
+		const i = source.indexOf(`追踪发射(s, '${kind}', {`);
+		assert.ok(i > 0, `the tracer must emit a ${kind} event`);
+		const seg = source.slice(i, source.indexOf('});', i));
+		assert.ok(seg.includes('total_setup_ms: s.totalSetupMs'),
+			`the ${kind} event must carry total_setup_ms; a route event can be sampled away, these two cannot`);
+		assert.ok(seg.includes('dial_ms: s.dialMs'),
+			`the ${kind} event must keep dial_ms alongside it -- the pair is what separates the attempt from the total`);
+	}
 	const 允许的未捕获事件 = /console\.error\(JSON\.stringify\(\{ ev: 'uncaught',/;
 
 	// fetchWithTimeout's deadline used to DEFAULT to the DoH budget (850ms), which is right for one DNS query

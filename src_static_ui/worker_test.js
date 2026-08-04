@@ -129,7 +129,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-04 src:c68e25a7441f panel:179ec79f';
+const Version = '2026-08-04 src:03cef265a16a panel:5339a2fc';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -947,7 +947,11 @@ export default {
 								if (response.ok) {
 									订阅内容 = await 读取有限响应文本(response, 2 * 1024 * 1024, 15000, 'subscription converter');
 									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
-								} else return new Response('Subscription conversion backend error: ' + response.statusText, { status: response.status });
+								} else {
+									// Nothing reads this body; an unconsumed response holds resources for the rest of the invocation.
+									cancelBodyQuietly(response);
+									return new Response('Subscription conversion backend error: ' + response.statusText, { status: response.status });
+								}
 							} catch (error) {
 								return new Response('Subscription conversion backend error: ' + error.message, { status: 403 });
 							}
@@ -7642,7 +7646,14 @@ function 是流取消错误(err) {
 // future mid-stream stall from failure metrics while the client was still receiving a transport error --
 // the same disagreement between what the client is told and what the operator is shown that first_byte_timeout
 // already avoids by being absent from this set.
-const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'remote_eof_no_data', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel']);
+// 'remote_eof_no_data' is NOT expected. The very same branch that sets it calls onNoData(), which scores the
+// endpoint as FAILED and advances the ProxyIP cursor -- so the worker was simultaneously telling endpoint
+// health "this route failed" and telling telemetry "this was normal". A remote that accepts a ClientHello
+// and closes without a ServerHello is a failed route however faithfully the FIN is relayed.
+// This changes CLASSIFICATION only: the client still receives the real FIN, because inventing a protocol
+// error there would break relay transparency (see the terminal block in connectStreams).
+// 'no_request_idle' stays expected -- a preconnect that never sent a request has nothing to fail.
+const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel']);
 function 分类关闭原因(wrapper, err) {
 	if (wrapper?.closeHint) return { reason: wrapper.closeHint, expected: 预期关闭原因集.has(wrapper.closeHint) };
 	if (wrapper?.客户端已关闭) return { reason: 'client_cancel', expected: true };
@@ -7723,7 +7734,7 @@ function 创建连接追踪器(transport, request = null, env = null) {
 			// connection from its last heartbeat even when no close arrives.
 			追踪发射(s, 'stat', {
 				secs: Math.round((Date.now() - t0) / 1000), route: s.route, endpoint: s.endpoint, target: s.target, port: s.port,
-				ttfb_ms: s.ttfbMs, dial_ms: s.dialMs,
+				ttfb_ms: s.ttfbMs, dial_ms: s.dialMs, total_setup_ms: s.totalSetupMs,
 				up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown,
 				up_bps: upBps, down_bps: downBps, peak_up_bps: s.peakUpBps, peak_down_bps: s.peakDownBps,
 				dial_attempts: s.dialAttempts, dial_failures: s.dialFailures, fallbacks: s.fallbacks,
@@ -7819,7 +7830,7 @@ function 追踪关闭(s, reasonOrWrapper, err) {
 	try { q = s.队列统计 ? s.队列统计() : null; } catch (e) { }
 	追踪发射(s, 'close', {
 		reason, expected, dur_ms: dur, route: s.route, target: s.target, port: s.port,
-		ttfb_ms: s.ttfbMs, dial_ms: s.dialMs,
+		ttfb_ms: s.ttfbMs, dial_ms: s.dialMs, total_setup_ms: s.totalSetupMs,
 		up_b: s.bytesUp, down_b: s.bytesDown, up_ch: s.chunksUp, down_ch: s.chunksDown, init_write_b: s.initialWriteBytes,
 		life_down_bps: dur > 0 ? Math.round(s.bytesDown * 1000 / dur) : 0,
 		active_down_bps: 有效活跃采样 ? Math.round(s.bytesDown * 1000 / activeMs) : null,
@@ -9392,6 +9403,9 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 			if (CF_JSON.UsageAPI) {
 				try {
 					const response = await fetchWithTimeout(CF_JSON.UsageAPI, {}, 10000);
+					// UsageAPI is an operator-supplied URL, so a 404 or an error page would otherwise be parsed as
+					// usage JSON. Check the status before reading, and release the body when it is not usable.
+					if (!response.ok) { cancelBodyQuietly(response); throw new Error(`usage API returned ${response.status}`); }
 					const Usage = await 读取有限响应JSON(response, 256 * 1024, 10000, 'usage API');
 					config_JSON.CF.Usage = Usage;
 				} catch (err) {
@@ -9459,7 +9473,12 @@ async function 生成随机IP(request, count = 16, 指定端口 = -1) {
 	const cfname = 运营商名称映射[运营商文件标识] || 'CF Official Preferred';
 	const cfport = [443, 2053, 2083, 2087, 2096, 8443];
 	let cidrList = [];
-	try { const res = await fetchWithTimeout(cidr_url, {}, 5000); cidrList = res.ok ? await 整理成数组(await 读取有限响应文本(res, 1024 * 1024, 5000, 'CIDR list')) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
+	try {
+		const res = await fetchWithTimeout(cidr_url, {}, 5000);
+		// The fallback branch used to drop the response on the floor without reading or cancelling it.
+		if (!res.ok) { cancelBodyQuietly(res); cidrList = ['104.16.0.0/13']; }
+		else cidrList = await 整理成数组(await 读取有限响应文本(res, 1024 * 1024, 5000, 'CIDR list'));
+	} catch { cidrList = ['104.16.0.0/13'] }
 
 	const generateRandomIPFromCIDR = (cidr) => {
 		const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength, 10);
@@ -9514,6 +9533,7 @@ async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
 		}, 3000);
 
 		if (!response.ok) {
+			cancelBodyQuietly(response);
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST} preferred-sub generator error: ${response.statusText}`);
 			return [优选IP, 其他节点LINK];
 		}

@@ -911,7 +911,14 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// Precise close hints from the watchdogs / EOF / abort: a clean remote EOF and a client abort are expected;
 	// a first-byte timeout is a blackhole signal and stays UNexpected so it surfaces.
 	assert.deepEqual(classifyClose({ closeHint: 'remote_eof' }, null), { reason: 'remote_eof', expected: true });
-	assert.deepEqual(classifyClose({ closeHint: 'remote_eof_no_data' }, null), { reason: 'remote_eof_no_data', expected: true });
+	// UNexpected, because the branch that sets this hint also calls onNoData(), which scores the endpoint as
+	// FAILED and advances the ProxyIP cursor. Marking it expected meant the worker told endpoint health
+	// "this route failed" and told telemetry "this was normal" about the same event. The client still
+	// receives the real FIN -- only the classification changed, because synthesising a protocol error there
+	// would break relay transparency.
+	assert.deepEqual(classifyClose({ closeHint: 'remote_eof_no_data' }, null), { reason: 'remote_eof_no_data', expected: false });
+	// ...while a preconnect that never sent a request has nothing to fail and stays expected.
+	assert.deepEqual(classifyClose({ closeHint: 'no_request_idle' }, null), { reason: 'no_request_idle', expected: true });
 	assert.deepEqual(classifyClose({ closeHint: 'client_abort' }, null), { reason: 'client_abort', expected: true });
 	// idle_timeout is UNexpected, for the same reason first_byte_timeout is. The idle watchdog records a
 	// terminal error and fails the client transport, so the client is told the tunnel failed -- classifying
