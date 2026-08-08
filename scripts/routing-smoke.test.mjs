@@ -390,6 +390,38 @@ globalThis.fetch = realFetch;
 	assert.equal(cls('/%zz').敏感, true, 'undecodable encoding must fail safe');
 }
 
+
+// EVERY application/grpc* variant must reach the gRPC handler. This exists because rejecting
+// `application/grpc-web` at the route -- on the theory that it was a protocol this worker does not
+// implement -- took real gRPC configs offline. The theory was wrong on the facts: grpc-web's binary framing
+// is the same 5-byte length prefix as grpc, the parser has always handled it, and xray's gun transport
+// sends that content type in ordinary use. The production capture used to justify the change was the
+// operator's OWN traffic. Deciding a content type is "unsupported" needs proof that no client sends it.
+{
+	const worker = (await import('../_worker_copypaste.js')).default;
+	const ctx2 = { waitUntil: () => { }, passThroughOnException: () => { } };
+	const prev = globalThis.fetch;
+	globalThis.fetch = async () => new Response('<html>Welcome to nginx!</html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+	const env2 = {
+		ADMIN: 'pw', KEY: 'k', UUID, URL: 'nginx', DEBUG: '0', OFF_LOG: '1',
+		KV: { get: async () => null, put: async () => { }, list: async () => ({ keys: [] }), delete: async () => { } },
+	};
+	const frame = new Uint8Array([0, 0, 0, 0, 3, 0x0a, 1, 0x41]);
+	const route = async (ct) => {
+		const res = await worker.fetch(new Request('https://t.example/', {
+			method: 'POST', headers: { 'content-type': ct }, body: frame, duplex: 'half',
+		}), env2, ctx2);
+		await res.text().catch(() => { });
+		return (res.headers.get('content-type') || '').includes('grpc') ? 'grpc' : 'other';
+	};
+	for (const ct of ['application/grpc', 'application/grpc-web', 'application/grpc-web+proto',
+		'application/grpc+proto', 'application/grpc-web-text', 'application/grpc; charset=utf-8']) {
+		assert.equal(await route(ct), 'grpc', `${ct} must reach the gRPC handler — real clients send these`);
+	}
+	assert.equal(await route('text/plain'), 'other', 'a non-gRPC content type must not enter the gRPC parser');
+	globalThis.fetch = prev;
+}
+
 // The chain-proxy path parses its own JSON and never calls the shared SOCKS account parser, so the port
 // bound added there did not cover it: -1, 1.5, 65536 and Infinity all passed isNaN() and were dialled.
 // Its catch also fell through to ordinary query parsing, so a malformed chain became a DIRECT dial.

@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-08 src:caaace8945b9 copypaste:7d57d965
+// Build: 2026-08-08 src:cc7ace096dd3 copypaste:39f5153d
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-08 src:caaace8945b9 copypaste:7d57d965';
+const Version = '2026-08-08 src:cc7ace096dd3 copypaste:39f5153d';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -521,11 +521,21 @@ export default {
 			// Sending it to the native framing parser spends real CPU discovering it cannot be parsed, once per
 			// request, and that is worst on a deployment whose PATH is unset. Turn it away at the route instead,
 			// with the same camouflage page any other unrecognised POST gets.
+			// Normalise the media type (strip ';charset=...'), then accept EVERY application/grpc* variant.
+			//
+			// grpc-web is NOT rejected here, and the attempt to reject it was a regression that broke real
+			// clients. The reasoning behind it was wrong on the facts: grpc-web's binary framing is the same
+			// 5-byte length prefix as grpc, this parser has always handled it, and xray's gun transport sends
+			// `application/grpc-web` in ordinary use -- the production capture that prompted the change was the
+			// operator's OWN traffic, not foreign probes. Turning it away served the camouflage page to a
+			// legitimate tunnel and took gRPC configs offline.
+			//
+			// The lesson worth keeping: "this content type is unsupported" needed proof that no client sends
+			// it, and the capture said the opposite. Anything under application/grpc goes to the gRPC handler;
+			// an unauthenticated peer is still rejected by the inner credential check, which is the layer that
+			// is actually allowed to decide who gets a tunnel.
 			const 媒体类型 = contentType.split(';', 1)[0].trim();
-			if (!命中XHTTP特征 && 媒体类型.startsWith('application/grpc-web')) {
-				return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
-			}
-			if (!命中XHTTP特征 && (媒体类型 === 'application/grpc' || 媒体类型.startsWith('application/grpc+'))) {
+			if (!命中XHTTP特征 && 媒体类型.startsWith('application/grpc')) {
 				log(`[gRPC] Matched request: ${脱敏隧道路径(url.pathname)}${脱敏查询串(url.search)}`);
 				return await 处理gRPC请求(request, userID);
 			}
