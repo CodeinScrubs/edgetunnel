@@ -149,4 +149,35 @@ for (const [标签, 获取写入器, 期望计数] of [
 await 静置();
 assert.deepEqual(unhandled, [], `queue produced ${unhandled.length} unhandled rejection(s)`);
 
+
+// The FIRST real application write had no deadline. 写入首包 bounds the initial packet, but ONLY when the
+// header already carries one -- and a browser preconnect authenticates with an EMPTY first packet, so the
+// ClientHello that arrives moments later came through this queue instead, where UPLINK_WRITE_TIMEOUT_MS
+// defaults to 0 and the write is bare. Nothing else could rescue it: 请求已发送 is set by 上行活动 AFTER the
+// write resolves, so the first-byte watchdog never armed. A wedged writer parked the invocation forever.
+//
+// The deadline therefore cannot be chosen once at construction. Both directions are asserted, because the
+// obvious "just add a timeout" fix would kill legitimately backpressured uploads.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const wedged = { write: () => new Promise(() => { }), releaseLock() { } };
+	const run = async (请求已发送) => {
+		const q = H.创建上行写入队列({
+			获取写入器: () => wedged, 释放写入器: () => { }, 关闭连接: () => { },
+			上行活动: () => { }, 写入开始: () => { }, 写入结束: () => { },
+			名称: 'test', 写入超时毫秒: 0,
+			获取本次写入超时毫秒: () => (请求已发送 ? 0 : 200),
+		});
+		let err = null;
+		const p2 = q.写入并等待(new Uint8Array([1, 2, 3]), true).catch((e) => { err = e; });
+		await Promise.race([p2, new Promise((r) => setTimeout(r, 700))]);
+		return err;
+	};
+	const first = await run(false);
+	assert.ok(first, 'a wedged FIRST application write must be bounded, or the invocation parks indefinitely');
+	assert.match(first.message, /remote write timed out/);
+	const later = await run(true);
+	assert.equal(later, null, 'a steady-state upload write must stay unbounded — backpressure is not a failure');
+}
+
 console.log('uplink queue tests passed');

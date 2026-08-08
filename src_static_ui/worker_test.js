@@ -129,7 +129,7 @@ function 解析显式UUID(value) {
 	return { status: 'valid', value: 规范, reason: null };
 }
 
-const Version = '2026-08-08 src:b17ea424c2cd panel:c7486105';
+const Version = '2026-08-08 src:0a23ea1580d5 panel:e1d52996';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -546,7 +546,11 @@ export default {
 				} else if (访问路径 === 'login') {
 					const cookies = request.headers.get('Cookie') || '';
 					const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-					if (authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
+					// Short-circuit on a missing cookie. Without this the pure-JS double MD5 ran on every anonymous
+					// /login hit, keyed on the caller's User-Agent -- remotely triggerable CPU and memoisation churn
+					// for a comparison whose answer is already known. The /locations branch guards this correctly;
+					// this one did not.
+					if (authCookie && authCookie === await MD5MD5(UA + 加密秘钥 + 管理员密码)) {
 						return new Response('Redirecting...', { status: 302, headers: { 'Location': '/admin' } });
 					}
 					if (request.method === 'POST') {
@@ -1246,7 +1250,14 @@ async function 处理XHTTP请求(request, yourUUID) {
 				},
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'XHTTP upload',
-				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env),
+				// The FIRST real application write inherits the initial-write bound. A preconnect authenticates
+				// with an empty first packet, so 写入首包 never sees one and the ClientHello that arrives later came
+				// through this queue with no deadline at all -- and 请求已发送 is only set after that write resolves,
+				// so the first-byte watchdog could not arm either. Steady-state uploads stay unbounded on purpose.
+				获取本次写入超时毫秒: () => remoteConnWrapper.请求已发送 === true
+					? getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+					: getInitialWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1956,7 +1967,14 @@ async function 处理gRPC请求(request, yourUUID) {
 				关闭连接,
 				写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 				名称: 'gRPC upload',
-				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+				最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env),
+				// The FIRST real application write inherits the initial-write bound. A preconnect authenticates
+				// with an empty first packet, so 写入首包 never sees one and the ClientHello that arrives later came
+				// through this queue with no deadline at all -- and 请求已发送 is only set after that write resolves,
+				// so the first-byte watchdog could not arm either. Steady-state uploads stay unbounded on purpose.
+				获取本次写入超时毫秒: () => remoteConnWrapper.请求已发送 === true
+					? getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+					: getInitialWriteTimeoutMs(getWorkerRequestContext(request).env)
 			});
 			if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -1979,7 +1997,17 @@ async function 处理gRPC请求(request, yourUUID) {
 					const { done, value } = 读取前已认证
 						? await reader.read()
 						: await readWithOperationTimeout(reader, Math.max(1, gRPC预认证.剩余毫秒()), 'gRPC pre-authentication timed out');
-					if (done) { if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`); 正常结束 = true; break; }
+					if (done) {
+						if (pending.byteLength !== 0) throw new Error(`gRPC request ended with an incomplete frame (${pending.byteLength}B pending)`);
+						// A half-delivered inner datagram is not a clean end. XHTTP already refuses this; gRPC
+						// silently discarded the tail and reported success, so a truncated DNS query vanished while
+						// the transport claimed the request completed. Same check, same reason, both transports.
+						if (isDnsQuery) {
+							const 未完帧 = (判断是否是木马 ? 木马UDP上下文 : 魏烈思UDP上下文)?.缓存;
+							if (未完帧?.byteLength) throw new Error(`gRPC ended with an incomplete UDP frame (${未完帧.byteLength}B)`);
+						}
+						正常结束 = true; break;
+					}
 					if (!value || value.byteLength === 0) continue;
 					let 待并入 = value instanceof Uint8Array ? value : new Uint8Array(value);
 					// Until the 魏烈思/木马 header authenticates (a remote socket exists, or this is the DNS path),
@@ -2078,7 +2106,10 @@ async function 处理gRPC请求(request, yourUUID) {
 				// A client-initiated stream cancellation ("Stream was cancelled.") is a normal gRPC lifecycle
 				// event, not a tunnel failure — don't log it at error level or record it as reason=error.
 				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) log(`[gRPC forwarding] Failed to process: ${err?.message || err}`);
-				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
+				// Classify BEFORE closing the tracer. The previous ordering called 追踪关闭(..., err) first and
+				// only then set closeHint, so the tracer had already finalised the event as reason=error while
+				// the transport went on to close the response cleanly -- the two halves of the worker disagreed
+				// about the same event, which is precisely the defect this classification exists to remove.
 				// Carry the failure into the finally so the response is errored rather than closed. Cancellation
 				// and our own teardown stay a clean close — those are not tunnel failures.
 				// A PRE-AUTHENTICATION rejection is not a tunnel failure. WS answers it with a 1008 policy close
@@ -2090,6 +2121,9 @@ async function 处理gRPC请求(request, yourUUID) {
 				// A POST-authentication failure still errors the stream -- that distinction is the whole point.
 				if (err?.预认证拒绝) { if (remoteConnWrapper.追踪 && !remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'preauth_reject'; }
 				else if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) 关闭原因 = err;
+				// Finalise the tracer only NOW, with the classification decided: a pre-auth rejection carries no
+				// error (it is policy working), a genuine failure carries its cause.
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err?.预认证拒绝 ? undefined : err);
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
@@ -2270,7 +2304,14 @@ async function 处理WS请求(request, yourUUID, url) {
 		},
 		写入开始: () => { remoteConnWrapper.已向远端发送数据 = true; remoteConnWrapper.活跃写入数 = (remoteConnWrapper.活跃写入数 | 0) + 1; }, 写入结束: () => { remoteConnWrapper.活跃写入数 = Math.max(0, (remoteConnWrapper.活跃写入数 | 0) - 1); }, 上行活动: () => { remoteConnWrapper.请求已发送 = true; remoteConnWrapper.记录上行活动?.(); }, 统计上行: remoteConnWrapper.追踪 ? (n) => 追踪上行(remoteConnWrapper.追踪, n) : undefined,
 		名称: 'WS upload',
-		最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+		最大字节: getUplinkQueueMaxBytes(getWorkerRequestContext(request)?.env), 最大条目: getUplinkQueueMaxItems(getWorkerRequestContext(request)?.env), 写入超时毫秒: getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env),
+				// The FIRST real application write inherits the initial-write bound. A preconnect authenticates
+				// with an empty first packet, so 写入首包 never sees one and the ClientHello that arrives later came
+				// through this queue with no deadline at all -- and 请求已发送 is only set after that write resolves,
+				// so the first-byte watchdog could not arm either. Steady-state uploads stay unbounded on purpose.
+				获取本次写入超时毫秒: () => remoteConnWrapper.请求已发送 === true
+					? getUplinkWriteTimeoutMs(getWorkerRequestContext(request).env)
+					: getInitialWriteTimeoutMs(getWorkerRequestContext(request).env)
 	});
 	if (remoteConnWrapper.追踪) remoteConnWrapper.追踪.队列统计 = 上行写入队列.获取统计;
 
@@ -5017,12 +5058,24 @@ async function WebSocket发送并等待(webSocket, payload, limits = null) {
 	}
 }
 
-function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
+function 创建上行写入队列({ 获取写入器, 释放写入器, 关闭连接, 上行活动, 写入开始, 写入结束, 统计上行, 名称 = 'Upload queue', 写入超时毫秒 = 0, 获取本次写入超时毫秒 = null, 最大字节 = 上行队列最大字节, 最大条目 = 上行队列最大条目 }) {
 	// 写入超时毫秒 > 0 arms an opt-in stuck-writer watchdog (UPLINK_WRITE_TIMEOUT_MS). Default 0 keeps the
 	// bare, un-timed write so a legitimately backpressured upload is never aborted.
-	const 执行远端写入 = 写入超时毫秒 > 0
-		? (w, chunk) => withOperationTimeout(w.write(chunk), 写入超时毫秒, `${名称}: remote write timed out`)
-		: (w, chunk) => w.write(chunk);
+	//
+	// 获取本次写入超时毫秒 exists because the deadline cannot be decided once, at construction. 写入首包
+	// bounds the initial packet -- but ONLY when the header already carries one. A browser preconnect
+	// authenticates with an EMPTY first packet, so the real first application write (the ClientHello that
+	// arrives moments later) came through this queue instead, and with UPLINK_WRITE_TIMEOUT_MS defaulting
+	// to 0 it was a bare write with no bound at all. Nothing else could rescue it either: 请求已发送 is set
+	// by 上行活动 AFTER the write resolves, so the first-byte watchdog never arms. A wedged writer there
+	// parked the invocation indefinitely. Choosing the deadline per write lets the first one inherit the
+	// initial-write bound while steady-state uploads stay deliberately unbounded.
+	const 执行远端写入 = (w, chunk) => {
+		const 本次超时 = Number(获取本次写入超时毫秒?.()) || Number(写入超时毫秒) || 0;
+		return 本次超时 > 0
+			? withOperationTimeout(w.write(chunk), 本次超时, `${名称}: remote write timed out`)
+			: w.write(chunk);
+	};
 	let chunks = [];
 	let head = 0;
 	let queuedBytes = 0;
@@ -10132,7 +10185,12 @@ function getRequestTunnelContext(request) {
 
 async function applyProxyParamsToTunnelContext(url, uuid, tunnelContext = emptyTunnelContext()) {
 	const { searchParams } = url;
-	const pathname = decodeURIComponent(url.pathname);
+	// decodeURIComponent THROWS on a malformed escape ('/%E0%A4%A'), and this runs on the routing path, so a
+	// scanner could turn a bad byte into an uncaught worker exception plus a camouflage 200. Malformed input
+	// is a rejection, not a crash; fall back to the raw path so routing still resolves deterministically.
+	let pathname;
+	try { pathname = decodeURIComponent(url.pathname); }
+	catch (e) { pathname = url.pathname; }
 	const pathLower = pathname.toLowerCase();
 
 	tunnelContext.proxyAccount = null;
@@ -10910,6 +10968,7 @@ export const __testPerformanceHelpers = {
 	分类敏感隧道路径,
 	创建预认证累积器,
 	sha224,
+	创建上行写入队列,
 	DIRECT_ROUTE_STATUS_CACHE,
 	getDirectRouteFailed,
 	recordDirectRouteFailure,
