@@ -1,7 +1,7 @@
 import { connect as cloudflareConnect } from 'cloudflare:sockets';
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-08 src:b1b4bfe379d6 wrangler:c5c90603
+// Build: 2026-08-08 src:b17ea424c2cd wrangler:89e7160f
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -115,7 +115,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-08 src:b1b4bfe379d6 wrangler:c5c90603';
+const Version = '2026-08-08 src:b17ea424c2cd wrangler:89e7160f';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -129,6 +129,15 @@ const HOSTS_LIST_CACHE = new Map();
 const DIRECT_ROUTE_STATUS_CACHE = new Map();
 const DIRECT_ROUTE_FAILURE_THRESHOLD = 2;
 const DIRECT_ROUTE_STATUS_TTL_MS = 10 * 60 * 1000;
+// How long the cache commits to the proxy before letting ONE connection try direct again. Without this the
+// cache was all-or-nothing: two transient direct failures pinned a host to the relay for the full ten
+// minutes with no re-test. That is bad twice over. It keeps traffic on the slower route long after the
+// blockage cleared, and -- because a relay is a different TLS peer -- it silently changes which server the
+// end-to-end TLS session terminates against, which a certificate-pinning app (the ChatGPT app, banking
+// apps) rejects outright. A transient blip therefore broke those apps for ten minutes at a time.
+// One probe per minute costs at most one extra dial on a genuinely blocked host, and restores the fast
+// direct path within a minute when the failure was temporary.
+const DIRECT_ROUTE_PROBE_INTERVAL_MS = 60 * 1000;
 const DIRECT_ROUTE_STATUS_MAX_ENTRIES = 512;
 function getDirectRouteFailed(key) {
 	if (!key) return false;
@@ -136,7 +145,17 @@ function getDirectRouteFailed(key) {
 	const entry = DIRECT_ROUTE_STATUS_CACHE.get(key);
 	if (!entry) return false;
 	if (now >= entry.expiresAt) { DIRECT_ROUTE_STATUS_CACHE.delete(key); return false; }
-	return entry.failures >= DIRECT_ROUTE_FAILURE_THRESHOLD;
+	if (entry.failures < DIRECT_ROUTE_FAILURE_THRESHOLD) return false;
+	// HALF-OPEN PROBE. Hand exactly one caller permission to try direct again once the probe interval has
+	// passed, and move the marker forward as we do so -- otherwise every concurrent connection in the isolate
+	// probes at once and a genuinely blocked host pays a stampede of doomed dials instead of one. A probe that
+	// reaches its first byte calls recordDirectRouteOk and clears the entry outright; one that fails calls
+	// recordDirectRouteFailure, which re-arms both the expiry and the next probe.
+	if (now >= (entry.nextProbeAt || 0)) {
+		entry.nextProbeAt = now + DIRECT_ROUTE_PROBE_INTERVAL_MS;
+		return false;
+	}
+	return true;
 }
 function recordDirectRouteFailure(key) {
 	if (!key) return;
@@ -144,7 +163,7 @@ function recordDirectRouteFailure(key) {
 	const entry = DIRECT_ROUTE_STATUS_CACHE.get(key);
 	const failures = (entry && now < entry.expiresAt ? entry.failures : 0) + 1;
 	DIRECT_ROUTE_STATUS_CACHE.delete(key);
-	DIRECT_ROUTE_STATUS_CACHE.set(key, { failures, expiresAt: now + DIRECT_ROUTE_STATUS_TTL_MS });
+	DIRECT_ROUTE_STATUS_CACHE.set(key, { failures, expiresAt: now + DIRECT_ROUTE_STATUS_TTL_MS, nextProbeAt: now + DIRECT_ROUTE_PROBE_INTERVAL_MS });
 	while (DIRECT_ROUTE_STATUS_CACHE.size > DIRECT_ROUTE_STATUS_MAX_ENTRIES) DIRECT_ROUTE_STATUS_CACHE.delete(DIRECT_ROUTE_STATUS_CACHE.keys().next().value);
 }
 function recordDirectRouteOk(key) {
@@ -11681,6 +11700,10 @@ export const __testPerformanceHelpers = {
 	分类敏感隧道路径,
 	创建预认证累积器,
 	sha224,
+	DIRECT_ROUTE_STATUS_CACHE,
+	getDirectRouteFailed,
+	recordDirectRouteFailure,
+	recordDirectRouteOk,
 	读取config_JSON,
 	读取有限请求体,
 	SS首包最大字节,

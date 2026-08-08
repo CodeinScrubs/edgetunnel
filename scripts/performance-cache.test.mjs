@@ -483,4 +483,36 @@ function decodeDnsQuestion(packet) {
 	assert.deepEqual(parseDnsTcpFrames(new Uint8Array([0, 5, 1, 2])), [], 'a truncated frame is not emitted');
 }
 
+
+// The direct-route failure cache used to be all-or-nothing: two transient failures pinned a host to the
+// relay for a full ten minutes with no re-test. That is bad twice over. It keeps traffic on the slower route
+// long after the blockage cleared, and -- because a relay is a DIFFERENT TLS PEER -- it silently changes
+// which server the end-to-end TLS session terminates against. A certificate-pinning app (the ChatGPT app,
+// banking apps) rejects that outright, so one transient blip broke those apps for ten minutes at a time.
+{
+	const { __testPerformanceHelpers: H } = await import('../_worker_copypaste.js');
+	const failed = H.getDirectRouteFailed, fail = H.recordDirectRouteFailure, ok = H.recordDirectRouteOk;
+	const CACHE = H.DIRECT_ROUTE_STATUS_CACHE;
+	const K = 'probe.example:443';
+	CACHE.delete(K);
+
+	assert.equal(failed(K), false, 'an unknown host must go direct');
+	fail(K);
+	assert.equal(failed(K), false, 'one failure is under the threshold, so still direct');
+	fail(K);
+	assert.equal(failed(K), true, 'at the threshold it must use the relay -- and must NOT probe instantly');
+
+	CACHE.get(K).nextProbeAt = Date.now() - 1;          // stand in for the probe interval elapsing
+	assert.equal(failed(K), false, 'after the interval exactly one caller may retry direct');
+	assert.equal(failed(K), true, 'and the next caller must not: a blocked host gets one probe, not a stampede');
+
+	CACHE.get(K).nextProbeAt = Date.now() - 1;
+	assert.equal(failed(K), false, 'probes keep recurring while the entry lives');
+
+	ok(K);
+	assert.equal(failed(K), false, 'a probe that reaches its first byte restores the fast path immediately');
+	assert.equal(CACHE.has(K), false, 'and clears the entry outright');
+	CACHE.delete(K);
+}
+
 console.log('performance cache tests passed');
