@@ -130,8 +130,20 @@ for (const file of BUILDS) {
 	assert.match(src, /const 关闭连接 = \(错误\) => \{/, `${file}: 关闭连接 must be able to report a failure`);
 	assert.match(src, /if \(错误\) \{ try \{ controller\.error\(错误 instanceof Error \? 错误 : new Error\(String\(错误 \|\| 'gRPC forwarding failed'\)\)\) \} catch \(e\) \{ \} \}\s*\n\s*else \{ try \{ controller\.close\(\) \} catch \(e\) \{ \} \}/,
 		`${file}: a gRPC failure must error the response; only a clean end may close it`);
-	assert.match(src, /if \(!是流取消错误\(err\) && !remoteConnWrapper\.客户端已关闭\) 关闭原因 = err;/,
-		`${file}: the swallowed gRPC error must reach the finally, and cancellation must stay a clean close`);
+	// Classification is by STATE, not by which throw site remembered to tag itself. Tagging reached 2 of at
+	// least 5 pre-auth throws -- the incomplete outer frame, the empty-frame flood, the compression-flag check
+	// and the pre-auth read timeout were all still reported as tunnel failures. One flag cannot be forgotten
+	// by a throw that does not know it exists, which is the only shape that survives a new parser error.
+	assert.match(src, /let gRPC内层认证完成 = false;/, `${file}: gRPC must track authentication explicitly`);
+	assert.match(src, /gRPC内层认证完成 = true;/, `${file}: the flag must be set at the authentication boundary`);
+	assert.match(src, /const 预认证拒绝 = !客户端结束 && !gRPC内层认证完成 && !isDnsQuery;/,
+		`${file}: a failure is a pre-auth rejection iff we had not authenticated -- not iff someone tagged it`);
+	assert.match(src, /cancelReaderQuietly\(reader, 'gRPC pre-auth rejected'\);/,
+		`${file}: a rejected peer's request body must be cancelled, not merely have its lock released`);
+	assert.match(src, /} else if \(!客户端结束\) 关闭原因 = err;/,
+		`${file}: an authenticated failure must still become the terminal cause`);
+	assert.doesNotMatch(src, /标记预认证拒绝/,
+		`${file}: per-throw-site tagging must be gone; it is the fixed-one-of-N shape this replaces`);
 	assert.match(src, /关闭连接\(关闭原因\);/, `${file}: the gRPC finally must pass the failure through`);
 	assert.match(src, /new Error\(String\(error \|\| 'gRPC forwarding failed'\)\)/, `${file}: the gRPC bridge needs fail()`);
 	// fail() drains before erroring so the ordering is right for whatever the runtime has already pulled.
@@ -164,11 +176,8 @@ for (const file of BUILDS) {
 	// of them across the two logs -- unauthenticated peers making the worker look broken and burying the real
 	// errors. Nothing is authenticated there, no socket is opened and no byte is relayed, so no client is owed
 	// a failure signal. A POST-authentication failure must still error: that distinction is the whole point.
-	assert.match(src, /function 标记预认证拒绝\(err\)/, `${file}: a pre-auth rejection must be distinguishable from a tunnel failure`);
-	assert.match(src, /if \(预认证结果\.状态 === 'invalid'\) throw 标记预认证拒绝\(/,
-		`${file}: the gRPC inner-header rejection must be marked as pre-auth`);
-	assert.match(src, /if \(err\?\.预认证拒绝\) \{[^}]*preauth_reject/,
-		`${file}: a marked pre-auth rejection must end the gRPC response cleanly, not error it`);
+	// preauth_reject stays a named, EXPECTED close: policy working, visible as probe volume, absent from
+	// failure metrics. What changed is how it is decided -- see the state assertions above.
 	assert.match(src, /'runtime_cancel', 'preauth_reject'\]/,
 		`${file}: preauth_reject is policy working, so it must not sit in failure metrics`);
 	// The pre-auth frame budget is an amplifier: while unauthenticated the reader takes ONE frame per pass,

@@ -198,7 +198,7 @@ function decodeDnsQuestion(packet) {
 			['2.2.2.2', '8443'],
 			['bad-port', 70000],
 			['bad host name', 443],
-			['2001:db8::1', 443],
+			['[2606:4700:4700::1111]', 443],
 			['3.3.3.3', 443],
 			['4.4.4.4', 443],
 			['5.5.5.5', 443],
@@ -216,7 +216,7 @@ function decodeDnsQuestion(packet) {
 	assert.deepEqual(record.endpoints[1], ['2.2.2.2', 8443]);
 	assert.equal(record.endpoints.some(([host]) => host === 'bad-port'), false);
 	assert.equal(record.endpoints.some(([host]) => host === 'bad host name'), false);
-	assert.ok(record.endpoints.some(([host]) => host === '2001:db8::1'));
+	assert.ok(record.endpoints.some(([host]) => host === '[2606:4700:4700::1111]'));
 	assert.equal(record.health['2.2.2.2:8443'].latencyMs, 120);
 }
 

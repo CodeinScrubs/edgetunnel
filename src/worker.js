@@ -401,7 +401,17 @@ export default {
 			if (代理配置错误) return 代理配置错误;
 			const referer = request.headers.get('Referer') || '';
 			const 命中XHTTP特征 = referer.includes('x_padding');
-			if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
+			// Match the MEDIA TYPE, not a prefix. startsWith('application/grpc') also matches
+			// 'application/grpc-web', which is a DIFFERENT wire protocol this worker does not implement -- and
+			// the production capture that recorded 648 exceededCpu outcomes was entirely grpc-web traffic.
+			// Sending it to the native framing parser spends real CPU discovering it cannot be parsed, once per
+			// request, and that is worst on a deployment whose PATH is unset. Turn it away at the route instead,
+			// with the same camouflage page any other unrecognised POST gets.
+			const 媒体类型 = contentType.split(';', 1)[0].trim();
+			if (!命中XHTTP特征 && 媒体类型.startsWith('application/grpc-web')) {
+				return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' } });
+			}
+			if (!命中XHTTP特征 && (媒体类型 === 'application/grpc' || 媒体类型.startsWith('application/grpc+'))) {
 				log(`[gRPC] Matched request: ${脱敏隧道路径(url.pathname)}${脱敏查询串(url.search)}`);
 				return await 处理gRPC请求(request, userID);
 			}
@@ -1355,15 +1365,6 @@ function 解析木马首包三态(data, token) {
 
 // Bounded accumulator shared by WS and gRPC. Owns its buffer (grows geometrically), enforces one ABSOLUTE
 // deadline that does not restart per message, and caps total pre-auth bytes.
-// Tag an error as a pre-authentication rejection so the transport owner can end the response cleanly rather
-// than erroring it. The distinction that matters everywhere in this file is authenticated-vs-not: a failure
-// after authentication must reach the client, a rejection before it is just policy and belongs with the
-// decoy page.
-function 标记预认证拒绝(err) {
-	try { err.预认证拒绝 = true; } catch (e) { }
-	return err;
-}
-
 function 创建预认证累积器(token, 最大字节 = 预认证最大字节, 超时毫秒 = 预认证超时毫秒) {
 	let buffer = new Uint8Array(1024);
 	let offset = 0;
@@ -1842,6 +1843,12 @@ async function 处理gRPC请求(request, yourUUID) {
 
 			// Declared OUTSIDE the try so the finally can see what the catch caught.
 			let 关闭原因 = null;
+			// Classify a failure by WHETHER WE HAD AUTHENTICATED, not by which throw site remembered to tag
+			// itself. The tagging approach reached 2 of at least 5 pre-auth throws -- the incomplete outer
+			// frame, the empty-frame flood, the compression-flag check and the pre-auth read timeout were all
+			// still reported as tunnel failures -- which is the same "fixed one of N sites" shape this project
+			// keeps producing. One flag cannot be forgotten by a throw that does not know it exists.
+			let gRPC内层认证完成 = false;
 			try {
 				let pending = new Uint8Array(0);
 				let 正常结束 = false;
@@ -1886,7 +1893,7 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (!已认证) {
 							预认证帧数 += parsedFrames.consumed;
 							预认证无数据帧数 += parsedFrames.emptyConsumed;
-							if (预认证帧数 > GRPC_PREAUTH_MAX_FRAMES) throw 标记预认证拒绝(new Error('gRPC request sent too many pre-auth frames'));
+							if (预认证帧数 > GRPC_PREAUTH_MAX_FRAMES) throw new Error('gRPC request sent too many pre-auth frames');
 							if (预认证无数据帧数 > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC request sent too many no-data frames');
 						}
 						for (const payload of parsedFrames.payloads) {
@@ -1904,8 +1911,11 @@ async function 处理gRPC请求(request, yourUUID) {
 							if (!gRPC预认证) gRPC预认证 = 创建预认证累积器(yourUUID);
 							const 预认证结果 = gRPC预认证.推入(payload);
 							if (预认证结果.状态 === 'need_more') continue;  // valid so far; wait for the rest
-							if (预认证结果.状态 === 'invalid') throw 标记预认证拒绝(new Error(`Invalid inner header: ${预认证结果.原因}`));
+							if (预认证结果.状态 === 'invalid') throw new Error(`Invalid inner header: ${预认证结果.原因}`);
 							const 首包 = 预认证结果.结果;
+							// THE authentication boundary. Everything thrown before this line is an unauthenticated peer
+							// being rejected; everything after it is a failure a real client must be told about.
+							gRPC内层认证完成 = true;
 							判断是否是木马 = 预认证结果.协议 === 'trojan';
 							gRPC预认证 = null;                              // release the pre-auth buffer
 							// Protocol名 stays non-ASCII on purpose: the dashboard-signature gate caps how many plain
@@ -1977,11 +1987,18 @@ async function 处理gRPC请求(request, yourUUID) {
 				// errors. Nothing was authenticated, no socket was opened and no byte was relayed, so there is no
 				// client owed a failure signal; ending the response cleanly is both honest and quieter to probe.
 				// A POST-authentication failure still errors the stream -- that distinction is the whole point.
-				if (err?.预认证拒绝) { if (remoteConnWrapper.追踪 && !remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'preauth_reject'; }
-				else if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) 关闭原因 = err;
+				const 客户端结束 = 是流取消错误(err) || remoteConnWrapper.客户端已关闭;
+				const 预认证拒绝 = !客户端结束 && !gRPC内层认证完成 && !isDnsQuery;
+				if (预认证拒绝) {
+					if (!remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'preauth_reject';
+					// Cancel the body we have stopped reading. Releasing the lock is not the same as terminating
+					// the stream: a rejected peer could otherwise keep an unread request body attached to an
+					// invocation that has already decided to stop consuming it. XHTTP already does this.
+					cancelReaderQuietly(reader, 'gRPC pre-auth rejected');
+				} else if (!客户端结束) 关闭原因 = err;
 				// Finalise the tracer only NOW, with the classification decided: a pre-auth rejection carries no
 				// error (it is policy working), a genuine failure carries its cause.
-				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err?.预认证拒绝 ? undefined : err);
+				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, 预认证拒绝 ? undefined : err);
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
@@ -11208,11 +11225,19 @@ async function fetchWithTimeout(resource, init = {}, timeoutMs, fetchImpl = fetc
 	const 期限 = Number(timeoutMs);
 	if (!Number.isFinite(期限) || 期限 <= 0) throw new TypeError('fetchWithTimeout requires an explicit positive timeoutMs');
 	const controller = new AbortController();
+	// COMPOSE the caller's signal rather than replacing it. Overwriting init.signal meant a client that
+	// disconnected mid-request could not cancel the fetch we made on its behalf -- it ran to its own timeout
+	// while nobody was waiting for the answer, holding a subrequest slot the whole time.
+	const 调用方信号 = init?.signal;
+	const 跟随中止 = () => { try { controller.abort(调用方信号?.reason); } catch (e) { controller.abort(); } };
+	if (调用方信号?.aborted) 跟随中止();
+	else 调用方信号?.addEventListener?.('abort', 跟随中止, { once: true });
 	const timer = setTimeout(() => controller.abort(), 期限);
 	try {
 		return await fetchImpl(resource, { ...init, signal: controller.signal });
 	} finally {
 		clearTimeout(timer);
+		try { 调用方信号?.removeEventListener?.('abort', 跟随中止); } catch (e) { }
 	}
 }
 
@@ -11285,6 +11310,12 @@ function normalizeProxyEndpoint(endpoint) {
 	const host = String(endpoint[0] || '').trim().toLowerCase();
 	const port = Number(endpoint[1]);
 	if (!isValidProxyEndpointHost(host) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+	// A relay endpoint is a destination we dial, so it must clear the same policy as any other. This checked
+	// only shape and port, so a resolver answer or a cached record naming 127.0.0.1, 169.254.169.254 or
+	// 10.0.0.1 was admitted and dialled -- while the identical address requested as an ordinary tunnel
+	// target was refused. Two paths disagreeing about what is dialable is the bug, independent of whether
+	// the platform would also refuse it.
+	try { validateTunnelTarget(stripIPv6Brackets(host), port); } catch (e) { return null; }
 	return [host, port];
 }
 
@@ -11642,6 +11673,7 @@ export const __testPerformanceHelpers = {
 	创建预认证累积器,
 	sha224,
 	创建上行写入队列,
+	normalizeProxyEndpoint,
 	DIRECT_ROUTE_STATUS_CACHE,
 	getDirectRouteFailed,
 	recordDirectRouteFailure,

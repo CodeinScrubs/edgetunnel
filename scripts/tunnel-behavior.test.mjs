@@ -1162,7 +1162,10 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 {
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	const tunnel = await createTunnelContext(fakeRequest({ colo: 'SJC' }), {
-		PROXYIP: '198.51.100.10:443',
+		// NOT an RFC 5737 documentation address any more: relay endpoints now clear the same destination
+		// policy as any other dial target, and documentation space is unroutable, so a relay there could only
+		// ever fail. The connector is faked in this test, so a routable-looking address is safe.
+		PROXYIP: '93.184.216.34:443',
 		FORCE_PROXY_HOSTS: 'panel.example.com,*.example.com',
 	});
 	const connectCalls = [];
@@ -1205,7 +1208,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const bytes = await collectReadableStream(response.body);
 	const parsed = parseGrpcFrameChunk(new Uint8Array(0), bytes);
 
-	assert.deepEqual(connectCalls, [{ hostname: '198.51.100.10', port: 443 }], 'forced host should dial ProxyIP instead of the target hostname');
+	assert.deepEqual(connectCalls, [{ hostname: '93.184.216.34', port: 443 }], 'forced host should dial ProxyIP instead of the target hostname');
 	assert.equal(connectCalls.some(call => call.hostname === 'panel.example.com'), false, 'forced host must not be direct-dialed');
 	assert.deepEqual(upstreamWrites, [new Uint8Array([0xaa])]);
 	assert.deepEqual(parsed.payloads.map(payload => [...payload]), [[0, 0], [0x48, 0x54, 0x54, 0x50]]);
@@ -1276,11 +1279,11 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	const first = getProxyResolutionRecord(env, null, 'coalesce.example.com', 'target.example.com', '00000000-0000-4000-8000-000000000000', async () => {
 		liveCalls++;
 		await new Promise(resolve => setTimeout(resolve, 20));
-		return [['198.51.100.10', 443]];
+		return [['93.184.216.34', 443]];
 	});
 	const second = getProxyResolutionRecord(env, null, 'coalesce.example.com', 'target.example.com', '00000000-0000-4000-8000-000000000000', async () => {
 		liveCalls++;
-		return [['198.51.100.11', 443]];
+		return [['93.184.216.35', 443]];
 	});
 
 	const [a, b] = await Promise.all([first, second]);
@@ -1291,12 +1294,12 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// different request"). The dial then fails for a reason nothing in that request can explain. The whole
 	// value of the dedup was the unsafe part, so it is gone; each cold miss now resolves independently.
 	assert.equal(liveCalls, 2, 'concurrent cold misses must resolve independently, not share a live promise');
-	assert.deepEqual(a.record.endpoints, [['198.51.100.10', 443]]);
-	assert.deepEqual(b.record.endpoints, [['198.51.100.11', 443]]);
+	assert.deepEqual(a.record.endpoints, [['93.184.216.34', 443]]);
+	assert.deepEqual(b.record.endpoints, [['93.184.216.35', 443]]);
 	// Completed, serializable records are still shared — that is the safe half of the cache.
 	const third = await getProxyResolutionRecord(env, null, 'coalesce.example.com', 'target.example.com', '00000000-0000-4000-8000-000000000000', async () => {
 		liveCalls++;
-		return [['198.51.100.12', 443]];
+		return [['93.184.216.36', 443]];
 	});
 	assert.equal(liveCalls, 2, 'a warm L1 hit must not perform another live lookup');
 	assert.ok(third.record.endpoints.length > 0, 'the completed record must still come from cache');
@@ -2407,7 +2410,7 @@ function fakeLogRequest(url = 'https://worker.example/sub?token=redacted') {
 	// the third connection skips the wasted direct attempt and goes straight to ProxyIP.
 	const uuid = '11111111-1111-4111-8111-111111111111';
 	const targetHost = 'routecache.example';
-	const proxyIp = '198.51.100.10';
+	const proxyIp = '93.184.216.34';   // routable: relay endpoints now clear the destination policy
 	const makeNoDataDirectSocket = () => ({
 		opened: Promise.resolve(),
 		readable: new ReadableStream({ start(controller) { controller.close(); } }),
