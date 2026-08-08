@@ -1,6 +1,6 @@
 // Generated from src/worker.js by scripts/build-worker.mjs.
 // Edit src/worker.js or src/core/config.js, then run npm run build.
-// Build: 2026-08-04 src:03cef265a16a copypaste:a029f585
+// Build: 2026-08-08 src:b1b4bfe379d6 copypaste:14ce482c
 // User-editable defaults.
 // Cloudflare environment variables and KV/admin settings still override these values.
 const USER_CONFIG = {
@@ -114,7 +114,7 @@ function applyUserConfigDefaults(env = {}) {
 
 
 const ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES = ENGINE_DEFAULTS.ENGLISH_STATIC_PAGE_CACHE_MAX_ENTRIES;
-const Version = '2026-08-04 src:03cef265a16a copypaste:a029f585';
+const Version = '2026-08-08 src:b1b4bfe379d6 copypaste:14ce482c';
 const DEFAULT_SOCKS5_WHITELIST = ENGINE_DEFAULTS.DEFAULT_SOCKS5_WHITELIST;
 let 缓存SOCKS5白名单键 = null, 缓存SOCKS5白名单 = null, 缓存强制反代主机键 = null, 缓存强制反代主机 = null, 调试日志打印 = false, 抑制旧文本日志 = false;
 const PROXY_ENDPOINT_CURSOR = new Map();
@@ -1439,6 +1439,15 @@ function 解析木马首包三态(data, token) {
 
 // Bounded accumulator shared by WS and gRPC. Owns its buffer (grows geometrically), enforces one ABSOLUTE
 // deadline that does not restart per message, and caps total pre-auth bytes.
+// Tag an error as a pre-authentication rejection so the transport owner can end the response cleanly rather
+// than erroring it. The distinction that matters everywhere in this file is authenticated-vs-not: a failure
+// after authentication must reach the client, a rejection before it is just policy and belongs with the
+// decoy page.
+function 标记预认证拒绝(err) {
+	try { err.预认证拒绝 = true; } catch (e) { }
+	return err;
+}
+
 function 创建预认证累积器(token, 最大字节 = 预认证最大字节, 超时毫秒 = 预认证超时毫秒) {
 	let buffer = new Uint8Array(1024);
 	let offset = 0;
@@ -1944,7 +1953,7 @@ async function 处理gRPC请求(request, yourUUID) {
 						if (!已认证) {
 							预认证帧数 += parsedFrames.consumed;
 							预认证无数据帧数 += parsedFrames.emptyConsumed;
-							if (预认证帧数 > GRPC_MAX_FRAMES_PER_CHUNK) throw new Error('gRPC request sent too many pre-auth frames');
+							if (预认证帧数 > GRPC_PREAUTH_MAX_FRAMES) throw 标记预认证拒绝(new Error('gRPC request sent too many pre-auth frames'));
 							if (预认证无数据帧数 > GRPC_MAX_EMPTY_FRAMES_PER_CHUNK) throw new Error('gRPC request sent too many no-data frames');
 						}
 						for (const payload of parsedFrames.payloads) {
@@ -1962,7 +1971,7 @@ async function 处理gRPC请求(request, yourUUID) {
 							if (!gRPC预认证) gRPC预认证 = 创建预认证累积器(yourUUID);
 							const 预认证结果 = gRPC预认证.推入(payload);
 							if (预认证结果.状态 === 'need_more') continue;  // valid so far; wait for the rest
-							if (预认证结果.状态 === 'invalid') throw new Error(`Invalid inner header: ${预认证结果.原因}`);
+							if (预认证结果.状态 === 'invalid') throw 标记预认证拒绝(new Error(`Invalid inner header: ${预认证结果.原因}`));
 							const 首包 = 预认证结果.结果;
 							判断是否是木马 = 预认证结果.协议 === 'trojan';
 							gRPC预认证 = null;                              // release the pre-auth buffer
@@ -2025,7 +2034,15 @@ async function 处理gRPC请求(request, yourUUID) {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper, err);
 				// Carry the failure into the finally so the response is errored rather than closed. Cancellation
 				// and our own teardown stay a clean close — those are not tunnel failures.
-				if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) 关闭原因 = err;
+				// A PRE-AUTHENTICATION rejection is not a tunnel failure. WS answers it with a 1008 policy close
+				// and XHTTP returns the camouflage page; only gRPC turned it into controller.error(), which
+				// Cloudflare records as a worker exception. Two production captures show every single exception
+				// was one of these -- unauthenticated peers making the worker look broken, and drowning the real
+				// errors. Nothing was authenticated, no socket was opened and no byte was relayed, so there is no
+				// client owed a failure signal; ending the response cleanly is both honest and quieter to probe.
+				// A POST-authentication failure still errors the stream -- that distinction is the whole point.
+				if (err?.预认证拒绝) { if (remoteConnWrapper.追踪 && !remoteConnWrapper.closeHint) remoteConnWrapper.closeHint = 'preauth_reject'; }
+				else if (!是流取消错误(err) && !remoteConnWrapper.客户端已关闭) 关闭原因 = err;
 			} finally {
 				追踪关闭(remoteConnWrapper.追踪, remoteConnWrapper);
 				上行写入队列.清空();
@@ -3295,6 +3312,14 @@ const GRPC_MAX_FIELDS_PER_FRAME = 4096; // legit tunnel frames carry 1 protobuf 
 // frames). Reject a pathological flood of tiny/empty 5-byte frames in one chunk — reachable BEFORE UUID auth
 // by a path-knowing peer — so the O(frames) unwrap loop can't burn the whole 10ms CPU budget as a cheap DoS.
 const GRPC_MAX_FRAMES_PER_CHUNK = 4096;
+// PRE-AUTHENTICATION frame budget, separate from the authenticated one above. It used to share the 4096
+// cap, and that is an amplifier: while unauthenticated the reader takes ONE frame per pass, so a body
+// full of tiny frames costs one full parse pass each. Measured at ~4.4ms for 4096 frames on a fast dev
+// machine, and a Workers isolate is slower -- available to any unauthenticated peer, which matters most
+// on a deployment whose PATH is unset, because then every POST from the internet reaches this loop.
+// A real client sends its inner header in one frame; 128 still tolerates a header fragmented to a byte
+// per frame while cutting the worst case by 32x.
+const GRPC_PREAUTH_MAX_FRAMES = 128;
 // Empty (zero-payload) 5-byte frames carry no tunnel data and are the cheapest flood to generate, so cap them
 // far tighter than total frames. Real xray "gun" traffic sends essentially none in a chunk.
 const GRPC_MAX_EMPTY_FRAMES_PER_CHUNK = 64;
@@ -7655,7 +7680,9 @@ function 是流取消错误(err) {
 // This changes CLASSIFICATION only: the client still receives the real FIN, because inventing a protocol
 // error there would break relay transparency (see the terminal block in connectStreams).
 // 'no_request_idle' stays expected -- a preconnect that never sent a request has nothing to fail.
-const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel']);
+// 'preauth_reject' is EXPECTED: it means the policy worked. It stays a named reason so an operator can
+// still see probe volume, but it must not sit in failure metrics next to a relay that actually broke.
+const 预期关闭原因集 = new Set(['eof', 'request_eof', 'remote_eof', 'no_request_idle', 'client_cancel', 'client_close', 'client_ws_error', 'client_abort', 'runtime_cancel', 'preauth_reject']);
 function 分类关闭原因(wrapper, err) {
 	if (wrapper?.closeHint) return { reason: wrapper.closeHint, expected: 预期关闭原因集.has(wrapper.closeHint) };
 	if (wrapper?.客户端已关闭) return { reason: 'client_cancel', expected: true };

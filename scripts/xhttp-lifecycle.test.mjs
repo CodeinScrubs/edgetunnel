@@ -157,6 +157,26 @@ for (const file of BUILDS) {
 	// err="Stream was cancelled.", i.e. the classification survived and the diagnosis did not.
 	assert.match(src, /readError = 终止错误 \|\| err;/,
 		`${file}: a recorded terminal cause must survive the reader cancellation it triggered`);
+
+	// PRE-AUTHENTICATION must behave the same on all three transports. Two production captures showed every
+	// worker exception was a pre-auth rejection on gRPC: WS answered the identical event with a 1008 policy
+	// close and XHTTP with the camouflage page, but gRPC threw, which Cloudflare records as an exception. 295
+	// of them across the two logs -- unauthenticated peers making the worker look broken and burying the real
+	// errors. Nothing is authenticated there, no socket is opened and no byte is relayed, so no client is owed
+	// a failure signal. A POST-authentication failure must still error: that distinction is the whole point.
+	assert.match(src, /function 标记预认证拒绝\(err\)/, `${file}: a pre-auth rejection must be distinguishable from a tunnel failure`);
+	assert.match(src, /if \(预认证结果\.状态 === 'invalid'\) throw 标记预认证拒绝\(/,
+		`${file}: the gRPC inner-header rejection must be marked as pre-auth`);
+	assert.match(src, /if \(err\?\.预认证拒绝\) \{[^}]*preauth_reject/,
+		`${file}: a marked pre-auth rejection must end the gRPC response cleanly, not error it`);
+	assert.match(src, /'runtime_cancel', 'preauth_reject'\]/,
+		`${file}: preauth_reject is policy working, so it must not sit in failure metrics`);
+	// The pre-auth frame budget is an amplifier: while unauthenticated the reader takes ONE frame per pass,
+	// so a body of tiny frames costs a full parse pass each. It shared the authenticated 4096 cap.
+	assert.match(src, /const GRPC_PREAUTH_MAX_FRAMES = 128;/,
+		`${file}: pre-auth needs its own, much smaller frame budget than authenticated traffic`);
+	assert.match(src, /if \(预认证帧数 > GRPC_PREAUTH_MAX_FRAMES\)/,
+		`${file}: the pre-auth counter must use the pre-auth budget, not the authenticated one`);
 	// Regression guard: the old shape must not come back.
 	assert.doesNotMatch(src, /if \(!是流取消错误\(error\) && !\(pipeMeta\?\.wrapper\?\.客户端已关闭\)\) log\(`\[Stream pipe\][^\n]*\n\s*closeSocketQuietly\(webSocket\);/,
 		`${file}: the remote-read catch is swallowing failures again`);
